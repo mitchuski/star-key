@@ -79,7 +79,7 @@ function tsFiles(dir) {
 /** Module directory a path belongs to, or null for a file at the src root. */
 function moduleOf(absPath) {
   const rel = relative(SRC, absPath);
-  const parts = rel.split("/");
+  const parts = rel.split(/[\\/]/);
   return parts.length > 1 ? parts[0] : null;
 }
 

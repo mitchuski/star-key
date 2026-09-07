@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
-  "name": "VTA Wallet",
-  "description": "Verifiable Trust Agent wallet — manage logins, credentials, and DIDs via your VTA. Bridges WebAuthn passkeys to VTA identities.",
+  "name": "Star \u2014 Trust Experiment",
+  "description": "Star trust experiment: VTA identity, scoped sign-in and local City Key readings. Built on OpenVTC.",
   "icons": {
     "16": "icon-16.png",
     "32": "icon-32.png",
@@ -10,7 +10,7 @@
   },
   "action": {
     "default_popup": "popup.html",
-    "default_title": "VTA Wallet",
+    "default_title": "Star \u2014 trust",
     "default_icon": {
       "16": "icon-16.png",
       "32": "icon-32.png",
@@ -28,10 +28,22 @@
   },
   "web_accessible_resources": [
     {
-      "resources": ["provider.js"],
-      "matches": ["<all_urls>"]
+      "resources": [
+        "provider.js"
+      ],
+      "matches": [
+        "<all_urls>"
+      ]
     }
   ],
-  "permissions": ["storage", "offscreen", "notifications", "tabs", "scripting"],
-  "optional_host_permissions": ["<all_urls>"]
+  "permissions": [
+    "storage",
+    "offscreen",
+    "notifications",
+    "tabs",
+    "scripting"
+  ],
+  "optional_host_permissions": [
+    "<all_urls>"
+  ]
 }

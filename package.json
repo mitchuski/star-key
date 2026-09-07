@@ -1,8 +1,8 @@
 {
-  "name": "pnm-browser-plugin",
+  "name": "star-key",
   "private": true,
   "version": "0.1.2",
-  "description": "Browser-side bridge between WebAuthn passkeys and VTA-managed DIDs. Ships as a PWA and as an MV3 browser extension on a shared TypeScript core.",
+  "description": "Star Key: experimental VTA browser extension and local City Key reader, based on OpenVTC.",
   "type": "module",
   "workspaces": [
     "packages/tsp-js",
@@ -18,7 +18,8 @@
     "dev:extension": "npm run dev --workspace @openvtc/pnm-extension",
     "dev:demo-rp": "npm run start --workspace @openvtc/pnm-demo-rp",
     "lint": "npm run lint --workspaces --if-present",
-    "test": "npm run test --workspaces --if-present"
+    "test": "npm run test --workspaces --if-present",
+    "build:star-preview": "npm exec --workspace @openvtc/pnm-extension -- vite build --config vite.config.star-preview.ts --mode web-experiment && node scripts/copy-star-art.mjs"
   },
   "engines": {
     "node": ">=24"

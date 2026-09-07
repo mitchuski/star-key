@@ -233,7 +233,7 @@ export function AppShell({ advanced, vault }: { advanced: React.ReactNode; vault
       >
         <div style={{ display: "flex", alignItems: "center", gap: 9, padding: "0 8px 16px" }}>
           <Mark />
-          <span style={{ fontWeight: 640, letterSpacing: "-0.01em" }}>VTA Wallet</span>
+          <span style={{ fontWeight: 640, letterSpacing: "-0.01em" }}>Star · trust</span>
         </div>
 
         {PANES.map((p) => {

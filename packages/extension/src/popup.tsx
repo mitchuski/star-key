@@ -1,3 +1,4 @@
+import { StarBrand } from "./star-brand.js";
 /// <reference types="chrome" />
 import { StrictMode, useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
@@ -1030,6 +1031,7 @@ const root = document.getElementById("root");
 if (root) {
   createRoot(root).render(
     <StrictMode>
+      <StarBrand />
       <Popup />
       <AffinidiFooter />
     </StrictMode>,

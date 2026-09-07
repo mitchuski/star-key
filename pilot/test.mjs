@@ -1,0 +1,13 @@
+import assert from 'node:assert/strict';
+import { readiness, beginLogin } from './adapter.mjs';
+const config = { enabled: true, siteOrigin: 'http://127.0.0.1:8814', rpDid: 'did:example:test-rp', baseUrl: 'http://127.0.0.1:9900', identityPolicy: 'vta-persona-required' };
+let calls = 0;
+const provider = { login: async params => { calls++; assert.deepEqual(params, { rpDid: config.rpDid, baseUrl: config.baseUrl }); return { sessionId: 'PRIVATE_SESSION', accessToken: 'PRIVATE_TOKEN' }; } };
+for (const c of [{ ...config, enabled: false }, { ...config, siteOrigin: 'https://other.example' }, { ...config, baseUrl: 'http://remote.example' }, { ...config, baseUrl: 'https://user:secret@example.com' }, { ...config, identityPolicy: 'holder' }]) await assert.rejects(beginLogin(c, config.siteOrigin, provider));
+assert.equal(calls, 0);
+assert.equal(readiness(config, config.siteOrigin, null).ready, false);
+const outcome = await beginLogin(config, config.siteOrigin, provider);
+assert.equal(calls, 1); assert.equal(outcome.independentlyVerified, false);
+assert.equal(JSON.stringify(outcome).includes('PRIVATE_'), false);
+await assert.rejects(beginLogin(config, config.siteOrigin, { login: async () => ({}) }));
+console.log('Pilot adapter checks passed: invalid configs refused, provider required, no fake fallback, tokens absent from public result, no verification claim.');

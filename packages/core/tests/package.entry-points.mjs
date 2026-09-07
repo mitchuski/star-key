@@ -1,3 +1,4 @@
+import { pathToFileURL } from "node:url";
 // Every advertised entry point must actually load — in Node, with no DOM.
 //
 // The package is built in a browser-shaped repo, so the failure mode is
@@ -23,7 +24,7 @@ const subpaths = Object.keys(pkg.exports).filter(
 );
 
 test("the root entry point loads in Node", async () => {
-  const mod = await import(join(PKG_ROOT, pkg.exports["."].import));
+  const mod = await import(pathToFileURL(join(PKG_ROOT, pkg.exports["."].import)).href);
   assert.ok(Object.keys(mod).length > 0, "the barrel exports nothing");
 });
 
@@ -31,7 +32,7 @@ for (const subpath of subpaths) {
   test(`${subpath} loads in Node on its own`, async () => {
     const target = join(PKG_ROOT, pkg.exports[subpath].import);
     assert.ok(existsSync(target), `${subpath} points at ${target}, which does not exist`);
-    const mod = await import(target);
+    const mod = await import(pathToFileURL(target).href);
     assert.ok(
       Object.keys(mod).length > 0,
       `${subpath} loaded but exports nothing — check its index.ts`,

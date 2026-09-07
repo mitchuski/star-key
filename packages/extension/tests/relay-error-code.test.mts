@@ -301,7 +301,7 @@ const protocol = src("bridge-protocol.ts");
 const background = src("background.ts");
 
 test("the page's reply shape carries prose and nothing else", () => {
-  const page = /export type RuntimeRequestTaskResponse =([\s\S]*?);\n/.exec(protocol);
+  const page = /export type RuntimeRequestTaskResponse =([\s\S]*?);\r?\n/.exec(protocol);
   assert.ok(page, "RuntimeRequestTaskResponse not found — this test is reading the wrong shape");
   assert.ok(
     !/\bcode\b|\bdetails\b|RelayTaskFailure/.test(page[1]!),
@@ -312,7 +312,7 @@ test("the page's reply shape carries prose and nothing else", () => {
 
   // The positive half: the console's reply must actually carry the shape, or
   // the assertion above is true of a change that did nothing at all.
-  const console_ = /export type RuntimeManagerTaskResponse =([\s\S]*?);\n/.exec(protocol);
+  const console_ = /export type RuntimeManagerTaskResponse =([\s\S]*?);\r?\n/.exec(protocol);
   assert.ok(console_, "RuntimeManagerTaskResponse not found");
   assert.match(
     console_[1]!,

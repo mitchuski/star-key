@@ -123,7 +123,7 @@ test("no shipped schema requires a member it does not define", async () => {
   // closed. It is not general satisfiability, and is not meant to be.
   const { readdirSync, statSync } = await import("node:fs");
   const { join, resolve, dirname } = await import("node:path");
-  const { fileURLToPath } = await import("node:url");
+  const { fileURLToPath, pathToFileURL } = await import("node:url");
 
   const root = resolve(
     dirname(fileURLToPath(import.meta.url)),
@@ -154,7 +154,7 @@ test("no shipped schema requires a member it does not define", async () => {
 
   assert.ok(files.length > 300, `only ${files.length} schemas found — did the layout move?`);
   for (const f of files) {
-    const m = await import(f);
+    const m = await import(pathToFileURL(f).href);
     for (const key of ["PAYLOAD_SCHEMA", "RESPONSE_PAYLOAD_SCHEMA"]) {
       if (m[key]) scan(m[key], f.slice(root.length + 1), key);
     }

@@ -18,7 +18,7 @@ packages/didcomm-wasm/pkg/
 packages/didcomm-wasm/pkg-node/
 
 # Extension signing key and Web Store upload artefacts. The *public* key
-# (packages/extension/extension-key.txt) is committed on purpose — it ships in
+# (packages/extension/extension-key.txt) is committed on purpose â€” it ships in
 # every CRX and pins the extension ID. The private key must never be.
 packages/extension/extension-key.pem
 packages/extension/release/
@@ -28,3 +28,6 @@ packages/extension/release/
 # (jwk.d), so must never be committed.
 packages/core/.*-holder.json
 packages/core/*-test.mjs
+
+# Generated public reader bundle
+packages/extension/dist-star-preview/

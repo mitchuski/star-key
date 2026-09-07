@@ -46,6 +46,7 @@ export default defineConfig({
     rollupOptions: {
       input: {
         popup: resolve(__dirname, "popup.html"),
+        star: resolve(__dirname, "star.html"),
         options: resolve(__dirname, "options.html"),
         confirm: resolve(__dirname, "confirm.html"),
         offscreen: resolve(__dirname, "offscreen.html"),
