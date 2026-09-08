@@ -1,8 +1,9 @@
-export function StarBrand() {
-  return <header style={{ padding: '18px 24px', borderBottom: '1px solid #294552', background: 'linear-gradient(120deg,#101e2d,#10282b)', color: '#dfedec', display: 'flex', alignItems: 'center', gap: 16 }}>
-    <img src="star-manifold.svg" alt="Illustrative Star model" width="80" height="70" />
-    <div style={{ flex: 1 }}><div style={{ font: '30px Georgia,serif' }}>star <span style={{ font: '10px system-ui', color: '#a1c8cd', marginLeft: 10 }}>FOR TRUST · EXPERIMENTAL</span></div>
-      <p style={{ margin: '5px 0 0', fontSize: 11 }}>Your VTA connection, boundaries and chosen journey.</p></div>
-    <a href="star.html" target="_blank" rel="noreferrer" style={{ color: '#b5e6e6', fontSize: 12 }}>Inspect City Key ↗</a>
+import './star-brand.css';
+export function StarBrand({ active = false }: { active?: boolean }) {
+  return <header className="star-brand">
+    <div className={active ? 'star-mini is-active' : 'star-mini'}><img src="icon.svg" alt={active ? 'Star · VTA selected locally' : 'Star · no VTA selected'} width="72" height="72" /></div>
+    <div><div className="star-wordmark">star key</div><p>{active ? 'VTA selected · your chosen perspective' : 'Your boundaries. Your chosen perspective.'}</p></div>
+    <a href="star.html" target="_blank" rel="noreferrer" aria-label="Inspect and prepare a selected City Key reading" title="Inspect a reading before sharing">📤</a>
+    <button onClick={() => window.close()} aria-label="Close Star" title="Close Star">✕</button>
   </header>;
 }

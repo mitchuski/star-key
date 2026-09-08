@@ -698,6 +698,18 @@ function EnableOnThisSite() {
   );
 }
 
+function StarIdentityMenu() {
+ const connection = useActiveConnection();
+ const connections = useConnectionStore(s => s.connections);
+ return <><StarBrand active={!!connection} /><details style={{padding:16,overflowWrap:'anywhere'}}><summary>Your DIDs &amp; how Star works</summary>
+ <p>Remembered connections, not live site sessions.</p>
+ {!Object.keys(connections.vtas).length && <p>No VTA connected. Use setup below.</p>}
+ {Object.values(connections.vtas).map(c => <section key={c.vtaDid}><strong>{connection?.vtaDid === c.vtaDid ? 'Selected VTA' : 'Remembered VTA'}</strong><p>VTA: <code>{c.vtaDid}</code></p><p>Holder: <code>{c.holderDid}</code></p><p>Role: {c.role} · Context: {c.homeContext || 'not recorded'}</p></section>)}
+ <p>Compatible OpenVTC sites request sign-in through the wallet. Identity selection, site permissions and approval still apply. Remembered DIDs do not establish current access. Use the existing VTA controls for persona identities.</p>
+ <p>The Star expresses selected knowledge context. Key appearance, identity control and verified relationships are separate layers.</p>
+ <p><a href="https://guide.agentprivacy.ai/" target="_blank" rel="noreferrer">Guide wiki ↗</a> · <a href="https://soulbis.com/star/" target="_blank" rel="noreferrer">Explore Star ↗</a> · <a href="https://mages.city/" target="_blank" rel="noreferrer">Mages City ↗</a></p>
+ </details></>;
+}
 function Popup() {
   const connection = useActiveConnection();
   const setConnection = useConnectionStore((s) => s.setConnection);
@@ -1031,7 +1043,7 @@ const root = document.getElementById("root");
 if (root) {
   createRoot(root).render(
     <StrictMode>
-      <StarBrand />
+      <StarIdentityMenu />
       <Popup />
       <AffinidiFooter />
     </StrictMode>,

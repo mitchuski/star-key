@@ -57,3 +57,9 @@ An applicable VRC can support a proposed introduction and disclosure policy. Ver
 Next-stage proposal: a presentation carries an explicitly selected perspective, a versioned geometry reading and credential evidence or proofs of named claims. Bind the approved projection and mapping digest to the proof statement when relying on the visual reading. Specify issuer/profile acceptance, holder binding, credential status, audience, purpose, fresh challenge and expiry. Verify before granting the named action. Assignment identifies a recipient/subject/scope; it does not transfer a credential by copying its image.
 
 Start with one claim and one verifier. Selective disclosure, aggregation and succinct proofs are separate choices, and proof size is not guaranteed to be smaller. No arbitrary credential-to-proof conversion exists in this pilot. Test wrong recipient, replay, expired/revoked credentials, altered geometry/projection and unsupported proof profiles before accepting such an exchange.
+
+## Research-loop evidence · 8 September 2026
+
+Eight synthetic fingerprint/overlap assertions and nine existing canon/journey test entries passed in the observer loop. This checks narrow canonical-content compatibility, not rendered sigil equivalence or credential verification. A reduced projection needs its own content identity; preserve source lineage only when permitted. A signature on a full key does not automatically authenticate a changed reading. Source-element overlap uses vertex, slug and sorted links; evaluating independent evidence additionally needs immutable source versions and provenance dependency groups.
+
+The next research protocol is recorded in agentprivacy-docs/research/star-key-next-research-loop.md. Candidates remain unnumbered. Public chronicle reflections are staged pending the unsigned master's review, not installed in this fork.
