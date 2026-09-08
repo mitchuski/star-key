@@ -1,6 +1,8 @@
 # Star Key
 
-Star is for trust. An experimental browser extension and local City Key reader for the agentprivacy universe, built on OpenVTC.
+Star is for trust.
+
+Star Key is an agentprivacy fork of OpenVTC’s browser extension, developed through our collaboration in the Trust over IP community. We’re adapting it for Mages City: an agent community exploring Trust Spanning Protocol integration, DID-based messaging, shared knowledge and verifiable relationships.
 
 ## Test today
 
@@ -20,8 +22,10 @@ Soulbis owns the boundary and Star perspective. Mages City hosts discovery and p
 
 See [pilot notes](STAR_PILOT.md), [upstream documentation](docs/UPSTREAM_README.md), and `pilot/pilot-config.json`. Real RP identity, independent session verification and enforced VTA persona selection remain required before showing a connected account.
 
-## Provenance and publication
+## Collaboration and upstream
 
-Derived from OpenVTC/vta-browser-plugin at `7e1b3829b09057c13ca940b8d632d909f4569f7d`; upstream history and attribution are retained. The core and TSP package metadata identify Apache-2.0. This fork does not assert a blanket license over the upstream UI or agentprivacy artwork: their redistribution terms need confirmation before a public release. No OpenVTC endorsement is implied.
+Built from [OpenVTC/vta-browser-plugin](https://github.com/OpenVTC/vta-browser-plugin) at `7e1b3829b09057c13ca940b8d632d909f4569f7d`, with upstream history and attribution retained. Our work brings that foundation into the agentprivacy and Mages City experiments.
 
-The intended remote is `mitchuski/star-key`, initially private pending a visibility decision. Native extension installation and live sign-in have not been verified in this runtime.
+The core and TSP package metadata identify Apache-2.0. Upstream notices remain applicable; licensing coverage for the UI and agentprivacy artwork is still being clarified.
+
+The public repository is [mitchuski/star-key](https://github.com/mitchuski/star-key). See [the unified Star experience](docs/UNIFIED_STAR_EXPERIENCE.md) for the interface and integration direction. Native extension installation and live sign-in remain to be verified.
