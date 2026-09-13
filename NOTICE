@@ -1,0 +1,10 @@
+star-key
+Copyright (c) 2026 Mitchell Travers / 0xagentprivacy
+
+This repository is a derivative of the OpenVTC browser plugin
+(https://github.com/OpenVTC/vta-browser-plugin), whose core and TSP packages
+declare the Apache License, Version 2.0 in their package metadata. The upstream
+code remains the work of the OpenVTC contributors under that licence; the Star
+additions (the Star reading, the kappa registry adapter, the Star Hold module and
+their documentation) are contributed under the same licence by the holder above.
+Upstream notices remain applicable.
