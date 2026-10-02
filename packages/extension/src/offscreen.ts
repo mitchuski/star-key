@@ -15,11 +15,9 @@ import {
   Identity,
   IndexedDBKVStore,
   loginViaTrustTask,
-  loginViaSiop,
-  selfIssuedMinter,
+  rpHttpsSender,
   vaultTaskSigner,
   type ChannelSigner,
-  type SiopIdTokenMinter,
   type TaskSigner,
   claimInboundDocument,
   type MediatorConnection,
@@ -35,6 +33,7 @@ import {
   requestTask,
   buildTaskConsentDecision,
   parseTaskConsentOutcome,
+  taskConsentOutcomeThread,
   loadApproverIdentity,
   approverDid,
   TRUST_TASK_ENVELOPE_TYPE,
@@ -76,10 +75,18 @@ import {
   vtaListDids,
   VtaSession,
   verifyDid,
+  buildTrustTask,
+  verifyTrustTaskReply,
 } from "@openvtc/pnm-core";
+import {
+  verifyDisclosureStepUp,
+  disclosureApprovalPayload,
+  DISCLOSURE_APPROVE_RESPONSE_TYPE,
+} from "@openvtc/pnm-core/persona";
 import { base64url } from "@openvtc/vti-didcomm-js";
 import { grantCommand } from "./grant-command.js";
 import { forgetInbox, getSettings, inboxFor, inboxToAdopt, setInbox } from "./config.js";
+import { walletNetPolicy } from "./net-policy.js";
 import { loadHolder } from "./holder.js";
 import { WebAuthnPrfSecretWrap } from "./webauthn-prf-wrap.js";
 import type { Transport, TransportHealth, TransportObservation } from "./transports.js";
@@ -123,6 +130,11 @@ import {
   OFFSCREEN_SIGN_TRUST_TASK,
   OFFSCREEN_START_INBOUND,
   OFFSCREEN_STEP_UP_VTA,
+  OFFSCREEN_DISCLOSURE_STEP_UP,
+  RUNTIME_DISCLOSURE_STEP_UP_CONSENT,
+  type OffscreenDisclosureStepUpRequest,
+  type RuntimeDisclosureStepUpConsentRequest,
+  type RuntimeDisclosureStepUpConsentResponse,
   OFFSCREEN_TARGET,
   OFFSCREEN_VAULT_DELETE,
   OFFSCREEN_REQUEST_TASK,
@@ -161,7 +173,28 @@ import {
   type SignTrustTaskResult,
   type VerifyRpDidResult,
 } from "./bridge-protocol.js";
+import {
+  MEDIATOR_MONITOR_PORT,
+  OFFSCREEN_MEDIATOR,
+  type KnownRelay,
+  type MediatorOp,
+  type MediatorOpResult,
+  type MonitorMessage,
+  type MonitorOpen,
+  type OffscreenMediatorRequest,
+  type RuntimeMediatorResponse,
+} from "./bridge-protocol.js";
 import { relayFailure } from "./relay-failure.js";
+import { chooseTrustTaskSigner, needsVault, SignAsUnavailableError } from "./sign-identity.js";
+import { isLensTask, knownRelays, mayOperateMediator } from "./mediator-standing.js";
+import {
+  MonitorSequencer,
+  monitorBatchOf,
+  monitorSubscribe,
+  monitorUnsubscribe,
+  type MediatorCaller,
+  type MonitorFilter,
+} from "@openvtc/pnm-core/mediator";
 
 // Request durable IndexedDB on offscreen-document load. The wallet's
 // irreplaceable key material (the v4 holder records) lives in
@@ -231,6 +264,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       );
     return true; // async sendResponse
   }
+  if (msg.type === OFFSCREEN_DISCLOSURE_STEP_UP) {
+    doDisclosureStepUp(message as OffscreenDisclosureStepUpRequest)
+      .then(sendResponse)
+      .catch((e: unknown) =>
+        sendResponse({ ok: false, error: e instanceof Error ? e.message : String(e) }),
+      );
+    return true; // async sendResponse
+  }
   if (msg.type === OFFSCREEN_STEP_UP_VTA) {
     doStepUpVta(message as OffscreenStepUpVtaRequest)
       .then(sendResponse)
@@ -275,7 +316,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
   if (msg.type === OFFSCREEN_ONBOARD_PREPARE) {
     const req = message as OffscreenOnboardPrepareRequest;
-    doOnboardPrepare(req.vtaDid, req.adminScope, req.context)
+    doOnboardPrepare(req.vtaDid, req.adminScope, req.context, req.personaHolder === true)
       .then((result) => sendResponse({ ok: true, result }))
       .catch((e: unknown) =>
         sendResponse({ ok: false, error: e instanceof Error ? e.message : String(e) }),
@@ -481,6 +522,19 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       );
     return true; // async sendResponse
   }
+  if (msg.type === OFFSCREEN_MEDIATOR) {
+    // The background gates the console on `sender.url`; this listener is also
+    // reachable directly by any content script (it carries our extension id),
+    // so the gate is repeated here rather than trusted to have happened.
+    if (!isExtensionContextSender(sender)) {
+      sendResponse({ ok: false, error: "mediator surface is not page-reachable" });
+      return false;
+    }
+    doMediatorOp((message as OffscreenMediatorRequest).op)
+      .then((result) => sendResponse({ ok: true, result } satisfies RuntimeMediatorResponse))
+      .catch((e: unknown) => sendResponse(mediatorFailure(e)));
+    return true; // async sendResponse
+  }
   if (msg.type === OFFSCREEN_REQUEST_TASK) {
     // `relayFailure`, not the `e.message` collapse every other branch here
     // uses. This is the one branch whose caller may be the management console,
@@ -680,7 +734,7 @@ async function diagnoseTransportDown(
       // asks about the thing that broke rather than a health route that may
       // be served by something else. It answers `405` to the probe's GET —
       // irrelevant, since an opaque response only has to exist.
-      probeUrl = await resolveMediatorEndpoint(mediatorDid)
+      probeUrl = await resolveMediatorEndpoint(mediatorDid, { netPolicy: walletNetPolicy() })
         .then((m) => m.authEndpoint)
         .catch(() => undefined);
     }
@@ -777,7 +831,12 @@ async function diagnoseMediator(
 
   let authEndpoint: string | undefined;
   try {
-    authEndpoint = (await resolveMediatorEndpoint(mediatorDid)).authEndpoint;
+    // The self-test resolves under the SAME policy the real path uses, so a
+    // mediator this wallet would refuse to dial reports as refused here rather
+    // than passing a check the wallet will not honour.
+    authEndpoint = (
+      await resolveMediatorEndpoint(mediatorDid, { netPolicy: walletNetPolicy() })
+    ).authEndpoint;
     checks.push({
       id: `${idBase}.resolve`,
       label: `${label} mediator DID resolves`,
@@ -1107,7 +1166,15 @@ async function buildVtaSession(
   }
   const rest = restBaseUrl || services.rest?.baseUrl;
   if (rest) {
-    channels.push(new RestChannel({ baseUrl: rest, holder, signing: documentSigner, service }));
+    channels.push(
+      new RestChannel({
+        baseUrl: rest,
+        holder,
+        signing: documentSigner,
+        service,
+        netPolicy: walletNetPolicy(),
+      }),
+    );
     // Deliberately `"unknown"`, not `"up"`. A `RestChannel` is built from a
     // URL without contacting anything, so construction is not evidence — and
     // a REST channel that turns out to be unreachable fails the caller's
@@ -1218,6 +1285,9 @@ const activeConsentDigests = new Set<string>();
 // document leaks.
 const MAX_AWAITING_DECISIONS = 64;
 interface AwaitingDecision {
+  /** The executor the decision was sent to — the only party whose answer is
+   *  believed (see `parseTaskConsentOutcome`). */
+  executorDid: string;
   payloadDigest: string;
   decision: "approve" | "deny";
   taskType: string;
@@ -1263,16 +1333,21 @@ function notifyApprovalRefused(summary: string): void {
 async function handleTaskConsentOutcome(
   vtaDid: string,
   message: Record<string, unknown>,
+  senderDid: string,
 ): Promise<boolean> {
-  const outcome = parseTaskConsentOutcome(message, {
-    enrolledExecutorDids: await enrolledExecutorDids(vtaDid),
-  });
-  if (!outcome) return false;
-
   // The decision this answers, when we still remember sending it. Absent after
   // an MV3 teardown, or if the executor answered something we never sent — the
-  // outcome is still reported, just without the local detail.
-  const sent = outcome.thid ? awaitingDecisions.get(outcome.thid) : undefined;
+  // outcome is then believed only from this session's own VTA, and reported
+  // without the local detail.
+  const thid = taskConsentOutcomeThread(message);
+  const sent = thid ? awaitingDecisions.get(thid) : undefined;
+  // Only the executor the decision went to may answer it, as authenticated by
+  // the transport — not whoever the message's `from` names.
+  const outcome = await parseTaskConsentOutcome(message, {
+    senderDid,
+    expectedExecutorDid: sent?.executorDid ?? vtaDid,
+  });
+  if (!outcome) return false;
   if (outcome.thid) awaitingDecisions.delete(outcome.thid);
   const what = sent
     ? `${sent.decision} of ${sent.taskType} (digest ${sent.payloadDigest.slice(0, 12)}…)`
@@ -1448,6 +1523,7 @@ async function maybeRelayConsentLocally(
     });
     conn.send(outer.packed);
     recordDecisionSent(outer.id, {
+      executorDid: vtaDid,
       payloadDigest: parsed.parsed.request.payloadDigest,
       decision: "approve",
       taskType: parsed.parsed.request.taskType,
@@ -1556,8 +1632,12 @@ async function doVerifyDid(did: string): Promise<VerifyRpDidResult> {
 // 1. **Holder-signed (default).** When `asDid` is absent the envelope
 //    is signed locally by the wallet's holder did:key #key-2 — the
 //    same eddsa-jcs-2022 Data Integrity proof the wallet has emitted
-//    since the beginning. The RP attributes the request to the holder
-//    DID.
+//    since the beginning, with `proofPurpose: authentication`: the page
+//    is asking the holder to sign its own request to the RP, an
+//    operational message, not an attestation. A relying party that binds
+//    proofs to key roles (the did-hosting control plane does) refuses an
+//    `assertionMethod` proof there. The RP attributes the request to the
+//    holder DID.
 //
 // 2. **Principal-signed via VTA (`asDid` set).** After a
 //    `vault/proxy-login/0.1` session the RP authenticates the session
@@ -1570,31 +1650,33 @@ async function doVerifyDid(did: string): Promise<VerifyRpDidResult> {
 //    canonicalises + signs + returns the signed envelope. Same
 //    eddsa-jcs-2022 proof shape, just signed by a different key.
 //
-// Falls back to holder-signing on `asDid` set BUT no matching vault
-// entry — easier on the caller than failing, and the resulting
-// proof's verificationMethod ≠ asDid will surface as a clear RP-side
-// rejection the operator can diagnose.
+// An `asDid` this wallet cannot sign as is refused (`sign-identity.ts`), never
+// served with the holder key in its place: the relying party would see a
+// document claiming one identity and proved by another.
 async function doSignTrustTask(
   vtaDid: string,
   params: SignTrustTaskParams,
   restBaseUrl: string | undefined,
 ): Promise<SignTrustTaskResult> {
   const envelope = params.envelope;
+  const { signing } = await loadHolder(vtaDid);
 
-  if (params.asDid && restBaseUrl) {
+  if (needsVault(params.asDid, signing.did)) {
     // Principal-signed path: find the matching vault entry, route via VTA
     // (over the VTA's preferred transport).
-    const { session, holder, service } = await getVtaSession(vtaDid, restBaseUrl);
-    const listed = await vaultList(session, {
-      holder,
-      service,
-    });
-    const match = listed.entries.find(
-      (e) =>
-        e.principalDid === params.asDid &&
-        (e.secretKind === "didSelfIssued" || e.secretKind === "didcommPeer"),
-    );
-    if (match) {
+    const vta = restBaseUrl ? await getVtaSession(vtaDid, restBaseUrl) : null;
+    const listed = vta
+      ? await vaultList(vta.session, { holder: vta.holder, service: vta.service })
+      : null;
+    const signer = chooseTrustTaskSigner(params.asDid, signing.did, listed?.entries ?? null);
+    // Unreachable — `chooseTrustTaskSigner` refuses rather than answering
+    // `holder` for an identity other than the holder — and kept so this
+    // branch can only ever end in a VTA signature or a refusal.
+    if (signer.kind !== "vault" || !vta) {
+      throw new SignAsUnavailableError(`cannot sign as ${params.asDid}`);
+    }
+    {
+      const { session, holder, service } = vta;
       // Ensure issuer is set on the envelope — the VTA rejects with
       // envelope_issuer_mismatch if it doesn't already match the
       // entry's principalDid. We don't silently rewrite either (matches
@@ -1613,26 +1695,14 @@ async function doSignTrustTask(
       const { signedEnvelope } = await vaultSignTrustTask(session, {
         holder,
         service,
-        entryId: match.id,
+        entryId: signer.entryId,
         unsignedEnvelope: toSign,
       });
-      return { signedEnvelope, holderDid: params.asDid };
+      return { signedEnvelope, holderDid: params.asDid! };
     }
-    // Fall through to holder-signing with a warning the operator
-    // can spot in the offscreen console.
-    console.warn(
-      `[pnm] signTrustTask: asDid=${params.asDid} requested but no matching vault entry found; falling back to holder-signed proof (the RP will likely reject)`,
-    );
-    const { signing } = await loadHolder(vtaDid);
-    const signedEnvelope = await signTrustTask({
-      envelope: { ...envelope },
-      signing,
-    });
-    return { signedEnvelope, holderDid: signing.did };
   }
 
-  // Holder-signed path: existing default.
-  const { signing } = await loadHolder(vtaDid);
+  // Holder-signed path: no `asDid`, or `asDid` naming the holder itself.
   // signTrustTask mutates in place and returns the same reference; clone
   // first so the caller's input is preserved across the IPC boundary
   // (chrome.runtime.sendMessage serializes — a defensive copy is cheap and
@@ -1640,6 +1710,7 @@ async function doSignTrustTask(
   const signedEnvelope = await signTrustTask({
     envelope: { ...envelope },
     signing,
+    proofPurpose: "authentication",
   });
   return { signedEnvelope, holderDid: signing.did };
 }
@@ -1675,6 +1746,7 @@ async function doOnboardPrepare(
   vtaDid: string,
   adminScope: AdminScope,
   context: string | undefined,
+  personaHolder: boolean,
 ): Promise<OnboardPrepareResult> {
   const services = await resolveVtaServices(vtaDid);
   if (!services.didcomm && !services.rest) {
@@ -1698,6 +1770,7 @@ async function doOnboardPrepare(
       ephemeralDid: eph.did,
       adminScope,
       ...(context ? { context } : {}),
+      personaHolder,
     }),
     ...(services.didcomm ? { mediatorDid: services.didcomm.mediatorDid } : {}),
     ...(services.rest ? { restBaseUrl: services.rest.baseUrl } : {}),
@@ -1810,7 +1883,12 @@ async function doOnboardConnect(params: OnboardConnectParams): Promise<OnboardCo
   const connect: MediatorConnector = (m) => {
     let c = conns.get(m);
     if (!c) {
-      c = connectMediatorSession({ holder: ephemeral, mediatorDid: m, vtaDid: pending.vtaDid });
+      c = connectMediatorSession({
+        holder: ephemeral,
+        mediatorDid: m,
+        vtaDid: pending.vtaDid,
+        netPolicy: walletNetPolicy(),
+      });
       conns.set(m, c);
     }
     return c;
@@ -1948,7 +2026,12 @@ async function doOnboardContexts(): Promise<{ contexts: Array<{ id: string; name
   const connect: MediatorConnector = (m) => {
     let c = conns.get(m);
     if (!c) {
-      c = connectMediatorSession({ holder: ephemeral, mediatorDid: m, vtaDid: pending.vtaDid });
+      c = connectMediatorSession({
+        holder: ephemeral,
+        mediatorDid: m,
+        vtaDid: pending.vtaDid,
+        netPolicy: walletNetPolicy(),
+      });
       conns.set(m, c);
     }
     return c;
@@ -2272,6 +2355,7 @@ async function createWarmSession(
   const conn = await connectMediatorSession({
     holder: identity,
     mediatorDid,
+    netPolicy: walletNetPolicy(),
     // No fixed peer for a shared session; the session resolves each reply's
     // sender on demand. Seed with our own DID (harmless) to satisfy the API;
     // each operation resolves its real VTA target separately (cached).
@@ -2293,7 +2377,9 @@ async function createWarmSession(
   if (isInbox) {
     // Return the promise: the transport awaits it and acks only once the
     // message is durably recorded (R1.6).
-    conn.onInbound((message) => onInboundMessage(conn, identity, signing, vtaDid, message));
+    conn.onInbound((message, _thid, sender) =>
+      onInboundMessage(conn, identity, signing, vtaDid, message, sender.did),
+    );
     // The same inbox over TSP. One socket carries both, so an executor that
     // pushes over TSP reaches the identical pipeline — same proof check, same
     // dedup, same persist-before-ack — with `unpackInboundTsp` supplying the
@@ -2304,6 +2390,353 @@ async function createWarmSession(
     );
   }
   return conn;
+}
+
+// ─── Mediator Lens ───────────────────────────────────────────────────────────
+//
+// The console's view of a mediator, over the session the wallet already holds
+// with it. A mediator answers Trust Tasks addressed to its own DID, so the
+// channel below is an ordinary `DidcommVtaTransport` whose "VTA" is the
+// mediator and which has no forward wrap: the authcrypt goes straight to the
+// relay that terminates it. Everything else is inherited — the holder signs the
+// document (SPEC §7.2 item 7a), the reply is matched by `thid` and its proof
+// checked against the mediator's DID, and a refusal arrives as a coded error.
+
+/** A refusal the lens raises itself, before any mediator is asked. */
+class MediatorLensError extends Error {
+  constructor(
+    readonly code: string,
+    message: string,
+  ) {
+    super(message);
+    this.name = "MediatorLensError";
+  }
+}
+
+function mediatorFailure(e: unknown): RuntimeMediatorResponse {
+  if (e instanceof MediatorLensError) return { ok: false, error: e.message, code: e.code };
+  return relayFailure(e);
+}
+
+/** Every (relay, agent) pair this document has opened a session for. */
+function pooledPairs(): { mediatorDid: string; vtaDid: string }[] {
+  return statusSnapshot().map(({ mediatorDid, vtaDid }) => ({ mediatorDid, vtaDid }));
+}
+
+interface LensSession {
+  conn: MediatorConnection;
+  channel: DidcommVtaTransport;
+  caller: MediatorCaller;
+  isInbox: boolean;
+}
+
+/**
+ * The channel to `mediatorDid`, authenticated as `vtaDid`'s holder — refused
+ * unless the wallet already uses that relay for that agent (`mayOperateMediator`
+ * says why that is the whole boundary).
+ */
+async function lensSession(mediatorDid: string, vtaDid: string): Promise<LensSession> {
+  const settings = await getSettings();
+  const decision = mayOperateMediator(
+    { mediatorDid, vtaDid },
+    { inboxes: settings.inboxes ?? {}, pooled: pooledPairs() },
+  );
+  if (!decision.ok) throw new MediatorLensError(decision.code, decision.reason);
+  const conn = await getWarmSession(mediatorDid, vtaDid);
+  const { identity: holder, signing } = await loadHolder(vtaDid);
+  const channel = new DidcommVtaTransport({
+    bridge: new MediatorSessionBridge(conn),
+    holder,
+    signing,
+    // The mediator is the counterparty: its key-agreement key is the authcrypt
+    // recipient and its DID the audience the proof binds. No `mediator` option,
+    // so no forward wrap — this message is for the relay itself.
+    vta: conn.mediator,
+    timeoutMs: 20_000,
+  });
+  return {
+    conn,
+    channel,
+    caller: { holder: { did: holder.did }, mediator: { did: conn.mediator.did } },
+    isInbox: decision.isInbox,
+  };
+}
+
+/** The mediator's release, from its public `readyz`. Best effort: a failure is
+ *  reported, never thrown, because the lens can still say what it found. */
+async function mediatorVersion(
+  mediatorDid: string,
+): Promise<{ version?: string; versionError?: string }> {
+  try {
+    const { restEndpoint } = await resolveMediatorEndpoint(mediatorDid, {
+      netPolicy: walletNetPolicy(),
+    });
+    const url = `${restEndpoint.replace(/\/+$/, "")}/readyz`;
+    const res = await withFetchTimeout(undefined, 5_000)(url, { redirect: "error" });
+    const body = (await res.json().catch(() => ({}))) as { version?: unknown };
+    if (typeof body.version === "string" && body.version) return { version: body.version };
+    return { versionError: `${originOf(url) ?? url} answered readyz without a version` };
+  } catch (e) {
+    // A fetch that fails at the network layer while this wallet holds a live
+    // session with the same mediator is a CORS refusal, not an outage: the
+    // mediator's health routes sit outside its CORS layer (fixed upstream,
+    // tdk-rs — health routes answer browsers from 0.29.3). Said structurally,
+    // never read off the message (R3.7).
+    if (e instanceof TypeError) {
+      return {
+        versionError:
+          "the mediator's /readyz does not answer a browser (it sends no CORS headers), " +
+          "so its release cannot be read from here",
+      };
+    }
+    return { versionError: e instanceof Error ? e.message : String(e) };
+  }
+}
+
+async function doMediatorOp(op: MediatorOp): Promise<MediatorOpResult> {
+  switch (op.kind) {
+    case "task": {
+      // An allow-list on top of the mediator's own authorisation — see
+      // `LENS_TASK_TYPES` for what is absent and why.
+      if (!isLensTask(op.params.type)) {
+        throw new MediatorLensError(
+          "mediator/task-not-offered",
+          `${op.params.type} is not something the lens runs.`,
+        );
+      }
+      const { channel, caller } = await lensSession(op.mediatorDid, op.vtaDid);
+      // Minted here, from the two members the carrier may carry: the device
+      // decides issuer, recipient, id and time, and the channel signs.
+      const envelope = buildTrustTask(op.params.type, op.params.payload, {
+        issuer: caller.holder.did,
+        recipient: caller.mediator.did,
+      });
+      const result = await channel.send<Record<string, unknown>>(envelope, {
+        expectedResponseType: `${op.params.type}#response`,
+      });
+      return { kind: "accepted", result };
+    }
+    case "probe": {
+      const { caller, isInbox } = await lensSession(op.mediatorDid, op.vtaDid);
+      return {
+        mediatorDid: op.mediatorDid,
+        vtaDid: op.vtaDid,
+        holderDid: caller.holder.did,
+        isInbox,
+        ...(await mediatorVersion(op.mediatorDid)),
+      };
+    }
+    case "locate": {
+      const services = await resolveVtaServices(op.did);
+      const mediatorDid = services.didcomm?.mediatorDid ?? services.tsp?.mediatorDid;
+      return { did: op.did, ...(mediatorDid ? { mediatorDid } : {}) };
+    }
+    case "relays": {
+      const settings = await getSettings();
+      const states = new Map(statusSnapshot().map((s) => [`${s.mediatorDid}|${s.vtaDid}`, s.state]));
+      return knownRelays(
+        { inboxes: settings.inboxes ?? {}, pooled: pooledPairs() },
+        (p) => states.get(`${p.mediatorDid}|${p.vtaDid}`),
+      ) satisfies KnownRelay[];
+    }
+  }
+}
+
+// ── Live traffic ────────────────────────────────────────────────────────────
+//
+// One subscription per console port, owned here. The port's lifetime is the
+// subscription's: the console tab closing disconnects it and the lease is
+// released at once, and this document being torn down (normal MV3 operation)
+// lets it lapse within one short lease — a closed tab must not hold one of the
+// mediator's three per-account slots for long.
+//
+// Batches arrive as frames *from the mediator* on the session, which
+// `onMediatorFrame` delivers without ever touching the inbound pending store:
+// they are live-only telemetry the mediator never stores, so there is nothing
+// for persist-before-ack to protect.
+
+const MONITOR_LEASE_SECONDS = 60;
+/** Renew this long before the lease lapses. */
+const MONITOR_RENEW_MARGIN_MS = 20_000;
+
+function isExtensionPagePort(port: chrome.runtime.Port): boolean {
+  return isExtensionContextSender(port.sender ?? {});
+}
+
+/** A sender inside this extension — an extension page or the service worker —
+ *  rather than a content script, which carries our id but a web page's URL. */
+function isExtensionContextSender(sender: chrome.runtime.MessageSender): boolean {
+  const base = chrome.runtime.getURL("");
+  return typeof sender.url === "string" && sender.url.startsWith(base);
+}
+
+chrome.runtime.onConnect.addListener((port) => {
+  if (port.name !== MEDIATOR_MONITOR_PORT) return;
+  if (!isExtensionPagePort(port)) {
+    console.warn(`[mediator lens] refusing monitor port from ${port.sender?.url}`);
+    port.disconnect();
+    return;
+  }
+  // Registered now, not after the session is up: Chrome does not replay a
+  // disconnect to a listener added later, and a console closed during the
+  // handshake would otherwise leave a subscription renewing with nobody
+  // listening — holding one of the mediator's three slots for as long as this
+  // document lives.
+  const gone = { closed: false, onClose: [] as Array<() => void> };
+  port.onDisconnect.addListener(() => {
+    gone.closed = true;
+    for (const f of gone.onClose.splice(0)) f();
+  });
+  const onFirst = (msg: unknown) => {
+    port.onMessage.removeListener(onFirst);
+    const open = msg as MonitorOpen;
+    if (open?.kind !== "open") {
+      port.disconnect();
+      return;
+    }
+    void runMonitor(port, open, gone);
+  };
+  port.onMessage.addListener(onFirst);
+});
+
+async function runMonitor(
+  port: chrome.runtime.Port,
+  open: MonitorOpen,
+  gone: { closed: boolean; onClose: Array<() => void> },
+): Promise<void> {
+  let connected = !gone.closed;
+  // Filled in once the session is up; until then a disconnect only marks it.
+  let stopNow: ((reason: string) => void) | undefined;
+  gone.onClose.push(() => {
+    connected = false;
+    stopNow?.("the console closed the feed");
+  });
+  const post = (m: MonitorMessage) => {
+    if (!connected) return;
+    try {
+      port.postMessage(m);
+    } catch {
+      // A port that cannot be written to has no reader; keeping the
+      // subscription would only hold a slot at the mediator for nobody.
+      connected = false;
+      stopNow?.("the console is no longer listening");
+    }
+  };
+
+  let session: LensSession;
+  try {
+    session = await lensSession(open.mediatorDid, open.vtaDid);
+  } catch (e) {
+    const f = mediatorFailure(e);
+    post({ kind: "ended", reason: f.ok ? "" : f.error, ...(!f.ok && f.code ? { code: f.code } : {}) });
+    port.disconnect();
+    return;
+  }
+  const { conn, channel, caller } = session;
+  const mediatorDid = caller.mediator.did;
+
+  const sequencer = new MonitorSequencer();
+  let subscriptionId: string | undefined;
+  const early: Record<string, unknown>[] = [];
+  let ended = false;
+  let renewTimer: ReturnType<typeof setTimeout> | undefined;
+  // Batches are verified one at a time, in arrival order, so a slow check on
+  // one cannot let the next overtake it and scramble the sequence.
+  let chain: Promise<void> = Promise.resolve();
+
+  const deliver = (doc: Record<string, unknown>) => {
+    chain = chain.then(async () => {
+      const batch = monitorBatchOf(doc);
+      if (!batch || batch.subscriptionId !== subscriptionId || ended) return;
+      try {
+        // A batch is the mediator's signed document like any reply; one that
+        // does not verify is not the mediator's account of its traffic.
+        await verifyTrustTaskReply(doc, mediatorDid);
+      } catch (e) {
+        console.warn("[mediator lens] dropped a monitor batch that did not verify:", e);
+        return;
+      }
+      for (const update of sequencer.push(batch)) post({ kind: "update", update });
+    });
+  };
+
+  const unlisten = conn.onMediatorFrame((message) => {
+    if (message.type !== TRUST_TASK_ENVELOPE_TYPE || message.from !== mediatorDid) return;
+    const doc = message.body as Record<string, unknown> | undefined;
+    if (!doc || !monitorBatchOf(doc)) return;
+    // A batch can beat the subscribe reply to us; hold it until we know the id.
+    if (subscriptionId === undefined) early.push(doc);
+    else deliver(doc);
+  });
+
+  const stop = (reason: string, code?: string) => {
+    if (ended) return;
+    ended = true;
+    if (renewTimer) clearTimeout(renewTimer);
+    unlisten();
+    post({ kind: "ended", reason, ...(code ? { code } : {}) });
+    if (subscriptionId && conn.isOpen) {
+      // Best effort: a lease that is not released lapses on its own.
+      void monitorUnsubscribe(channel, caller, subscriptionId).catch(() => undefined);
+    }
+    if (connected) {
+      connected = false;
+      port.disconnect();
+    }
+  };
+  stopNow = stop;
+  if (!connected) {
+    stop("the console closed the feed");
+    return;
+  }
+
+  const scheduleRenew = (expiresAt: string) => {
+    if (ended) return;
+    const lapse = Date.parse(expiresAt);
+    const wait = Number.isFinite(lapse)
+      ? Math.max(5_000, lapse - Date.now() - MONITOR_RENEW_MARGIN_MS)
+      : (MONITOR_LEASE_SECONDS * 1000) / 2;
+    renewTimer = setTimeout(() => void renew(), wait);
+  };
+  const renew = async () => {
+    if (ended || !subscriptionId) return;
+    // Batches ride this socket. If it dropped, a renewal on a fresh one would
+    // keep a lease alive whose batches go somewhere nobody is listening.
+    if (!conn.isOpen) return stop("the session with the mediator dropped");
+    try {
+      const g = await monitorSubscribe(channel, caller, {
+        subscriptionId,
+        leaseSeconds: MONITOR_LEASE_SECONDS,
+      });
+      scheduleRenew(g.expiresAt);
+    } catch (e) {
+      const f = mediatorFailure(e);
+      stop(`the lease could not be renewed: ${f.ok ? "" : f.error}`, f.ok ? undefined : f.code);
+    }
+  };
+
+  try {
+    const grant = await monitorSubscribe(channel, caller, {
+      ...(open.filter ? { filter: open.filter as MonitorFilter } : {}),
+      leaseSeconds: MONITOR_LEASE_SECONDS,
+    });
+    subscriptionId = grant.subscriptionId;
+    if (ended) {
+      void monitorUnsubscribe(channel, caller, grant.subscriptionId).catch(() => undefined);
+      return;
+    }
+    post({
+      kind: "granted",
+      subscriptionId: grant.subscriptionId,
+      filter: grant.filter as Record<string, unknown>,
+      expiresAt: grant.expiresAt,
+    });
+    for (const doc of early.splice(0)) deliver(doc);
+    scheduleRenew(grant.expiresAt);
+  } catch (e) {
+    const f = mediatorFailure(e);
+    stop(f.ok ? "subscription refused" : f.error, f.ok ? undefined : f.code);
+  }
 }
 
 // ─── Approver identity (Phase 2): a second, biometric-gated inbox ───
@@ -2418,6 +2851,7 @@ async function createApproverWarmSession(vtaDid: string): Promise<MediatorConnec
   const conn = await connectMediatorSession({
     holder: approver.identity,
     mediatorDid,
+    netPolicy: walletNetPolicy(),
     vtaDid: approver.identity.did,
     onClose: () => {
       approverPool.delete(key);
@@ -2431,8 +2865,8 @@ async function createApproverWarmSession(vtaDid: string): Promise<MediatorConnec
   conn.onInboundTsp((bytes) =>
     onInboundTspFrame(conn, approver.identity, approver.signing, vtaDid, bytes, true),
   );
-  conn.onInbound((message) =>
-    onInboundMessage(conn, approver.identity, approver.signing, vtaDid, message, true),
+  conn.onInbound((message, _thid, sender) =>
+    onInboundMessage(conn, approver.identity, approver.signing, vtaDid, message, sender.did, true),
   );
   console.info("[pnm approver] inbox listening as", approver.did);
   return conn;
@@ -2653,6 +3087,7 @@ async function drainPendingInbound(vtaDids: readonly string[]): Promise<void> {
           approver.signing,
           entry.vtaDid,
           entry.message,
+          entry.senderDid,
           true,
           true,
         );
@@ -2667,6 +3102,7 @@ async function drainPendingInbound(vtaDids: readonly string[]): Promise<void> {
           signing,
           entry.vtaDid,
           entry.message,
+          entry.senderDid,
           false,
           true,
         );
@@ -2757,7 +3193,8 @@ async function onInboundTspFrame(
     );
     throw err;
   }
-  await onInboundMessage(conn, identity, signing, vtaDid, message, isApprover);
+  // `message.from` here is the sender `unpackInboundTsp` proved, not a claim.
+  await onInboundMessage(conn, identity, signing, vtaDid, message, message.from, isApprover);
 }
 
 async function onInboundMessage(
@@ -2766,6 +3203,10 @@ async function onInboundMessage(
   signing: SigningIdentity,
   vtaDid: string,
   message: Record<string, unknown>,
+  // Who the transport authenticated as the sender: the authcrypt `skid`'s DID
+  // (DIDComm) or the proven VID (TSP). Carried beside the message, and
+  // persisted with it, because the message's own `from` is sender-written.
+  senderDid: string,
   isApprover = false,
 ): Promise<void> {
   const id = typeof message.id === "string" ? message.id : undefined;
@@ -2784,7 +3225,7 @@ async function onInboundMessage(
     isApprover ? "(approver inbox)" : "(worker inbox)",
     "type=", message.type,
     "id=", id ?? "(none)",
-    "from=", message.from,
+    "sender=", senderDid,
     "to=", message.to,
   );
   let persistError: unknown;
@@ -2793,6 +3234,7 @@ async function onInboundMessage(
       await putPendingInbound(new IndexedDBKVStore(), {
         id,
         message,
+        senderDid,
         vtaDid,
         isApprover,
       });
@@ -2807,7 +3249,7 @@ async function onInboundMessage(
     }
   }
   // Deliberately not awaited — see above.
-  void handleInbound(conn, identity, signing, vtaDid, message, isApprover);
+  void handleInbound(conn, identity, signing, vtaDid, message, senderDid, isApprover);
   if (persistError) throw persistError;
 }
 
@@ -2826,11 +3268,12 @@ async function handleInbound(
   signing: SigningIdentity,
   vtaDid: string,
   message: Record<string, unknown>,
+  senderDid: string,
   isApprover = false,
   fromDrain = false,
 ): Promise<void> {
   try {
-    await dispatchInbound(conn, identity, signing, vtaDid, message, isApprover, fromDrain);
+    await dispatchInbound(conn, identity, signing, vtaDid, message, senderDid, isApprover, fromDrain);
   } catch (err) {
     // There was no catch here, and the call site is `void handleInbound(...)`.
     // So anything dispatch threw — rather than returned as a refusal — became an
@@ -2867,6 +3310,8 @@ async function dispatchInbound(
   signing: SigningIdentity,
   vtaDid: string,
   message: Record<string, unknown>,
+  // The transport-authenticated sender (see `onInboundMessage`).
+  senderDid: string,
   // True when this is the approver's own inbox session: the decision is signed
   // as the approver, and the popup demands a per-decision biometric.
   isApprover = false,
@@ -2881,7 +3326,7 @@ async function dispatchInbound(
   // — accepted only from our enrolled VTA, carries no secret, and the page
   // re-checks the digest against its outstanding approval before acting — so we
   // just relay it to the background, which broadcasts it as a page event.
-  const granted = parseTaskConsentGranted(message, vtaDid);
+  const granted = parseTaskConsentGranted(message, vtaDid, senderDid);
   if (granted) {
     void chrome.runtime.sendMessage({
       type: RUNTIME_EMIT_WALLET_EVENT,
@@ -2896,7 +3341,7 @@ async function dispatchInbound(
   // reply on the same envelope type, and `parseTaskConsentRequest` can only
   // report it as `not-a-task-consent-request`, which is the one reason a caller
   // is allowed to ignore. That is exactly how a refused approval used to vanish.
-  if (await handleTaskConsentOutcome(vtaDid, message)) {
+  if (await handleTaskConsentOutcome(vtaDid, message, senderDid)) {
     return;
   }
 
@@ -3041,6 +3486,7 @@ async function handleTaskConsent(
     // Sending is not the end of the ceremony — a refusal means the human agreed
     // to a change that did not happen, and they have to be told which one.
     recordDecisionSent(outer.id, {
+      executorDid: parsed.executorDid,
       payloadDigest: parsed.request.payloadDigest,
       decision,
       taskType: parsed.request.taskType,
@@ -3063,52 +3509,60 @@ async function handleTaskConsent(
 async function doRestLogin(
   req: OffscreenRestLoginRequest,
 ): Promise<RuntimeLoginResponse> {
-  // REST SIOPv2 login moved off the background SW into offscreen so
-  // the holder's signing key is accessible — background's module
-  // scope has no PRF AES cache, so `loadHolder` from there throws
-  // `WalletLockedError` on encrypted wallets. Same flow as before
-  // (challenge → issueIdToken → authenticate), just running in the
-  // context that owns the cache.
-  const { signing } = await loadHolder(req.vtaDid);
+  // Runs here rather than in background because the holder's signing key only
+  // lives unwrapped in this document (the PRF AES cache is module-scoped), and
+  // `loadHolder` from background throws `WalletLockedError` on an encrypted
+  // wallet.
+  const sw = createStopwatch();
+  const { identity, signing } = await loadHolder(req.vtaDid);
+  sw.mark("load holder");
 
   // Which identity signs in was decided in the background, where the vault and
-  // the operator's choice live. Here it is only the difference between two
-  // id_token producers: the holder self-issues from a key this document holds,
-  // while a persona is minted by the VTA — the only place that key exists.
-  const minter = req.entryId
-    ? await personaMinter(req.vtaDid, req.restBaseUrl, req.entryId)
-    : selfIssuedMinter(signing);
+  // the operator's choice live. The holder signs with a key this document
+  // holds. A persona signs through the VTA, the only place its key exists.
+  const documentSigner = req.entryId
+    ? await personaTaskSigner(req.vtaDid, req.restBaseUrl, req.entryId)
+    : undefined;
 
-  const tokens = await loginViaSiop({
+  // `auth/challenge` then `auth/authenticate/0.2`, as Trust Tasks, to the RP
+  // this origin is pinned to. `rpHttpsSender` refuses a document addressed to
+  // anyone else and any reply the RP did not sign.
+  const sender = rpHttpsSender({
     baseUrl: req.params.baseUrl,
     rpDid: req.params.rpDid,
-    minter,
+    signing: documentSigner ?? signing,
   });
-  // The DID the RP actually authenticated, not the wallet's own. Reporting
-  // `signing.did` for a persona login would tell the page it is talking to an
-  // identity that never signed anything in this flow.
-  return { ok: true, result: { ...tokens, holderDid: minter.did } };
+  const rpSession = await loginViaTrustTask({
+    sender,
+    holder: identity,
+    service: { did: req.params.rpDid },
+    ...(documentSigner ? { subject: documentSigner.did } : {}),
+    // Validated as a did:key in the background, before the prompt, and
+    // checked again by `loginViaTrustTask` before the subject signs it.
+    ...(req.params.sessionKey !== undefined ? { sessionKey: req.params.sessionKey } : {}),
+  });
+  sw.mark("authenticate (trust-task)");
+  return {
+    ok: true,
+    result: {
+      accessToken: rpSession.accessToken,
+      refreshToken: rpSession.refreshToken ?? "",
+      sessionId: rpSession.sessionId,
+      // The DID the RP actually authenticated, not the wallet's own. Reporting
+      // `signing.did` for a persona login would tell the page it is talking to
+      // an identity that never signed anything in this flow.
+      holderDid: documentSigner?.did ?? signing.did,
+      ...(rpSession.sessionKey !== undefined ? { sessionKey: rpSession.sessionKey } : {}),
+      timings: sw.marks,
+    },
+  };
 }
 
-/**
- * An `id_token` minter backed by `vault/proxy-login/0.2`.
- *
- * The persona's signing key never leaves the VTA, so the wallet cannot issue
- * this token — it asks the VTA to, threading the RP's challenge through as the
- * `nonce` so the result passes the RP's exact-match check. The `SessionBlob`
- * comes back with the token in an `Authorization` header, which is the shape
- * `vault/proxy-login` has always returned for did-self-issued entries.
- *
- * The DID is read from the entry rather than assumed, because `principalDid` is
- * maintainer-derived: an entry whose secret was rotated at the VTA signs as
- * something the wallet never chose, and the challenge must be requested for
- * whatever actually signs or the RP refuses on `signer_did` mismatch.
- */
 /** A {@link TaskSigner} for a vault entry's persona, plus the VTA session it
- *  signs through. The persona DID is read from the entry rather than assumed,
- *  for the same reason `personaMinter` reads it: `principalDid` is
- *  maintainer-derived, and the RP checks the signer against the challenge
- *  subject. */
+ *  signs through. The persona DID is read from the entry rather than assumed.
+ *  `principalDid` is maintainer-derived, so an entry whose secret was rotated
+ *  at the VTA signs as something the wallet never chose, and the RP checks the
+ *  signer against the challenge subject. */
 async function personaTaskSigner(
   vtaDid: string,
   restBaseUrl: string | undefined,
@@ -3123,38 +3577,11 @@ async function personaTaskSigner(
   return vaultTaskSigner({ session, holder, service, entryId, did: entry.principalDid });
 }
 
-async function personaMinter(
-  vtaDid: string,
-  restBaseUrl: string | undefined,
-  entryId: string,
-): Promise<SiopIdTokenMinter> {
-  const { session, holder, service } = await getVtaSession(vtaDid, restBaseUrl);
-  const listed = await vaultList(session, { holder, service });
-  const entry = listed.entries.find((e) => e.id === entryId);
-  if (!entry?.principalDid) {
-    throw new Error(`vault entry ${entryId} names no persona DID`);
-  }
-  return {
-    did: entry.principalDid,
-    mint: async ({ nonce }) => {
-      const res = await vaultProxyLogin(session, { holder, service, entryId, nonce });
-      const auth = res.sessionBlob.headers?.find(
-        (h) => h.name.toLowerCase() === "authorization",
-      );
-      const token = auth ? /^\s*Bearer\s+(.+?)\s*$/i.exec(auth.value)?.[1] : undefined;
-      if (!token) {
-        throw new Error("vault/proxy-login: SessionBlob carried no id_token");
-      }
-      return token;
-    },
-  };
-}
-
 async function doDidcommLogin(
   req: OffscreenDidcommLoginRequest,
 ): Promise<RuntimeLoginResponse> {
   // Same IndexedDB-backed holder the popup/background use (shared extension
-  // origin), so the DID is identical to the REST path.
+  // origin), so the DID is identical to the `login()` path.
   const sw = createStopwatch();
   const { identity, signing } = await loadHolder(req.vtaDid);
   sw.mark("load holder");
@@ -3226,16 +3653,81 @@ async function doDidcommLogin(
   };
 }
 
+/**
+ * Obtain the fresh approval a `release: stepUp` disclosure needs.
+ *
+ * The same enforced order as `doStepUpVta`: **verify, then show, then sign.**
+ * Everything the human reads is taken from *inside* the agent's signature, per
+ * the spec's "consumers MUST verify the proof BEFORE surfacing the reason" —
+ * and here the reason is the list of facts about to leave, so the rule matters
+ * more rather than less.
+ *
+ * `verifyDisclosureStepUp` adds the check the generic verifier cannot make: the
+ * `previewId` inside the signature must equal the one the refusal named. The
+ * refusal's copy is unsigned, so approving against it would mean the holder
+ * read a prompt describing one disclosure and authorised whichever the
+ * signature meant.
+ *
+ * A refused request returns before the prompt, so the holder is never shown a
+ * claim list this wallet could not verify. A declined prompt sends nothing and
+ * the agent's challenge lapses on its TTL.
+ */
+async function doDisclosureStepUp(
+  req: OffscreenDisclosureStepUpRequest,
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  const verified = await verifyDisclosureStepUp(
+    { kind: "stepUpRequired", ...req.refusal },
+    { enrolledExecutorDids: await enrolledExecutorDids(req.vtaDid) },
+  );
+  if (!verified.ok) return { ok: false, error: `step-up request refused: ${verified.reason}` };
+
+  const ask: RuntimeDisclosureStepUpConsentRequest = {
+    type: RUNTIME_DISCLOSURE_STEP_UP_CONSENT,
+    origin: req.origin,
+    agentDid: verified.issuer,
+    claimTypes: [...verified.context.claimTypes],
+    ...(verified.context.verifierDid !== undefined
+      ? { verifierDid: verified.context.verifierDid }
+      : {}),
+    ...(verified.context.purpose !== undefined ? { purpose: verified.context.purpose } : {}),
+  };
+  const decision = (await chrome.runtime.sendMessage(ask)) as
+    | RuntimeDisclosureStepUpConsentResponse
+    | undefined;
+  // Anything but an explicit true — a vanished background, a malformed reply —
+  // is a denial. A prompt the holder never saw must not become an approval.
+  if (decision?.approved !== true) return { ok: false, error: "user declined the step-up approval" };
+
+  // An ordinary Trust Task: the channel signs it as the holder with
+  // `assertionMethod`, which IS the gate the approve-response requires, so the
+  // payload carries no proof of its own.
+  await doRequestTask({
+    target: OFFSCREEN_TARGET,
+    type: OFFSCREEN_REQUEST_TASK,
+    vtaDid: req.vtaDid,
+    ...(req.restBaseUrl !== undefined ? { restBaseUrl: req.restBaseUrl } : {}),
+    origin: req.origin,
+    params: {
+      type: DISCLOSURE_APPROVE_RESPONSE_TYPE,
+      payload: disclosureApprovalPayload(verified.request, true) as unknown as Record<
+        string,
+        unknown
+      >,
+    },
+  } as OffscreenRequestTaskRequest);
+  return { ok: true };
+}
+
 async function doStepUpVta(
   req: OffscreenStepUpVtaRequest,
 ): Promise<RuntimeLoginResponse> {
   // Same IndexedDB-backed holder the popup/background use, so the DID is
   // identical to the base-login path being elevated.
   const sw = createStopwatch();
-  const { signing } = await loadHolder(req.params.vtaDid);
+  const { signing } = await loadHolder(req.vtaDid);
   sw.mark("load holder");
 
-  // The flow itself — start → verify → consent → sign → finish, in that
+  // The flow itself — start → verify → consent → sign → finish → refresh, in that
   // enforced order — lives in core (`performStepUpVta`), where it is unit
   // tested. This function contributes only what core cannot know: the holder
   // identity, the enrolled-executor set, and how to reach a human. The
@@ -3243,22 +3735,25 @@ async function doStepUpVta(
   // windows): after `verifyStepUpApproveRequest` has passed — so the `reason`
   // the human reads comes from inside the verified signature, per the spec's
   // "consumers MUST verify the proof BEFORE surfacing the reason" — and
-  // before anything is signed. A refused approve-request (missing document,
-  // bad proof, non-enrolled signer, issuer ≠ rpDid) returns before the
+  // before anything is signed. A refused approve-request (unsigned reply, bad
+  // proof, non-enrolled signer, issuer ≠ rpDid, another session) returns before the
   // consent callback runs, so no prompt is ever raised for it; a declined
   // prompt sends nothing, and the RP's challenge lapses on its TTL.
   const outcome = await performStepUpVta({
     baseUrl: req.params.baseUrl,
     accessToken: req.params.accessToken,
+    refreshToken: req.params.refreshToken,
+    sessionId: req.params.sessionId,
     signing,
     rpDid: req.params.rpDid,
-    enrolledExecutorDids: await enrolledExecutorDids(req.params.vtaDid),
+    enrolledExecutorDids: await enrolledExecutorDids(req.vtaDid),
     onMark: (label) => sw.mark(label),
     requestConsent: async (ctx) => {
       const ask: RuntimeStepUpConsentRequest = {
         type: RUNTIME_STEP_UP_CONSENT,
         origin: req.origin,
         rpDid: req.params.rpDid,
+        baseUrl: req.params.baseUrl,
         holderDid: signing.did,
         ...(ctx.reason !== undefined ? { reason: ctx.reason } : {}),
       };

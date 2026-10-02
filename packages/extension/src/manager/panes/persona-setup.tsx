@@ -1,10 +1,10 @@
-// The first five minutes: a fact, a face, a context.
+// The first five minutes: an attribute, a face, a context.
 //
 // Shown while the holder has no face yet — the one state in which the identity
 // map has nothing to draw and a stack of empty bands would answer "what do I
 // do?" with silence. Three steps, in the order the model runs, each saying what
 // it changes before it is done; and beside the second, the exact card someone
-// would receive, updating as facts are ticked, because that card is the whole
+// would receive, updating as attributes are ticked, because that card is the whole
 // point of a face and the thing a person cannot picture from a list of
 // checkboxes.
 //
@@ -14,11 +14,14 @@
 import { useState } from "react";
 import type { PoolAttribute, PoolProfile } from "@openvtc/pnm-core/admin";
 import type { ContextRecord } from "@openvtc/pnm-core";
+import type { ClaimTypeRegistry } from "@openvtc/pnm-core/persona";
 import { Button, Note, Panel } from "../../ui.js";
 import { c, t, font } from "../../theme.js";
 import { contextHeading } from "../format.js";
 import type { Authority, Parties } from "../use-vta.js";
-import { AttributeEditor, BindingForm, FactValue, ProfileEditor } from "./persona-editors.js";
+import type { RevealTarget } from "../reveal-value.js";
+import { AttributeEditor, BindingForm, AttributeValue, ProfileEditor } from "./persona-editors.js";
+import { StarterForm } from "./persona-starter.js";
 import { holderGate } from "../holder-gate.js";
 import { reachableStep } from "../persona-flow.js";
 
@@ -26,7 +29,7 @@ type Step = 1 | 2 | 3;
 
 function Stepper({ step, reachable, onGo }: { step: Step; reachable: (s: Step) => boolean; onGo: (s: Step) => void }) {
   const items: [Step, string][] = [
-    [1, "Add a fact or two"],
+    [1, "Add an attribute or two"],
     [2, "Make a face"],
     [3, "Be known somewhere"],
   ];
@@ -82,10 +85,20 @@ function Stepper({ step, reachable, onGo }: { step: Step; reachable: (s: Step) =
 /** The card a stranger would receive from a face — the thing a tick list
  *  cannot convey. Rendered from the pool directly: at this step nothing has
  *  been pushed anywhere yet, so the pool is the only source. */
-function StrangerCard({ facts, faceName }: { facts: PoolAttribute[]; faceName: string }) {
-  const name = facts.find((f) => f.type === "name" || f.type.startsWith("name."));
-  const rest = facts.filter((f) => f !== name);
-  const provable = facts.some((f) => f.provenance.kind === "credentialBacked" && !f.stale);
+function StrangerCard({
+  attributes,
+  faceName,
+  registry,
+  onReveal,
+}: {
+  attributes: PoolAttribute[];
+  faceName: string;
+  registry: ClaimTypeRegistry | null;
+  onReveal: (target: RevealTarget) => Promise<unknown>;
+}) {
+  const name = attributes.find((f) => f.type === "name" || f.type.startsWith("name."));
+  const rest = attributes.filter((f) => f !== name);
+  const provable = attributes.some((f) => f.provenance.kind === "credentialBacked" && !f.stale);
   return (
     <div style={{ background: c.ground, border: `1px dashed ${c.line}`, borderRadius: "var(--w-r-md)", padding: "16px 18px", display: "grid", gap: 12, alignContent: "start" }}>
       <div style={{ display: "grid", gap: 3 }}>
@@ -93,13 +106,20 @@ function StrangerCard({ facts, faceName }: { facts: PoolAttribute[]; faceName: s
         <span style={{ fontSize: t.sm, color: c.muted }}>Exactly this, and nothing else. It changes as you tick.</span>
       </div>
       <div style={{ background: c.surface, border: `1px solid ${c.line}`, borderRadius: "var(--w-r-lg)", padding: "18px 20px", display: "grid", gap: 10, boxShadow: "0 1px 2px rgba(19,23,34,0.06), 0 8px 24px rgba(19,23,34,0.06)" }}>
-        {facts.length === 0 ? (
+        {attributes.length === 0 ? (
           <span style={{ fontSize: t.sm, color: c.faint }}>Nothing ticked. A stranger would receive an empty card.</span>
         ) : (
           <>
             <div style={{ display: "grid" }}>
               {name ? (
-                <FactValue type={name.type} value={name.value} style={{ fontSize: t.md, fontWeight: 640 }} />
+                <AttributeValue
+                  registry={registry}
+                  type={name.type}
+                  value={name.value}
+                  sensitivity={name.sensitivity}
+                  reveal={() => onReveal({ attributeId: name.attributeId, type: name.type })}
+                  style={{ fontSize: t.md, fontWeight: 640 }}
+                />
               ) : (
                 <span style={{ fontSize: t.md, fontWeight: 640 }}>—</span>
               )}
@@ -110,7 +130,13 @@ function StrangerCard({ facts, faceName }: { facts: PoolAttribute[]; faceName: s
               {rest.map((f) => (
                 <span key={f.attributeId} style={{ display: "contents" }}>
                   <span style={{ color: c.faint, fontFamily: font.mono, fontSize: t.xs }}>{f.label ?? f.type}</span>
-                  <FactValue type={f.type} value={f.value} />
+                  <AttributeValue
+                    registry={registry}
+                    type={f.type}
+                    value={f.value}
+                    sensitivity={f.sensitivity}
+                    reveal={() => onReveal({ attributeId: f.attributeId, type: f.type })}
+                  />
                 </span>
               ))}
             </div>
@@ -118,7 +144,7 @@ function StrangerCard({ facts, faceName }: { facts: PoolAttribute[]; faceName: s
         )}
       </div>
       <div style={{ display: "grid", gap: 6, fontSize: t.sm, color: c.muted, lineHeight: 1.5 }}>
-        {facts.length > 0 && !provable && (
+        {attributes.length > 0 && !provable && (
           <span>
             <strong style={{ color: c.text }}>Nothing here is proven.</strong> These are things you said. A context can pass them on, but cannot show anyone they are true.
           </span>
@@ -142,6 +168,8 @@ export function GuidedSetup({
   onChanged,
   onFinished,
   onSkip,
+  registry,
+  onReveal,
 }: {
   parties: Parties;
   authority: Authority | null;
@@ -152,11 +180,31 @@ export function GuidedSetup({
   /** The third step succeeded; the map takes over with the outcome as its banner. */
   onFinished: (outcome: string) => void;
   onSkip: () => void;
+  registry: ClaimTypeRegistry | null;
+  /**
+   * Ask the agent for one value it kept back.
+   *
+   * Threaded in with the fix that made this screen honour the holder's own
+   * `sensitivity`: without it a *Show* on a genuinely withheld value has
+   * nothing to call, and a button that cannot do what it says is the same
+   * defect one step along.
+   */
+  onReveal: (target: RevealTarget) => Promise<unknown>;
 }) {
   const [step, setStep] = useState<Step>(attributes.length === 0 ? 1 : 2);
   const [contextId, setContextId] = useState(records[0]?.id ?? "");
   const [ticked, setTicked] = useState<Set<string>>(new Set());
   const [faceName, setFaceName] = useState("");
+  /**
+   * Whether step one is showing the suggestions or the free-form editor.
+   *
+   * Suggestions first, and only while the holder has nothing: someone who has
+   * already added an attribute has met the model and is better served by the
+   * editor, and a form of mostly-blank boxes above it would read as work
+   * outstanding. Sticky once chosen, because "I'd rather type my own" is a
+   * statement about this person rather than about this render.
+   */
+  const [manual, setManual] = useState(false);
   const denied = holderGate(authority);
   const face = profiles[0];
 
@@ -174,26 +222,42 @@ export function GuidedSetup({
       {denied && <Note tone="warn">{denied}</Note>}
       <Stepper
         step={step}
-        reachable={(s) => reachableStep(s, { facts: attributes.length, faces: profiles.length })}
+        reachable={(s) => reachableStep(s, { attributes: attributes.length, faces: profiles.length })}
         onGo={setStep}
       />
 
       {step === 1 && (
         <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 1.2fr) minmax(0, 1fr)", gap: 16 }}>
           <div style={{ display: "grid", gap: 12, alignContent: "start" }}>
-            <AttributeEditor
+            {!manual && attributes.length === 0 ? (
+              <StarterForm
+                parties={parties}
+                authority={authority}
+                registry={registry}
+                onDone={onChanged}
+                onManual={() => setManual(true)}
+              />
+            ) : (
+            <AttributeEditor registry={registry}
               key={`new-${attributes.length}`}
               parties={parties}
               authority={authority}
               onDone={onChanged}
             />
+            )}
             {attributes.length > 0 && (
-              <Panel title={`${attributes.length} fact${attributes.length === 1 ? "" : "s"} so far`}>
+              <Panel title={`${attributes.length} attribute${attributes.length === 1 ? "" : "s"} so far`}>
                 <div style={{ display: "grid", gap: 6 }}>
                   {attributes.map((a) => (
                     <div key={a.attributeId} style={{ display: "flex", gap: 10, alignItems: "baseline", fontSize: t.sm }}>
                       <span style={{ fontFamily: font.mono, fontSize: t.xs, color: c.muted, minWidth: 120 }}>{a.type}</span>
-                      <FactValue type={a.type} value={a.value} />
+                      <AttributeValue
+                        registry={registry}
+                        type={a.type}
+                        value={a.value}
+                        sensitivity={a.sensitivity}
+                        reveal={() => onReveal({ attributeId: a.attributeId, type: a.type })}
+                      />
                     </div>
                   ))}
                 </div>
@@ -205,13 +269,13 @@ export function GuidedSetup({
           </div>
           <Panel title="Why start here">
             <p style={{ margin: 0, fontSize: t.sm, color: c.muted, lineHeight: 1.6 }}>
-              A fact is one thing about you, held once — a name, a phone number, a handle. Nothing you add here
-              is visible anywhere yet. Faces choose among facts; a context receives a copy only when a persona
+              An attribute is one thing about you, held once — a name, a phone number, a handle. Nothing you add here
+              is visible anywhere yet. Faces choose among attributes; a context receives a copy only when a persona
               there wears one.
             </p>
             <p style={{ margin: 0, fontSize: t.sm, color: c.muted, lineHeight: 1.6 }}>
               Two or three are plenty to start. You can always add more, and a face only ever shows what you
-              ticked — facts you add later stay out until you say otherwise.
+              ticked — attributes you add later stay out until you say otherwise.
             </p>
           </Panel>
         </div>
@@ -234,9 +298,9 @@ export function GuidedSetup({
               setStep(3);
             }}
             onCancel={() => setStep(1)}
-            cancelLabel="Back — add more facts"
+            cancelLabel="Back — add more attributes"
           />
-          <StrangerCard facts={preview} faceName={faceName} />
+          <StrangerCard onReveal={onReveal} registry={registry} attributes={preview} faceName={faceName} />
         </div>
       )}
 
@@ -275,11 +339,11 @@ export function GuidedSetup({
           </div>
           <Panel title="What this does">
             <p style={{ margin: 0, fontSize: t.sm, color: c.muted, lineHeight: 1.6 }}>
-              A persona is the identifier a context knows you by. Putting a face on it copies the face's facts
+              A persona is the identifier a context knows you by. Putting a face on it copies the face's attributes
               down into that context — and only that context. Nothing reads back up.
             </p>
             <p style={{ margin: 0, fontSize: t.sm, color: c.muted, lineHeight: 1.6 }}>
-              Edit a fact later and every copy updates. Wear the same face in two contexts and anyone who sees
+              Edit an attribute later and every copy updates. Wear the same face in two contexts and anyone who sees
               you in both knows you are one person — the map will show that link the moment it exists.
             </p>
           </Panel>

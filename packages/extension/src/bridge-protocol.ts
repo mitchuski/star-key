@@ -39,12 +39,25 @@ export type BridgeMethod =
 
 /** Parameters for `window.vtaWallet.login(...)` (REST SIOPv2). */
 export interface LoginParams {
-  /** The RP's identifier (its server DID) — becomes the `id_token` `aud`. */
+  /** The RP's identifier (its server DID). It is the `recipient` of both auth
+   *  documents, and every reply must be signed by it. */
   rpDid: string;
-  /** Base URL of the RP's auth API, e.g. `https://admin.webvh.storm.ws/api`.
-   *  Supplied by the RP because the API host need not match the DID's
-   *  domain (did:webvh domain ≠ admin host). */
+  /** The RP's Trust Task base, e.g. `https://admin.webvh.storm.ws/api`. The
+   *  documents are POSTed to `{baseUrl}/trust-tasks`. Supplied by the RP
+   *  because the API host need not match the DID's domain (did:webvh
+   *  domain ≠ admin host). */
   baseUrl: string;
+  /**
+   * Optional `did:key` for the RP to bind to this login's session
+   * (`auth/authenticate/0.2` `sessionKey`). The page generates it and keeps
+   * the private half, ideally as a non-extractable WebCrypto key. The wallet
+   * puts it inside the document it signs, so the RP accepts that key's proofs
+   * as the user for this session only, and never for a step-up approval.
+   *
+   * Anything that is not a `did:key` is refused before the wallet signs, and
+   * the consent prompt tells the user the site is getting a session key.
+   */
+  sessionKey?: string;
 }
 
 /** Parameters for `window.vtaWallet.loginDidcomm(...)` (DIDComm transport). */
@@ -61,19 +74,24 @@ export interface DidcommLoginParams {
   scope?: string[];
 }
 
-/** Parameters for `window.vtaWallet.stepUpVta(...)` (VTA-approval step-up).
- *  Elevates an existing `aal1` session (its `accessToken`) to `aal2`. */
+/** Parameters for `window.vtaWallet.stepUpVta(...)`: raise an existing RP
+ *  session to `aal2`. The wallet sends `auth/step-up/start/0.1`, verifies the
+ *  RP's signed reply and the approve-request inside it, asks the human, sends
+ *  a signed `approve-response/0.5`, and renews the session with
+ *  `auth/refresh/0.1` — all to `{baseUrl}/trust-tasks`. The holder that signs
+ *  is the active connection's; the page does not choose it. */
 export interface StepUpVtaParams {
-  /** Base URL of the RP's auth API (same one used for the base login). */
+  /** The RP's Trust Task base (the same one used for the base login). */
   baseUrl: string;
-  /** The RP's DID — bound into the approval the VTA signs. */
+  /** The RP's DID — every document is addressed to it, and every reply and the
+   *  approve-request must be signed by it. */
   rpDid: string;
-  /** The existing `aal1` session access token to elevate. */
+  /** The session's current access token. */
   accessToken: string;
-  /** The holder's VTA DID — approves the step-up over DIDComm. */
-  vtaDid: string;
-  /** The VTA's mediator DID (for the forward envelope). */
-  vtaMediatorDid: string;
+  /** The session's refresh token, spent on the renewal once it is elevated. */
+  refreshToken: string;
+  /** The session to elevate. The approve-request must be bound to it. */
+  sessionId: string;
 }
 
 /** Parameters for `window.vtaWallet.apiGet(...)` — an authenticated GET the
@@ -161,6 +179,10 @@ export interface LoginResult {
   sessionId: string;
   /** The wallet holder DID — surfaced so the operator can ACL-grant it. */
   holderDid: string;
+  /** The `did:key` the RP bound to this session. Present exactly when the
+   *  login asked for one, and then always equal to it: a relying party that
+   *  does not bind it fails the login. */
+  sessionKey?: string;
   /** Per-phase timings (ms) of the auth flow, for the demo to display. */
   timings?: { label: string; ms: number }[];
 }
@@ -557,6 +579,9 @@ export interface RuntimeOnboardPrepareRequest {
    *  names no context and the wallet's home context is chosen afterwards —
    *  from the list the authorised ephemeral can then read. */
   context?: string;
+  /** Ask for `persona-holder` on a `"context"` grant. Always granted for
+   *  `"unrestricted"`; see `grant-command.ts`. */
+  personaHolder?: boolean;
 }
 
 export interface OnboardPrepareResult {
@@ -1715,6 +1740,8 @@ export interface OffscreenOnboardPrepareRequest {
   adminScope: AdminScope;
   /** Mirrors `RuntimeOnboardPrepareRequest.context`. */
   context?: string;
+  /** Mirrors `RuntimeOnboardPrepareRequest.personaHolder`. */
+  personaHolder?: boolean;
 }
 
 export interface OffscreenOnboardConnectRequest {
@@ -1772,12 +1799,12 @@ export interface OffscreenDidcommLoginRequest {
   params: DidcommLoginParams;
 }
 
-/** background → offscreen: run a REST SIOPv2 login. The actual
- *  `issueIdToken` signing must happen here in offscreen — that's
- *  where the unwrapped holder secret lives (PRF AES cache is per-
- *  module-scope). Background's prior approach of loading the
- *  holder + calling `loginViaSiop` directly hung on encrypted
- *  wallets because background has no access to the cache. */
+/** background → offscreen: run the page's `login()`, `auth/challenge/0.1` then
+ *  `auth/authenticate/0.2`, over the RP's HTTPS Trust Task binding
+ *  (`{baseUrl}/trust-tasks`). The signing must happen here in offscreen,
+ *  because that is where the unwrapped holder secret lives (the PRF AES cache
+ *  is module-scoped). Background has no access to the cache, so signing from
+ *  there hung on encrypted wallets. */
 export const OFFSCREEN_REST_LOGIN = "offscreen/rest-login" as const;
 
 export interface OffscreenRestLoginRequest {
@@ -1792,10 +1819,10 @@ export interface OffscreenRestLoginRequest {
    *  operator chose it for this site or because there is no attested origin to
    *  bind a persona to. Resolved in the background, where the vault and the
    *  operator's recorded choice live; the offscreen only turns it into the
-   *  matching `id_token` producer. */
+   *  matching document signer. */
   entryId?: string;
-  /** REST base for the VTA session the persona mint goes through. Unused for
-   *  a holder login, which contacts only the RP. */
+  /** REST base for the VTA session the persona's signatures go through.
+   *  Unused for a holder login, which contacts only the RP. */
   restBaseUrl?: string;
 }
 
@@ -1803,9 +1830,75 @@ export interface OffscreenRestLoginRequest {
  *  [`RuntimeLoginResponse`] via `sendResponse`. Mid-flow the offscreen calls
  *  back with a [`RuntimeStepUpConsentRequest`] once the approve-request has
  *  verified — the background raises the consent prompt then, not before. */
+/** background → offscreen: obtain the fresh approval a `release: stepUp`
+ *  disclosure needs.
+ *
+ *  **In the offscreen, not the background, and the reason is structural.**
+ *  Verifying the agent's approve-request resolves a DID, and DID resolution
+ *  cannot be statically bundled into an MV3 service worker — a dynamic
+ *  `import()` in `background.js` is the one thing CI asserts is absent, because
+ *  a service worker cannot load one. So the verify and the signing both happen
+ *  here and the background contributes the only thing it uniquely can: a
+ *  window for the human. Exactly the shape `OFFSCREEN_STEP_UP_VTA` already has.
+ *
+ *  Reply is an [`OffscreenDisclosureStepUpResponse`]. */
+export const OFFSCREEN_DISCLOSURE_STEP_UP = "pnm/offscreen-disclosure-step-up" as const;
+
+export interface OffscreenDisclosureStepUpRequest {
+  target: typeof OFFSCREEN_TARGET;
+  type: typeof OFFSCREEN_DISCLOSURE_STEP_UP;
+  /** The agent that refused, and the transport to answer it on. */
+  vtaDid: string;
+  restBaseUrl?: string;
+  /** The requesting page's origin — display only, for the prompt. */
+  origin: string;
+  /** The refusal, verbatim. Its `approveRequest` is UNVERIFIED here; nothing
+   *  in it may be shown until `verifyDisclosureStepUp` has passed. */
+  refusal: {
+    previewId: string;
+    previewRetained: boolean;
+    unverifiedApproveRequest: Record<string, unknown>;
+  };
+}
+
+export type OffscreenDisclosureStepUpResponse =
+  | { ok: true }
+  | { ok: false; error: string };
+
+/** offscreen → background: raise the DISCLOSURE step-up prompt for a VERIFIED
+ *  approve-request. Everything here came out of the signature.
+ *
+ *  Deliberately its own message rather than reusing [`RUNTIME_STEP_UP_CONSENT`]:
+ *  that one is answered through `gatedConsent`, which returns true outright for
+ *  an origin the holder ticked "remember this site" for. Right for a login
+ *  step-up; wrong for this one, where the whole requirement is that the holder
+ *  decides *each time*. An origin-level grant answering for them would turn
+ *  "each time" into "once per site". */
+export const RUNTIME_DISCLOSURE_STEP_UP_CONSENT = "vta-wallet/disclosure-step-up-consent" as const;
+
+export interface RuntimeDisclosureStepUpConsentRequest {
+  type: typeof RUNTIME_DISCLOSURE_STEP_UP_CONSENT;
+  origin: string;
+  /** The agent that asked — the proven signer of the approve-request. */
+  agentDid: string;
+  /** From the verified context. Who would receive the claims. */
+  verifierDid?: string;
+  /** From the verified context. What would leave. */
+  claimTypes: string[];
+  /** From the verified context. The verifier's stated reason, if any. */
+  purpose?: string;
+}
+
+export interface RuntimeDisclosureStepUpConsentResponse {
+  approved: boolean;
+}
+
 export interface OffscreenStepUpVtaRequest {
   target: typeof OFFSCREEN_TARGET;
   type: typeof OFFSCREEN_STEP_UP_VTA;
+  /** The active connection's VTA — whose holder signs. Set by the background,
+   *  never by the page. */
+  vtaDid: string;
   params: StepUpVtaParams;
   /** The RP page's origin — threaded through so the mid-flow consent prompt
    *  can show it (and honour per-origin trust). Display only, never auth. */
@@ -1822,6 +1915,9 @@ export interface RuntimeStepUpConsentRequest {
   origin: string;
   /** The RP DID (== the approve-request's proven issuer). */
   rpDid: string;
+  /** The RP's Trust Task base the flow is running against, re-checked
+   *  against the origin's pin before the prompt is raised. */
+  baseUrl: string;
   /** The holder DID that will sign the approve-response. */
   holderDid: string;
   /** The RP's reason from inside the verified document. Absent when the
@@ -2002,6 +2098,114 @@ export interface RuntimeManagerTaskRequest {
 export type RuntimeManagerTaskResponse =
   | { ok: true; result: RequestTaskResult }
   | RelayTaskFailure;
+
+// ── Mediator Lens ────────────────────────────────────────────────────────────
+//
+// The console's view of a **mediator** — the relay carrying an agent's mail —
+// rather than of the agent. A mediator serves its own operations surface
+// (`messaging/*`: statistics, queues, accounts, a traffic monitor) as Trust
+// Tasks addressed to its own DID, and the wallet already holds an authenticated
+// session with it for each agent's inbox. These messages run those tasks over
+// that session: no new socket, and no key leaves the offscreen document.
+//
+// Operator surface, like `RUNTIME_MANAGER_TASK`: NOT page-facing, absent from
+// `content.ts`, and gated on `sender.url` in the background.
+
+/** manager console → background → offscreen: one Mediator Lens operation. */
+export const RUNTIME_MEDIATOR = "vta-wallet/mediator-lens" as const;
+export const OFFSCREEN_MEDIATOR = "offscreen/mediator" as const;
+
+/**
+ * What the console may ask of a mediator.
+ *
+ * `mediatorDid` + `vtaDid` name a (relay, agent) pair — the session is
+ * authenticated as that agent's holder, and the mediator decides what that
+ * holder may see. The offscreen document runs the operation only over a
+ * session the wallet already holds for its own traffic; it never opens
+ * standing at a mediator the console points it at.
+ */
+export type MediatorOp =
+  /** Run one `messaging/*` task. Same carrier rule as the manager relay: only
+   *  `type` and `payload` travel; the device mints and signs the envelope. */
+  | { kind: "task"; mediatorDid: string; vtaDid: string; params: RequestTaskParams }
+  /** Who the session is (holder DID) and what the mediator is (its release,
+   *  read from its public `readyz`). */
+  | { kind: "probe"; mediatorDid: string; vtaDid: string }
+  /** Where a DID's mail goes: the mediator its `DIDCommMessaging` service names. */
+  | { kind: "locate"; did: string }
+  /** Every (relay, agent) pair the wallet holds a session for. */
+  | { kind: "relays" };
+
+export interface RuntimeMediatorRequest {
+  type: typeof RUNTIME_MEDIATOR;
+  op: MediatorOp;
+}
+
+export interface OffscreenMediatorRequest {
+  target: typeof OFFSCREEN_TARGET;
+  type: typeof OFFSCREEN_MEDIATOR;
+  op: MediatorOp;
+}
+
+export interface MediatorProbe {
+  mediatorDid: string;
+  vtaDid: string;
+  /** The DID the session is authenticated as — the mediator account. */
+  holderDid: string;
+  /** Whether this relay is the agent's inbox (vs. a hop it only sends through). */
+  isInbox: boolean;
+  /** The mediator's release, when its `readyz` answered with one. */
+  version?: string;
+  /** Why the version could not be read, when it could not. */
+  versionError?: string;
+}
+
+export interface MediatorLocation {
+  did: string;
+  /** Absent when the DID names no mediator — it may not receive DIDComm at all. */
+  mediatorDid?: string;
+}
+
+export interface KnownRelay {
+  mediatorDid: string;
+  vtaDid: string;
+  isInbox: boolean;
+  state: "connecting" | "live" | "closed";
+}
+
+export type MediatorOpResult = RequestTaskResult | MediatorProbe | MediatorLocation | KnownRelay[];
+
+export type RuntimeMediatorResponse = { ok: true; result: MediatorOpResult } | RelayTaskFailure;
+
+/**
+ * Port name for the live traffic monitor, console → offscreen.
+ *
+ * A port rather than a message pair because the feed is a stream, and because
+ * its lifetime *is* the subscription's: the offscreen document unsubscribes the
+ * moment the console tab's port disconnects, so a closed tab never holds one of
+ * the mediator's three subscription slots for longer than a lease. The offscreen
+ * document gates the connection on `sender.url`, exactly as the background gates
+ * `RUNTIME_MEDIATOR`.
+ */
+export const MEDIATOR_MONITOR_PORT = "vta-wallet/mediator-monitor" as const;
+
+/** console → offscreen, once, as the port's first message. */
+export interface MonitorOpen {
+  kind: "open";
+  mediatorDid: string;
+  vtaDid: string;
+  /** A `MonitorFilter`. Typed loosely here so this module stays free of the
+   *  core import; the offscreen document passes it through to the mediator,
+   *  which validates it against the schema and narrows it. */
+  filter?: Record<string, unknown>;
+}
+
+/** offscreen → console. */
+export type MonitorMessage =
+  | { kind: "granted"; subscriptionId: string; filter: Record<string, unknown>; expiresAt: string }
+  /** One sequenced update: `events`, `gap` or `heartbeat`. */
+  | { kind: "update"; update: Record<string, unknown> & { kind: string } }
+  | { kind: "ended"; reason: string; code?: string };
 
 /**
  * Every runtime message type a *web page* can originate through the content

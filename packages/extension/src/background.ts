@@ -1,15 +1,24 @@
 /// <reference types="chrome" />
 
-// Service worker. Owns the wallet's holder identity, runs the REST SIOPv2
-// login, and gates every login behind a user-consent prompt. The DIDComm
-// login is delegated to an offscreen document (see `offscreen.ts`) because
-// it needs dynamic `import()` + a DOM, which a service worker lacks.
+// Service worker. Owns the wallet's holder identity and gates every login
+// behind a user-consent prompt. Both logins run in an offscreen document (see
+// `offscreen.ts`), because signing needs the unwrapped holder key and the
+// transports need dynamic `import()` + a DOM, which a service worker lacks.
 //
-// REST flow: content → RUNTIME_LOGIN → consent → offscreen REST login → tokens.
+// Login: content → RUNTIME_LOGIN → consent → offscreen Trust Task login (HTTPS) → tokens.
 // DIDComm flow: content → RUNTIME_LOGIN_DIDCOMM → consent → offscreen doc.
 
-import { pageTaskRefusal } from "./page-task-policy.js";
-import { IndexedDBKVStore, listPendingInbound } from "@openvtc/pnm-core";
+import {
+  pageSignBindingRefusal,
+  pageSignRefusal,
+  pageStepUpBindingRefusal,
+  pageTaskRefusal,
+} from "./page-task-policy.js";
+import {
+  disclosureStepUpFrom,
+  type DisclosureStepUpRequired,
+} from "@openvtc/pnm-core/persona";
+import { IndexedDBKVStore, isDidKey, listPendingInbound } from "@openvtc/pnm-core";
 import {
   parseActiveVtaDid,
   parseAllVtaDids,
@@ -18,8 +27,9 @@ import {
   readAgentMediatorDids,
   readAllVtaDids,
 } from "./active-vta.js";
-import { checkOriginPin, pinOrigin } from "./origin-pin.js";
+import { checkOriginPin, pinOrigin, readOriginPin, type OriginPinStatus } from "./origin-pin.js";
 import { isOriginTrusted, trustOrigin } from "./trusted-sites.js";
+import { promptMayRemember, trustMaySkipPrompt } from "./login-consent.js";
 import {
   forgetSiteIdentity,
   HOLDER_IDENTITY,
@@ -113,10 +123,22 @@ import {
   type RuntimeDiscloseRequest,
   type RuntimeDiscloseResponse,
   RUNTIME_MANAGER_TASK,
+  RUNTIME_MEDIATOR,
+  OFFSCREEN_MEDIATOR,
+  type RuntimeMediatorRequest,
+  type RuntimeMediatorResponse,
   RUNTIME_SIGN_TRUST_TASK,
   RUNTIME_TASK_CONSENT,
   CONSENT_KEEPALIVE_PORT,
   RUNTIME_STEP_UP_CONSENT,
+  OFFSCREEN_DISCLOSURE_STEP_UP,
+  RUNTIME_DISCLOSURE_STEP_UP_CONSENT,
+  type OffscreenDisclosureStepUpRequest,
+  type OffscreenDisclosureStepUpResponse,
+  type RuntimeDisclosureStepUpConsentRequest,
+  type RuntimeDisclosureStepUpConsentResponse,
+  type RelayTaskFailure,
+  type DiscloseResult,
   RUNTIME_STEP_UP_VTA,
   RUNTIME_APPROVER_STATE,
   RUNTIME_RESOLVE_AGENT_NAME,
@@ -205,7 +227,9 @@ import {
   displayHostFor,
   hasOriginPermission,
 } from "./host-permissions.js";
+import { vetEgressUrl } from "./proxy-url.js";
 import { ConsentReplayLedger, replayKey } from "./consent-replay.js";
+import { deliverConsentResult, openConsentWindow, type ConsentDecision } from "./consent-window.js";
 
 /** Consent-gated requests awaiting their one exempt replay. In-memory by
  *  design: a service-worker restart loses it, and losing it costs one extra
@@ -607,19 +631,27 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
 // login and reuse it thereafter.
 let creatingOffscreen: Promise<void> | null = null;
 async function ensureOffscreenDocument(): Promise<void> {
-  if (await chrome.offscreen.hasDocument()) return;
-  if (!creatingOffscreen) {
-    creatingOffscreen = chrome.offscreen
-      .createDocument({
-        url: "offscreen.html",
-        reasons: [chrome.offscreen.Reason.WORKERS],
-        justification:
-          "Run the DIDComm mediator session (WebSocket + did:webvh resolution) for wallet login.",
-      })
-      .finally(() => {
-        creatingOffscreen = null;
-      });
-  }
+  // The in-flight creation is checked before `hasDocument()`, and again after
+  // it. `hasDocument()` turns true as soon as creation starts — before the
+  // document has loaded and registered its `onMessage` listener — so a caller
+  // that trusted it returned early and sent into a document with no receiver
+  // ("Could not establish connection. Receiving end does not exist."), losing
+  // e.g. the boot-time START_INBOUND and leaving every inbox dark. The second
+  // check covers a creation that began while `hasDocument()` was answering.
+  if (creatingOffscreen) return creatingOffscreen;
+  const exists = await chrome.offscreen.hasDocument();
+  if (creatingOffscreen) return creatingOffscreen;
+  if (exists) return;
+  creatingOffscreen = chrome.offscreen
+    .createDocument({
+      url: "offscreen.html",
+      reasons: [chrome.offscreen.Reason.WORKERS],
+      justification:
+        "Run the DIDComm mediator session (WebSocket + did:webvh resolution) for wallet login.",
+    })
+    .finally(() => {
+      creatingOffscreen = null;
+    });
   await creatingOffscreen;
 }
 
@@ -687,10 +719,7 @@ chrome.runtime.onConnect.addListener((port) => {
 // ─── Consent coordination ───
 // A login request opens a consent popup and parks here until the popup
 // reports the user's decision (or is closed, which counts as a denial).
-const pendingConsents = new Map<
-  string,
-  (approved: boolean, remember: boolean, prfOutputB64u?: string, selectedDid?: string) => void
->();
+const pendingConsents = new Map<string, ConsentDecision>();
 
 /**
  * Size a consent popup as wide as the display sensibly allows.
@@ -757,8 +786,19 @@ async function requestConsent(args: {
    * operator has to explicitly approve the swap.
    */
   changedFromRpDid?: string;
+  /** When set, the base URL previously pinned for this origin — the site's
+   *  login now names a different one. Same loud treatment as an RP change. */
+  changedFromBaseUrl?: string;
+  /** Show that this origin is pinned to `rpDid` (and, for step-up, to this
+   *  base URL): the action is allowed only because of that pairing, so the
+   *  human should see it. Set by `signTrustTask` and step-up. */
+  pinned?: { baseUrl?: string };
   /** Frames the prompt as a session step-up rather than a sign-in. */
   stepUp?: boolean;
+  /** The `did:key` a sign-in will bind to its session. The prompt tells the
+   *  user that the site gets a key that can act for them in this session.
+   *  Already validated as a `did:key` by the caller. */
+  sessionKey?: string;
   /** VERIFIED RP-authored reason to render (plain text, already length-capped
    *  and control-stripped by the caller). Only ever set from the step-up path,
    *  where it comes from inside the signed approve-request — never pass a
@@ -783,12 +823,18 @@ async function requestConsent(args: {
     (args.action ? `&action=${encodeURIComponent(args.action)}` : "") +
     (args.noRemember ? `&noRemember=1` : "") +
     (args.stepUp ? `&stepUp=1` : "") +
+    (args.sessionKey ? `&sessionKey=${encodeURIComponent(args.sessionKey)}` : "") +
     (args.chooseProfile ? `&chooseProfile=1` : "") +
     (args.allowHolder ? `&allowHolder=1` : "") +
     (args.reason ? `&reason=${encodeURIComponent(args.reason)}` : "") +
     (args.changedFromRpDid
       ? `&changedFrom=${encodeURIComponent(args.changedFromRpDid)}`
-      : "");
+      : "") +
+    (args.changedFromBaseUrl
+      ? `&changedFromBase=${encodeURIComponent(args.changedFromBaseUrl)}`
+      : "") +
+    (args.pinned ? `&pinned=1` : "") +
+    (args.pinned?.baseUrl ? `&pinnedBase=${encodeURIComponent(args.pinned.baseUrl)}` : "");
 
   // The reason card and the persona picker each need room, or the decision
   // buttons slide off-screen — and an Approve the operator has to scroll to
@@ -807,52 +853,15 @@ async function requestConsent(args: {
       settle(approved, remember, selectedDid),
     );
 
-    chrome.windows.create({ url, type: "popup", ...bounds }, (win) => {
-      const winId = win?.id;
-      if (winId === undefined) {
-        // The window could not be opened. This used to `return` without
-        // settling, leaving the promise pending forever: the caller's `await`
-        // never resolved, no decision was ever produced, and nothing was logged
-        // in any context. From the outside that is indistinguishable from a
-        // request that never arrived — which is exactly how it presented, after
-        // the message had already been verified, de-duplicated, and acked to
-        // the mediator (so its queued copy was gone too).
-        //
-        // Settle as a DENIAL, never assent. A prompt the user never saw must
-        // not become an approval, and the rest of this file is built on
-        // "silence is not agreement".
-        //
-        // `lastError` is read inside the callback because that is the only
-        // place it exists; leaving it unread also emits an "unchecked
-        // runtime.lastError" warning that buries the real reason.
-        const why = chrome.runtime.lastError?.message ?? "no window was created";
-        console.error(
-          "[pnm consent] could not open the consent window — treating as a denial:",
-          why,
-        );
-        settle(false, false);
-        return;
-      }
-      // A window id proves creation succeeded; it does NOT prove the window is
-      // visible. `consentWindowBounds` derives left/top from
-      // `chrome.windows.getLastFocused()`, so a minimised window, a second
-      // display, or an undocked DevTools window can place the prompt somewhere
-      // the user never looks — and that is indistinguishable from no prompt at
-      // all, which is precisely the ambiguity that made the silent hang above
-      // so hard to find. Log where it went so "I see no popup" is answerable.
-      console.info(
-        "[pnm consent] consent window opened",
-        "id=", winId,
-        "bounds=", JSON.stringify(bounds),
-      );
-      // Closing the window without a decision is a denial.
-      const onClosed = (closedId: number) => {
-        if (closedId === winId) {
-          chrome.windows.onRemoved.removeListener(onClosed);
-          settle(false, false);
-        }
-      };
-      chrome.windows.onRemoved.addListener(onClosed);
+    // Closing the window without a decision is a denial; failing to open it
+    // is one too. `openConsentWindow` owns both, and the grace that keeps a
+    // decision already in flight from being overtaken by the close (VTI-40).
+    openConsentWindow({
+      url,
+      bounds,
+      deny: () => settle(false, false),
+      tag: "[pnm consent]",
+      what: "consent window",
     });
   });
 }
@@ -863,13 +872,21 @@ const DISCLOSURE_CONSENT_PREFIX = "disclosure-consent:";
 const PERSONA_PREVIEW = "https://trusttasks.org/spec/persona/disclosure/preview/1.0";
 const PERSONA_PRESENT = "https://trusttasks.org/spec/persona/disclosure/present/1.0";
 
-/** Run one persona task as the wallet, not as the page. */
+/**
+ * Run one persona task as the wallet, not as the page.
+ *
+ * Returns the **relay** shape, not the page-facing one: this caller is the
+ * wallet, and the wallet has to tell one refusal from another to drive the
+ * step-up ceremony below (R3.7). Nothing here reaches the page — `handleDisclose`
+ * returns prose or the presentation, and the `code`/`details` the agent sent
+ * stop at this file, exactly as `handleRequestTask` narrows them off for a site.
+ */
 async function runPersonaTask(
   active: { vtaDid: string; restBaseUrl?: string },
   origin: string,
   type: string,
   payload: Record<string, unknown>,
-): Promise<RuntimeRequestTaskResponse> {
+): Promise<{ ok: true; result: unknown } | RelayTaskFailure> {
   await ensureOffscreenDocument();
   return (await chrome.runtime.sendMessage({
     target: OFFSCREEN_TARGET,
@@ -878,7 +895,7 @@ async function runPersonaTask(
     restBaseUrl: active.restBaseUrl,
     origin,
     params: { type, payload },
-  })) as RuntimeRequestTaskResponse;
+  })) as { ok: true; result: unknown } | RelayTaskFailure;
 }
 
 /**
@@ -957,12 +974,117 @@ async function handleDisclose(req: RuntimeDiscloseRequest): Promise<RuntimeDiscl
   const approved = await raiseDisclosureConsent(consentId);
   if (!approved) return { ok: false, error: "user declined the disclosure" };
 
-  const presented = await runPersonaTask(active.conn, req.origin, PERSONA_PRESENT, {
-    contextId: binding.contextId,
-    previewId: preview.previewId,
-  });
+  const present = async () =>
+    runPersonaTask(active.conn, req.origin, PERSONA_PRESENT, {
+      contextId: binding.contextId,
+      previewId: preview.previewId,
+    });
+
+  let presented = await present();
+
+  // `release: stepUp` — the agent wants a fresh authentication bound to THIS
+  // preview before it will release it (`CLAIM-TYPES.md` §3.2).
+  //
+  // Returned as a refusal rather than thrown, and answered here rather than
+  // handed on. A page that received "Error: stepUpRequired" would be stranded
+  // at the moment the holder was supposed to act, and the retry the agent
+  // explicitly offered — `previewRetained: true`, the same preview, once
+  // approved — would be discarded at the last hop.
+  const stepUp = disclosureStepUpFrom(
+    presented.ok ? undefined : presented.code,
+    presented.ok ? undefined : presented.details,
+  );
+  if (stepUp) {
+    const done = await runDisclosureStepUp(active.conn, req.origin, stepUp);
+    if (!done.ok) return { ok: false, error: done.error };
+    // The SAME preview. The refusal did not consume it, which is the whole
+    // reason this is retryable rather than a restart.
+    presented = await present();
+  }
+
   if (!presented.ok) return { ok: false, error: presented.error };
-  return { ok: true, result: presented.result ?? {} };
+  return { ok: true, result: (presented.result ?? {}) as DiscloseResult };
+}
+
+/**
+ * Obtain the fresh approval a `release: stepUp` disclosure needs.
+ *
+ * Delegated to the offscreen document, and that is structural rather than
+ * stylistic: verifying the agent's approve-request resolves a DID, and DID
+ * resolution cannot be statically bundled into an MV3 service worker. A dynamic
+ * `import()` in `background.js` is the one thing CI asserts is absent, because a
+ * service worker cannot load one — so the verify and the signing live where
+ * they can, and this side contributes the only thing it uniquely can, a window
+ * for the human. `doStepUpVta` has exactly this shape for the same reason.
+ */
+async function runDisclosureStepUp(
+  active: { vtaDid: string; restBaseUrl?: string },
+  origin: string,
+  refusal: DisclosureStepUpRequired,
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  await ensureOffscreenDocument();
+  const ask: OffscreenDisclosureStepUpRequest = {
+    target: OFFSCREEN_TARGET,
+    type: OFFSCREEN_DISCLOSURE_STEP_UP,
+    vtaDid: active.vtaDid,
+    ...(active.restBaseUrl !== undefined ? { restBaseUrl: active.restBaseUrl } : {}),
+    origin,
+    refusal: {
+      previewId: refusal.previewId,
+      previewRetained: refusal.previewRetained,
+      unverifiedApproveRequest: refusal.unverifiedApproveRequest,
+    },
+  };
+  const result = (await chrome.runtime.sendMessage(ask)) as
+    | OffscreenDisclosureStepUpResponse
+    | undefined;
+  return result ?? { ok: false, error: "the step-up ceremony returned nothing" };
+}
+
+/**
+ * Ask the holder to approve **one** disclosure, freshly.
+ *
+ * Two departures from `gatedConsent`, and both are the requirement rather than
+ * caution:
+ *
+ *   - **`requestConsent` directly, so a trusted origin does not skip it.**
+ *     `gatedConsent` returns `true` outright for an origin the holder ticked
+ *     "remember this site" for. That is right for a login step-up and wrong
+ *     here: `release: stepUp` exists to make the holder decide *each time*, and
+ *     an origin-level grant that answered for them turns "each time" into
+ *     "once per site" — the same failure as binding to the session, reached
+ *     from a different direction.
+ *   - **`noRemember`, so it cannot become one.** There is nothing to remember:
+ *     the approval is bound to a single `previewId` and dies with it.
+ *
+ * The text comes from the **verified** context, never the unsigned refusal.
+ */
+async function handleDisclosureStepUpConsent(
+  req: RuntimeDisclosureStepUpConsentRequest,
+): Promise<RuntimeDisclosureStepUpConsentResponse> {
+  const { origin, agentDid } = req;
+  const context = { verifierDid: req.verifierDid, claimTypes: req.claimTypes, purpose: req.purpose };
+  // `attributes`, not `facts`, and "let it leave", not "disclosure". Both words
+  // are retired by `design-docs/persona-vocabulary.md` and this card is the
+  // holder's own screen — the one place in this flow where they read anything.
+  // `fact` was wrong twice over: it asserts a truth a self-asserted value does
+  // not have, and it is already the VTC ceremony engine's word for a *verified*
+  // policy input, which is very nearly the opposite.
+  const what =
+    context.claimTypes.length === 1
+      ? context.claimTypes[0]
+      : `${context.claimTypes.length} attributes (${context.claimTypes.join(", ")})`;
+  const to = context.verifierDid ? ` to ${context.verifierDid}` : "";
+  const why = context.purpose ? ` — they say it is for: ${context.purpose}` : "";
+  const { approved } = await requestConsent({
+    origin,
+    rpDid: agentDid,
+    noRemember: true,
+    stepUp: true,
+    action: "let this leave",
+    reason: `Release ${what}${to}${why}. This approval covers this one departure, and nothing else.`,
+  });
+  return { approved };
 }
 
 /** The persona and context this origin's stored profile entry names. */
@@ -1008,15 +1130,16 @@ async function raiseDisclosureConsent(consentId: string): Promise<boolean> {
     };
     pendingConsents.set(consentId, (approved: boolean) => settle(approved));
 
-    chrome.windows.create({ url, type: "popup", ...bounds }, (win) => {
-      if (win?.id === undefined) {
-        const why = chrome.runtime.lastError?.message ?? "no window was created";
-        console.error(
-          "[pnm disclose] could not open the disclosure window — treating as a denial:",
-          why,
-        );
-        settle(false);
-      }
+    // Closing the window is a denial here too. This surface used to register no
+    // `onRemoved` at all, so a disclosure prompt closed with the X left the
+    // request pending forever — the page's promise never settled and the
+    // session copy of the request was never removed.
+    openConsentWindow({
+      url,
+      bounds,
+      deny: () => settle(false),
+      tag: "[pnm disclose]",
+      what: "disclosure window",
     });
   });
 }
@@ -1069,54 +1192,17 @@ async function requestTaskConsent(
       settle(approved, prfOutputB64u),
     );
 
-    chrome.windows.create({ url, type: "popup", ...bounds }, (win) => {
-      const winId = win?.id;
-      if (winId === undefined) {
-        // The window could not be opened. This used to `return` without
-        // settling, leaving the promise pending forever: the caller's `await`
-        // never resolved, no decision was ever produced, and nothing was logged
-        // in any context. From the outside that is indistinguishable from a
-        // request that never arrived — which is exactly how it presented, after
-        // the message had already been verified, de-duplicated, and acked to
-        // the mediator (so its queued copy was gone too).
-        //
-        // Settle as a DENIAL, never assent. A prompt the user never saw must
-        // not become an approval, and the rest of this file is built on
-        // "silence is not agreement".
-        //
-        // `lastError` is read inside the callback because that is the only
-        // place it exists; leaving it unread also emits an "unchecked
-        // runtime.lastError" warning that buries the real reason.
-        const why = chrome.runtime.lastError?.message ?? "no window was created";
-        console.error(
-          "[pnm consent] could not open the consent window — treating as a denial:",
-          why,
-        );
-        settle(false);
-        return;
-      }
-      // A window id proves creation succeeded; it does NOT prove the window is
-      // visible. `consentWindowBounds` derives left/top from
-      // `chrome.windows.getLastFocused()`, so a minimised window, a second
-      // display, or an undocked DevTools window can place the prompt somewhere
-      // the user never looks — and that is indistinguishable from no prompt at
-      // all, which is precisely the ambiguity that made the silent hang above
-      // so hard to find. Log where it went so "I see no popup" is answerable.
-      console.info(
-        "[pnm consent] consent window opened",
-        "id=", winId,
-        "bounds=", JSON.stringify(bounds),
-      );
-      // Closing the window without deciding is a denial. Never assent: silence
-      // is not agreement, and a task-consent prompt that timed out into an
-      // approval would be the single worst bug in this system.
-      const onClosed = (closedId: number) => {
-        if (closedId === winId) {
-          chrome.windows.onRemoved.removeListener(onClosed);
-          settle(false);
-        }
-      };
-      chrome.windows.onRemoved.addListener(onClosed);
+    // Closing the window without deciding is a denial, and so is a window that
+    // could not be opened. Never assent: silence is not agreement, and a
+    // task-consent prompt that timed out into an approval would be the single
+    // worst bug in this system. The grace in `openConsentWindow` only lets a
+    // decision the operator actually sent land first (VTI-40).
+    openConsentWindow({
+      url,
+      bounds,
+      deny: () => settle(false),
+      tag: "[pnm consent]",
+      what: "consent window",
     });
   });
 }
@@ -1133,16 +1219,21 @@ async function gatedConsent(args: {
   holderDid?: string;
   action?: string;
   changedFromRpDid?: string;
+  changedFromBaseUrl?: string;
+  pinned?: { baseUrl?: string };
   stepUp?: boolean;
   reason?: string;
+  sessionKey?: string;
 }): Promise<boolean> {
-  // A pinned-RP *change* must always re-prompt, even for a trusted site —
-  // it's exactly the redirect-to-attacker-RP case the louder warning exists
-  // for, so trust doesn't get to silence it.
-  if (args.origin && !args.changedFromRpDid && (await isOriginTrusted(args.origin))) {
+  // A pinned-RP change, or a sign-in that binds a session key, is always
+  // asked, even for a remembered site. See `login-consent.ts`.
+  if (args.origin && trustMaySkipPrompt(args) && (await isOriginTrusted(args.origin))) {
     return true;
   }
-  const { approved, remember } = await requestConsent(args);
+  const { approved, remember } = await requestConsent({
+    ...args,
+    ...(promptMayRemember(args) ? {} : { noRemember: true }),
+  });
   if (approved && remember && args.origin) {
     await trustOrigin(args.origin, args.rpDid);
   }
@@ -1155,27 +1246,44 @@ async function handleLogin(req: RuntimeLoginRequest): Promise<RuntimeLoginRespon
   const holderDid = await readActiveHolderDid();
   if (!holderDid) return { ok: false, error: "no active VTA connection — connect first" };
 
+  // The page chose this value, and the wallet is about to sign it into a
+  // document as the user. Anything that is not a `did:key` is refused here,
+  // before the prompt, so the user is never asked to approve a key the RP
+  // would reject.
+  const sessionKey = req.params.sessionKey;
+  if (sessionKey !== undefined && !isDidKey(sessionKey)) {
+    return { ok: false, error: "sessionKey must be a did:key (did:key:z…), with no fragment" };
+  }
+
   // M5: pin the rpDid against the requesting origin. First-sight
   // origins seed the pin on approval; subsequent origins asking
   // for a *different* rpDid get a louder consent prompt so the
   // operator can spot a redirect-to-attacker-RP attempt.
-  const pin = req.origin
-    ? await checkOriginPin(req.origin, req.params.rpDid)
-    : { firstSeen: true, rpDidChanged: false, pinnedRpDid: undefined };
+  //
+  // The base URL is pinned beside the rpDid, because it is where `stepUpVta`
+  // from this origin may later go. A changed base URL is treated like a
+  // changed rpDid: always prompted, loudly, even for a remembered site.
+  const pin: OriginPinStatus = req.origin
+    ? await checkOriginPin(req.origin, req.params.rpDid, req.params.baseUrl)
+    : { firstSeen: true, rpDidChanged: false, baseUrlChanged: false };
 
   const consent: Parameters<typeof requestConsent>[0] = {
     origin: req.origin,
     rpDid: req.params.rpDid,
     holderDid,
+    ...(sessionKey !== undefined ? { sessionKey } : {}),
   };
   if (pin.rpDidChanged && pin.pinnedRpDid) {
     consent.changedFromRpDid = pin.pinnedRpDid;
+  }
+  if (pin.baseUrlChanged && pin.pinnedBaseUrl) {
+    consent.changedFromBaseUrl = pin.pinnedBaseUrl;
   }
   const approved = await gatedConsent(consent);
   if (!approved) return { ok: false, error: "login denied by user" };
 
   if (req.origin) {
-    await pinOrigin(req.origin, req.params.rpDid);
+    await pinOrigin(req.origin, req.params.rpDid, req.params.baseUrl);
   }
 
   // Which identity signs in. A per-site persona when this origin has one, the
@@ -1184,11 +1292,11 @@ async function handleLogin(req: RuntimeLoginRequest): Promise<RuntimeLoginRespon
   const identity = await resolveLoginIdentity(req.origin, req.params.rpDid, holderDid);
   if (!identity.ok) return { ok: false, error: identity.error };
 
-  // Forward the actual SIOPv2 round-trip to offscreen — the holder's
+  // Forward the challenge → authenticate round-trip to offscreen. The holder's
   // signing key only lives unwrapped there (the PRF AES cache is
-  // offscreen-module-scoped). Calling `loginViaSiop` from background
-  // worked on plaintext wallets but threw `WalletLockedError` on
-  // encrypted ones even when offscreen was unlocked.
+  // offscreen-module-scoped). Signing from background worked on plaintext
+  // wallets but threw `WalletLockedError` on encrypted ones, even when
+  // offscreen was unlocked.
   await ensureOffscreenDocument();
   const active = await readActiveConnection();
   if (!active.ok) return { ok: false, error: active.error };
@@ -1302,7 +1410,7 @@ async function handleLoginDidcomm(
   // login path; the DIDComm rpDid here is the RP's controlDid).
   const pin = req.origin
     ? await checkOriginPin(req.origin, req.params.controlDid)
-    : { firstSeen: true, rpDidChanged: false, pinnedRpDid: undefined };
+    : { firstSeen: true, rpDidChanged: false, baseUrlChanged: false, pinnedRpDid: undefined };
 
   const consent: Parameters<typeof requestConsent>[0] = {
     origin: req.origin,
@@ -1359,18 +1467,35 @@ async function handleStepUpVta(
   if (!holderDid) return { ok: false, error: "no active VTA connection — connect first" };
 
   // NO consent prompt here. The step-up prompt fires mid-flow instead: the
-  // offscreen fetches the RP `start` response, verifies the signed
-  // approve-request (proof + enrolled-executor signer + issuer == rpDid), and
+  // offscreen sends `auth/step-up/start`, verifies the RP's signed reply and
+  // the approve-request in it (proof + enrolled-executor signer + issuer ==
+  // rpDid + bound to this session), and
   // only then asks back via RUNTIME_STEP_UP_CONSENT — so the prompt can show
   // the human the VERIFIED `reason` from inside the signature. Prompting
   // before the fetch (the old shape) showed origin/rpDid only and left the
   // signed reason unread, which defeated the point of signing it (the spec's
   // rule is verify-BEFORE-surfacing, not verify-instead-of-surfacing).
   // Nothing is signed or sent unless that prompt approves.
+  //
+  // The signer is the active connection's holder — the identity the base login
+  // used — never one the page names.
+  //
+  // Refused before anything is sent or prompted: the page may only step up at
+  // the RP DID and base URL its origin is pinned to by an approved login. See
+  // `pageStepUpBindingRefusal`.
+  const bindingRefusal = pageStepUpBindingRefusal(
+    req.origin,
+    await readOriginPin(req.origin),
+    req.params,
+  );
+  if (bindingRefusal) return { ok: false, error: bindingRefusal };
+  const active = await readActiveConnection();
+  if (!active.ok) return { ok: false, error: active.error };
   await ensureOffscreenDocument();
   const offscreenRequest: OffscreenStepUpVtaRequest = {
     target: OFFSCREEN_TARGET,
     type: OFFSCREEN_STEP_UP_VTA,
+    vtaDid: active.conn.vtaDid,
     params: req.params,
     origin: req.origin,
   };
@@ -1409,11 +1534,19 @@ async function handleStepUpConsent(
     cleaned && cleaned.length > MAX_STEP_UP_REASON_CHARS
       ? `${cleaned.slice(0, MAX_STEP_UP_REASON_CHARS)}…`
       : cleaned;
+  // Re-checked here as well as before the flow started: the pin is read again
+  // for the prompt, and a pin that changed underneath the flow is a denial,
+  // never a prompt for a pairing the human has not confirmed.
+  const pin = await readOriginPin(req.origin);
+  if (pageStepUpBindingRefusal(req.origin, pin, { rpDid: req.rpDid, baseUrl: req.baseUrl })) {
+    return { approved: false };
+  }
   const approved = await gatedConsent({
     origin: req.origin,
     rpDid: req.rpDid,
     holderDid: req.holderDid,
     stepUp: true,
+    pinned: { ...(pin?.baseUrl ? { baseUrl: pin.baseUrl } : {}) },
     ...(reason ? { reason } : {}),
   });
   return { approved };
@@ -1441,6 +1574,9 @@ export class HostPermissionError extends Error {
 }
 
 async function proxyFetch(url: string, init: RequestInit): Promise<Response> {
+  // Judged before the grant is checked — see `proxy-url.ts` for what that
+  // covers and why it runs first.
+  vetEgressUrl(url);
   // Host grants are per-origin and requested just-in-time from a UI context
   // (host-permissions.ts). A service worker cannot prompt, so an ungranted
   // origin fails fast with a code the popup knows how to act on — rather
@@ -1451,6 +1587,14 @@ async function proxyFetch(url: string, init: RequestInit): Promise<Response> {
   try {
     return await fetch(url, {
       ...init,
+      // A grant is per-origin, and a redirect leaves that origin. A 302 to
+      // `http://localhost:…` or `http://169.254.169.254/…` would be followed
+      // with the extension's permissions and come back through the bridge as
+      // though the granted origin had answered it. There is no re-vetting
+      // available in a browser — `redirect: "manual"` yields an opaque
+      // response nothing can inspect — so the redirect is refused instead.
+      // After `...init` deliberately: a caller cannot spread this away.
+      redirect: "error",
       signal: AbortSignal.timeout(PROXY_FETCH_TIMEOUT_MS),
     });
   } catch (e) {
@@ -1543,6 +1687,7 @@ async function handleOnboardPrepare(
     vtaDid: req.vtaDid,
     adminScope: req.adminScope,
     ...(req.context ? { context: req.context } : {}),
+    ...(req.personaHolder ? { personaHolder: true } : {}),
   })) as RuntimeOnboardPrepareResponse;
 }
 
@@ -1977,8 +2122,24 @@ async function handleManagerTask(
 async function handleSignTrustTask(
   req: RuntimeSignTrustTaskRequest,
 ): Promise<RuntimeSignTrustTaskResponse> {
-  const typeUri = (req.params.envelope as { type?: unknown } | undefined)?.type;
-  const label = typeof typeUri === "string" ? typeUri : "an unidentified Trust Task";
+  const active = await readActiveConnection();
+  if (!active.ok) return { ok: false, error: active.error };
+  // Refused before any prompt: shapes no answer to the prompt could make safe
+  // (unaddressed, addressed to the holder's own agent, an approval, a family a
+  // page may not drive). See `pageSignRefusal`.
+  const refusal = pageSignRefusal(req.params.envelope, active.conn.vtaDid);
+  if (refusal) return { ok: false, error: refusal };
+  const { type: label, recipient } = req.params.envelope as { type: string; recipient: string };
+  // And only for the relying party this origin is pinned to by a login the
+  // human approved: a signature addressed to any other party is refused, as is
+  // any signature for an origin with no pin. Nothing here pins. See
+  // `pageSignBindingRefusal`.
+  const bindingRefusal = pageSignBindingRefusal(
+    req.origin,
+    await readOriginPin(req.origin),
+    recipient,
+  );
+  if (bindingRefusal) return { ok: false, error: bindingRefusal };
   // `requestConsent`, NOT `gatedConsent`.
   //
   // `gatedConsent` short-circuits for a remembered origin and prompts for
@@ -1990,8 +2151,14 @@ async function handleSignTrustTask(
   //
   // Origin trust is not capability trust. There is no envelope worth signing
   // unprompted, so this always asks, and offers no "remember".
+  //
+  // The recipient is shown as the relying party: the signature is the holder's
+  // request to that party, and to no other — and the prompt says it is the
+  // party this origin is pinned to.
   const approved = await requestConsent({
     origin: req.origin,
+    rpDid: recipient,
+    pinned: {},
     ...(req.params.asDid ? { holderDid: req.params.asDid } : {}),
     action: `Sign ${label}`,
     noRemember: true,
@@ -2003,8 +2170,6 @@ async function handleSignTrustTask(
   // only uses it on the `asDid` branch (which needs to call
   // `vault/sign-trust-task/0.1` against the VTA). On the holder-signed
   // path the restBaseUrl is harmless overhead.
-  const active = await readActiveConnection();
-  if (!active.ok) return { ok: false, error: active.error };
   return (await chrome.runtime.sendMessage({
     target: OFFSCREEN_TARGET,
     type: OFFSCREEN_SIGN_TRUST_TASK,
@@ -2389,12 +2554,13 @@ async function handleVaultListPage(
 // We unwrap the params and reuse the same offscreen pipeline as the
 // popup-initiated path.
 //
-// Origin gating: M2B.4 records `req.origin` for the upcoming consent
-// prompt + origin-pinning checks but doesn't currently enforce any
-// origin/entry match. That hardening lands alongside M3 policy
-// (Rego-driven proxy-vs-fill decisions). For now the wallet's
-// ProxyLogin capability + the per-entry context-scope check on the
-// VTA side are the trust anchors.
+// Origin pinning follows `login()`'s rule (M5) when the page names a target
+// DID: a changed target re-prompts loudly, and an approved sign-in pins the
+// origin to it. That pin is what `signTrustTask` — including the `asDid`
+// path this sign-in exists to enable — is bound to. The origin/entry match is
+// still not enforced beyond the persona binding; the wallet's ProxyLogin
+// capability + the per-entry context-scope check on the VTA side are the
+// trust anchors for that.
 async function handleVaultProxyLoginPage(
   req: RuntimeVaultProxyLoginPageRequest,
 ): Promise<RuntimeVaultProxyLoginResponse> {
@@ -2410,13 +2576,23 @@ async function handleVaultProxyLoginPage(
   const resolved = await resolveProfileEntry(req.origin, req.params.entryId);
   if (!resolved.ok) return { ok: false, error: resolved.error };
 
+  // M5, as in `handleLogin`: a target that differs from the one pinned for
+  // this origin gets the loud prompt, and only an approval pins.
+  const pin = targetDid ? await checkOriginPin(req.origin, targetDid) : undefined;
+  const changedFromRpDid = pin?.rpDidChanged ? pin.pinnedRpDid : undefined;
+  const pinOnApproval = async () => {
+    if (targetDid) await pinOrigin(req.origin, targetDid);
+  };
+
   if (resolved.entryId) {
     const approved = await gatedConsent({
       origin: req.origin,
       action: "Sign in via your VTA (proxied SIOP)",
       ...(targetDid ? { rpDid: targetDid } : {}),
+      ...(changedFromRpDid ? { changedFromRpDid } : {}),
     });
     if (!approved) return { ok: false, error: "proxy-login denied by user" };
+    await pinOnApproval();
     return dispatchProxyLogin({ ...req.params, entryId: resolved.entryId });
   }
 
@@ -2435,6 +2611,7 @@ async function handleVaultProxyLoginPage(
     action: "Sign in via your VTA (proxied SIOP)",
     chooseProfile: true,
     ...(targetDid ? { rpDid: targetDid } : {}),
+    ...(changedFromRpDid ? { changedFromRpDid } : {}),
   });
   if (!decision.approved || !decision.selectedDid) {
     // An approval with no persona is not an approval of anything — the surface
@@ -2445,6 +2622,7 @@ async function handleVaultProxyLoginPage(
 
   const bound = await bindProfileEntry(req.origin, decision.selectedDid, targetDid);
   if (!bound.ok) return { ok: false, error: bound.error };
+  await pinOnApproval();
 
   if (decision.remember) await trustOrigin(req.origin, targetDid);
 
@@ -2951,6 +3129,44 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true; // async sendResponse
   }
 
+  if ((message as { type?: string })?.type === RUNTIME_DISCLOSURE_STEP_UP_CONSENT) {
+    handleDisclosureStepUpConsent(message as RuntimeDisclosureStepUpConsentRequest)
+      .then(sendResponse)
+      // A denial, for the same reason as every other prompt here: silence is
+      // not agreement — least of all on the surface deciding whether a card
+      // number leaves.
+      .catch(() =>
+        sendResponse({ approved: false } satisfies RuntimeDisclosureStepUpConsentResponse),
+      );
+    return true; // async sendResponse
+  }
+
+  if ((message as { type?: string })?.type === RUNTIME_MEDIATOR) {
+    // The same gate as the manager relay below, for the same reason: this does
+    // not prompt, so the sender check is the whole boundary. Which mediator the
+    // op may reach is decided in the offscreen document, which alone knows what
+    // sessions the wallet holds.
+    if (!isExtensionPageSender(sender)) {
+      // eslint-disable-next-line no-console
+      console.warn(`[background] rejecting ${RUNTIME_MEDIATOR} from non-extension sender url=${sender.url}`);
+      sendResponse({ ok: false, error: "mediator surface is not page-reachable" });
+      return false;
+    }
+    void (async () => {
+      await ensureOffscreenDocument();
+      return (await chrome.runtime.sendMessage({
+        target: OFFSCREEN_TARGET,
+        type: OFFSCREEN_MEDIATOR,
+        op: (message as RuntimeMediatorRequest).op,
+      })) as RuntimeMediatorResponse;
+    })()
+      .then(sendResponse)
+      .catch((e: unknown) =>
+        sendResponse({ ok: false, error: e instanceof Error ? e.message : String(e) }),
+      );
+    return true; // async sendResponse
+  }
+
   if ((message as { type?: string })?.type === RUNTIME_MANAGER_TASK) {
     // Extension pages only. A content script carries our extension id but not
     // our URL, and this relay does not stop to ask a human — so the gate is the
@@ -3155,9 +3371,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if ((message as { type?: string })?.type === RUNTIME_CONSENT_RESULT) {
-    const { consentId, approved, remember, prfOutputB64u, selectedDid } =
-      message as RuntimeConsentResult;
-    pendingConsents.get(consentId)?.(approved, !!remember, prfOutputB64u, selectedDid);
+    // Settle first, then acknowledge. The popup awaits this response before it
+    // closes, so its window cannot be removed — which reads as a denial — until
+    // the decision has already landed (VTI-40).
+    const matched = deliverConsentResult(pendingConsents, message as RuntimeConsentResult);
+    sendResponse({ ok: true, matched });
     return false;
   }
 

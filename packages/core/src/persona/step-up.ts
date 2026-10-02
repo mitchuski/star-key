@@ -40,6 +40,7 @@
 
 import { VtaClientError } from "../vta/errors.js";
 import {
+  AGENT_APPROVE_REQUEST_TYPES,
   buildStepUpApproval,
   verifyStepUpApproveRequest,
   type StepUpApproveRequest,
@@ -56,6 +57,30 @@ export const DISCLOSURE_STEP_UP_REQUIRED_CODE = "persona/disclosure/present:step
 
 /** The reverse-DNS `ext` key the agent carries the disclosure's context under. */
 const AUTHZ_CONTEXT_EXT_KEY = "org.openvtc.authorization-context";
+
+/**
+ * The `type` a disclosure's authorization context declares.
+ *
+ * Contexts are a shared channel — a Cierge share ask travels under the same
+ * `ext` key — and `type` is how a renderer tells them apart. Checking it here
+ * means a context for some *other* operation cannot be read as a disclosure
+ * and shown with a disclosure's words.
+ */
+const DISCLOSURE_AUTHZ_CONTEXT_TYPE = "https://openvtc.org/persona/authorization-context/0.1";
+
+/**
+ * The `action.kind` a disclosure carries.
+ *
+ * Checked as well as `type`, because they answer different questions. `type`
+ * says which *producer's* vocabulary the context speaks; `kind` says which
+ * action within it. The persona context type carries only `disclose` today, so
+ * this rejects nothing yet — it is here for the second `kind` added under this
+ * type, which would otherwise be read as a disclosure, have its fields mined
+ * for `claimTypes` it never had, and be shown to the holder in a disclosure's
+ * words. Naming `kind` as the discriminator and then not checking it is how
+ * that arrives unnoticed.
+ */
+const DISCLOSURE_ACTION_KIND = "disclose";
 
 /** The agent needs a fresh approval before it will release this preview. */
 export interface DisclosureStepUpRequired {
@@ -78,7 +103,7 @@ export interface DisclosureStepUpRequired {
    * Named for what it is. Nothing in it may be shown to a human or signed over
    * until {@link verifyDisclosureStepUp} has passed — the spec rule is that a
    * consumer verifies the proof *before* surfacing the reason, and here the
-   * reason includes the list of facts about to leave.
+   * reason includes the list of attributes about to leave.
    */
   unverifiedApproveRequest: Record<string, unknown>;
 }
@@ -86,6 +111,9 @@ export interface DisclosureStepUpRequired {
 /** What the agent says this approval would release. Read only from the
  *  verified document — the unsigned half of the refusal carries no authority. */
 export interface DisclosureApprovalContext {
+  /** The agent's one-line account of the act — the same string it put in the
+   *  request's `reason`, so a surface may show either without them differing. */
+  summary?: string;
   /** Who would receive it. */
   verifierDid?: string;
   /** The claim types that would leave. */
@@ -117,15 +145,33 @@ export type VerifyDisclosureStepUpResult =
  */
 export function disclosureStepUpRequiredFrom(e: unknown): DisclosureStepUpRequired | null {
   if (!(e instanceof VtaClientError)) return null;
-
   const body = e.details as
     | { code?: unknown; details?: Record<string, unknown> }
     | undefined;
-  if (body?.code !== DISCLOSURE_STEP_UP_REQUIRED_CODE) return null;
+  return disclosureStepUpFrom(body?.code, body?.details);
+}
 
-  const d = body.details ?? {};
+/**
+ * The same recognition, from a refusal that was **not** thrown.
+ *
+ * A wallet that dispatches the task itself gets the agent's `code` and
+ * `details` as fields rather than inside an exception — the relay shape the
+ * console and the background use. One rule, two entry points: a second
+ * implementation would be the same three checks written twice, and the pair
+ * would drift on the third change rather than the first.
+ */
+export function disclosureStepUpFrom(
+  code: unknown,
+  details: unknown,
+): DisclosureStepUpRequired | null {
+  if (code !== DISCLOSURE_STEP_UP_REQUIRED_CODE) return null;
+
+  const d = (details ?? {}) as Record<string, unknown>;
   const previewId = typeof d.previewId === "string" ? d.previewId : "";
   const req = d.approveRequest;
+  // Without a previewId there is nothing to present again; without an
+  // approve-request there is nothing for the holder to approve. Either way this
+  // is an error like any other and is better surfaced as one than half-handled.
   if (!previewId || !req || typeof req !== "object") return null;
 
   return {
@@ -135,6 +181,47 @@ export function disclosureStepUpRequiredFrom(e: unknown): DisclosureStepUpRequir
     unverifiedApproveRequest: req as Record<string, unknown>,
   };
 }
+
+/** Payload of the `approve-response/0.3` that answers a disclosure step-up. */
+export interface DisclosureApprovalPayload {
+  subject: string;
+  sessionId: string;
+  challenge: string;
+  decision: "approved" | "denied";
+  grantedAcr: string;
+}
+
+/**
+ * The approve-response payload for a verified disclosure step-up.
+ *
+ * Deliberately **not** a signed document. `buildStepUpApproval` exists for the
+ * did-hosting RP, which is answered outside the channels and so must carry its
+ * own proof. A disclosure step-up is answered by dispatching an ordinary Trust
+ * Task to the agent, and the channel signs every outbound document as the
+ * holder with `proofPurpose: "assertionMethod"` — which is exactly the gate the
+ * approve-response requires. Building a second proof here would duplicate or
+ * overwrite that one, which is the reason `provision/integration` is called out
+ * in this repo's guide as the case that must bypass a channel.
+ *
+ * Every echoed field comes from the **verified** request.
+ */
+export function disclosureApprovalPayload(
+  request: StepUpApproveRequest,
+  approved: boolean,
+): DisclosureApprovalPayload {
+  return {
+    subject: request.subject,
+    sessionId: request.sessionId,
+    challenge: request.challenge,
+    decision: approved ? "approved" : "denied",
+    grantedAcr: "aal2",
+  };
+}
+
+/** `auth/step-up/approve-response/0.3` — the version that can be answered
+ *  `recorded`, which is what a bound disclosure approval must be. */
+export const DISCLOSURE_APPROVE_RESPONSE_TYPE =
+  "https://trusttasks.org/spec/auth/step-up/approve-response/0.3";
 
 export interface VerifyDisclosureStepUpOptions {
   /** The executors this wallet is enrolled with — its agent's DID. The
@@ -158,10 +245,10 @@ export async function verifyDisclosureStepUp(
   refusal: DisclosureStepUpRequired,
   opts: VerifyDisclosureStepUpOptions,
 ): Promise<VerifyDisclosureStepUpResult> {
-  const verified = await verifyStepUpApproveRequest(
-    { document: refusal.unverifiedApproveRequest },
-    opts,
-  );
+  const verified = await verifyStepUpApproveRequest(refusal.unverifiedApproveRequest, {
+    ...opts,
+    acceptTypes: AGENT_APPROVE_REQUEST_TYPES,
+  });
   if (!verified.ok) return verified;
 
   const payload = (refusal.unverifiedApproveRequest.payload ?? {}) as {
@@ -169,7 +256,25 @@ export async function verifyDisclosureStepUp(
   };
   const ctx = (payload.ext?.[AUTHZ_CONTEXT_EXT_KEY] ?? {}) as Record<string, unknown>;
 
-  if (ctx.previewId !== refusal.previewId) {
+  if (ctx.type !== DISCLOSURE_AUTHZ_CONTEXT_TYPE) {
+    return {
+      ok: false,
+      reason: `authorization context is ${String(ctx.type)}, not a disclosure`,
+    };
+  }
+
+  // The specifics live under `action`, keyed by `kind` — the shape every
+  // authorization context uses, so one renderer serves all of them.
+  const action = (ctx.action ?? {}) as Record<string, unknown>;
+
+  if (action.kind !== DISCLOSURE_ACTION_KIND) {
+    return {
+      ok: false,
+      reason: `authorization context action is ${String(action.kind)}, not a disclosure`,
+    };
+  }
+
+  if (action.previewId !== refusal.previewId) {
     return {
       ok: false,
       reason:
@@ -178,8 +283,8 @@ export async function verifyDisclosureStepUp(
     };
   }
 
-  const claimTypes = Array.isArray(ctx.claimTypes)
-    ? ctx.claimTypes.filter((t): t is string => typeof t === "string")
+  const claimTypes = Array.isArray(action.claimTypes)
+    ? action.claimTypes.filter((t): t is string => typeof t === "string")
     : [];
 
   return {
@@ -188,8 +293,9 @@ export async function verifyDisclosureStepUp(
     issuer: verified.issuer,
     context: {
       claimTypes,
-      ...(typeof ctx.verifierDid === "string" ? { verifierDid: ctx.verifierDid } : {}),
-      ...(typeof ctx.purpose === "string" ? { purpose: ctx.purpose } : {}),
+      ...(typeof ctx.summary === "string" ? { summary: ctx.summary } : {}),
+      ...(typeof action.verifierDid === "string" ? { verifierDid: action.verifierDid } : {}),
+      ...(typeof action.purpose === "string" ? { purpose: action.purpose } : {}),
     },
   };
 }
@@ -201,6 +307,17 @@ export async function verifyDisclosureStepUp(
  * only so a caller handling a disclosure never has to reach into `rp-login/`
  * for it. `request` must come from {@link verifyDisclosureStepUp}, never from
  * the refusal directly.
+ *
+ * **Minted as `0.3`, which is the whole point of this call existing.** The
+ * approval is bound to one `previewId`, so the honest acknowledgement is
+ * `recorded` — applied to that disclosure, elevating nothing. An approval sent
+ * as 0.2 is answered `elevated`, and the session then satisfies unrelated
+ * step-up gates for its window on the strength of a decision the holder made
+ * about a card number.
+ *
+ * The agent has accepted 0.3 since VTI #1316; it had to, before this could
+ * send it. Nothing else in this wallet mints 0.3 — `rp-login` answers a
+ * different relying party, the did-hosting control plane, in 0.5.
  */
 export async function approveDisclosureStepUp(args: {
   signing: SigningIdentity;
@@ -215,6 +332,7 @@ export async function approveDisclosureStepUp(args: {
     rpDid: args.agentDid,
     request: args.request,
     approved: args.approved,
+    responseVersion: "0.3",
     ...(args.deniedReason !== undefined ? { deniedReason: args.deniedReason } : {}),
   });
 }

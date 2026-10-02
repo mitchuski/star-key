@@ -6,9 +6,11 @@
 // (`persona-setup.tsx`) compose the same forms rather than two drifting copies.
 // The pane (`persona.tsx`) decides which of the two to show.
 //
-// Copy follows `design-docs/persona-vocabulary.md`: on screen it is a fact, a
-// face, a context, and a persona that wears a face. The code keeps the spec's
-// names (`attribute`, `profile`, `binding`) where they name wire records.
+// Copy follows `design-docs/persona-vocabulary.md`: on screen it is an
+// attribute, a face, a context, and a persona that wears a face. `attribute`
+// is the one term the table does not translate — the screen says what the wire
+// says — because the friendlier word it used to carry, `fact`, claimed a truth
+// self-asserted values do not have. `profile` and `binding` still translate.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
@@ -17,6 +19,13 @@ import {
   personaDisclosureHistory,
   personaProfileDelete,
   personaProfileGet,
+  personaProfileRetire,
+  personaProfileReinstate,
+  personaProfileTimeline,
+  personaProfileUsage,
+  personaProfileCompose,
+  personaAttributePromote,
+  personaCorrelationAnalyze,
   personaProfilePut,
   personasBlockingDelete,
   PROFILE_DELETE_BOUND,
@@ -26,23 +35,46 @@ import {
   type PoolAttribute,
   type PoolProfile,
   type PoolProfileEntry,
+  type FaceReach,
 } from "@openvtc/pnm-core/admin";
-import { getBinding, listBindings } from "@openvtc/pnm-core/persona";
+import {
+  deleteLocalProfile,
+  getBinding,
+  getLocalProfile,
+  listBindings,
+  listLocalProfiles,
+  putLocalProfile,
+  setLocalBinding,
+} from "@openvtc/pnm-core/persona";
 import { webvhDidCreate, webvhDidList, webvhServerList } from "@openvtc/pnm-core/webvh";
 import type { ContextRecord } from "@openvtc/pnm-core";
 import { Button, Note, Panel, Pill } from "../../ui.js";
 import { c, t, font } from "../../theme.js";
 import { managerSender } from "../sender.js";
 import { ConsentRequiredError, RelayTaskError } from "../carrier.js";
-import { ConsentCeremony, runMutation } from "../destructive.js";
+import { ConsentCeremony, Destructive, runMutation } from "../destructive.js";
 import { Loading, LoadError, Table, Truncated, type Column } from "../table.js";
 import { useAsync } from "../use-async.js";
 import { contextHeading, formatInstant } from "../format.js";
 import { type Authority, type Parties } from "../use-vta.js";
 import { holderGate } from "../holder-gate.js";
-import { maskedFact } from "../claim-sensitivity.js";
-import { composeEntries, lockedRefs, preservedEntries, tickedFrom } from "../profile-entries.js";
+import type { ClaimTypeRegistry } from "@openvtc/pnm-core/persona";
+import { maskedValue, treatmentFor, type Sensitivity } from "../claim-sensitivity.js";
+import { revealAttributeValue } from "../reveal-value.js";
+import {
+  composeEntriesWithSlots,
+  displayNameIsInline,
+  displayNameOf,
+  lockedRefs,
+  preservedEntries,
+  tickedFrom,
+} from "../profile-entries.js";
 import { personaCandidates } from "../persona-candidates.js";
+import { currencyOf, currencyWords, editReachWords, outdatedHolders } from "../disclosure-currency.js";
+import { untilFromLocalInput, untilToLocalInput, untilWords } from "../binding-until.js";
+import { reachWords, retiredWords, timelineWords, unTellWords } from "../face-lifecycle.js";
+import { composeClaimsFrom, composedWords, type ComposeRow } from "../compose-claims.js";
+import { DidQrButton } from "../../did-qr-view.js";
 
 export const fieldStyle: React.CSSProperties = {
   boxSizing: "border-box",
@@ -67,16 +99,27 @@ export function Label({ children }: { children: React.ReactNode }) {
  * `value` really is arbitrary JSON — a string attribute's value is a string —
  * so this must not assume an object, and must not print `[object Object]` for
  * the one case that is. `undefined` is the answer to a metadata-only listing
- * and says so, rather than rendering as an empty cell that reads like a fact
+ * and says so, rather than rendering as an empty cell that reads like an attribute
  * with no value.
  *
  * **Not exported, and that is the enforcement.** Every value this pane draws
- * goes through `FactValue` below, which is where a sensitive one is hidden. A
+ * goes through `AttributeValue` below, which is where a sensitive one is hidden. A
  * surface that could reach the raw rendering would be one mask away from
  * printing a passport number in full, and it would look like ordinary code.
  */
 function formatValue(value: unknown): { text: string; withheld: boolean } {
-  if (value === undefined) return { text: "not requested", withheld: true };
+  // **"with your agent"**, because the two earlier attempts each described
+  // something other than what the reader needs.
+  //
+  // "not requested" described the request the console made — true, and about
+  // the console rather than the value. "not on this page" fixed that and
+  // introduced its own contradiction: pressing *Show* fetches the value and
+  // displays it, so the card had said the value was not here and then produced
+  // it, which reads as the screen not knowing its own mind.
+  //
+  // This says where the value is, and the control beside it says what pressing
+  // it does. Neither is a claim the next press disproves.
+  if (value === undefined) return { text: "with your agent", withheld: true };
   if (value === null) return { text: "null", withheld: false };
   if (typeof value === "string") return { text: value, withheld: false };
   if (typeof value === "number" || typeof value === "boolean") {
@@ -86,7 +129,7 @@ function formatValue(value: unknown): { text: string; withheld: boolean } {
 }
 
 /**
- * A fact's value, hidden if its type says it should be, with a *Show* beside
+ * An attribute's value, hidden if its type says it should be, with a *Show* beside
  * it when it is.
  *
  * Every place this pane draws a value goes through here, because "wherever it
@@ -102,29 +145,92 @@ function formatValue(value: unknown): { text: string; withheld: boolean } {
  * let a UI string in this component imply otherwise.
  *
  * **Reveal is per value and lives in this component.** Not lifted to the pane
- * keyed by fact id, which would be a store of "things the operator has
+ * keyed by attribute id, which would be a store of "things the operator has
  * unhidden" — one that survives selection changes, outlives the card the person
  * was looking at, and is one refactor away from a *Show all*. Local state
  * cannot become that: it dies with the element, so leaving the pane, reloading
  * the console or navigating anywhere re-hides everything, and revealing the
- * same fact in two places is two deliberate acts rather than one.
+ * same attribute in two places is two deliberate acts rather than one.
  */
-export function FactValue({
+export function AttributeValue({
   type,
   value,
+  sensitivity,
   style,
   textStyle,
+  reveal,
+  registry,
 }: {
   type: string;
   value: unknown;
+  /**
+   * The holder's own decision on this attribute, where they made one. Absent
+   * means they did not, and the claim-type registry answers — the two are
+   * different claims and `treatmentFor` keeps them apart. A surface that has a
+   * whole attribute in hand should pass this; one that has only a type (a claim
+   * inside a face, read from a binding) has nothing to pass and gets the
+   * registry's answer, which is correct for it.
+   */
+  sensitivity?: Sensitivity | undefined;
   /** Typography for the row — applied to the wrapper, so the control inherits it. */
   style?: React.CSSProperties;
   /** Wrapping or truncation for the value itself, which differs per surface. */
   textStyle?: React.CSSProperties;
+  /**
+   * Ask the agent for this one value, when it did not send it.
+   *
+   * Optional, because not every surface can: a claim inside a face was read
+   * from a binding, not from the pool, and there is no second question to ask
+   * about it. Where it is absent a withheld value simply says so — which is
+   * the honest end of the sentence, and better than a *Show* that cannot.
+   */
+  reveal?: () => Promise<unknown>;
+  /** The agent's claim-type table, or `null` while it loads. A caller must not
+   *  substitute a compiled-in one — that is the copy this replaced. */
+  registry: ClaimTypeRegistry | null;
 }) {
   const [shown, setShown] = useState(false);
-  const { text, withheld } = formatValue(value);
-  const { text: hidden, masked } = maskedFact(type, text);
+  const [revealed, setRevealed] = useState<{ value: unknown } | null>(null);
+  const [asking, setAsking] = useState(false);
+  const [refused, setRefused] = useState<string | null>(null);
+
+  const { text, withheld } = formatValue(revealed ? revealed.value : value);
+  const { text: hidden, masked } = maskedValue(registry, type, text, sensitivity);
+
+  // **A withheld value is never masked.** The mask is a statement that a value
+  // is here and is being kept off the screen; drawing it over "not on this
+  // page" said the opposite of the truth, and hid the fact that the console
+  // had never been sent anything. This is the line that makes the difference
+  // between the two states visible instead of identical.
+  const covered = masked && !withheld && !shown;
+  const askable = withheld && reveal !== undefined && !asking;
+
+  const ask = async () => {
+    if (!reveal) return;
+    setAsking(true);
+    setRefused(null);
+    try {
+      setRevealed({ value: await reveal() });
+      setShown(true);
+    } catch (e) {
+      setRefused(e instanceof Error ? e.message : String(e));
+    } finally {
+      setAsking(false);
+    }
+  };
+
+  // Hiding a value this component fetched *drops* it, rather than covering it
+  // again. The plaintext arrived because a person asked; when they are done
+  // with it there is no reason for the page to keep holding it, and a mask over
+  // a value still in the tree is the decorative version this whole path exists
+  // to stop being.
+  const hide = () => {
+    setRevealed(null);
+    setShown(false);
+  };
+
+  const label = asking ? "Asking…" : shown || (revealed !== null) ? "Hide" : "Show";
+  const pressable = askable || covered || shown || revealed !== null;
 
   return (
     <span style={{ display: "inline-flex", alignItems: "baseline", gap: 7, minWidth: 0, ...style }}>
@@ -132,29 +238,37 @@ export function FactValue({
         style={{
           // A masked value is drawn at full strength; `c.faint` is this pane's
           // word for "the agent did not send one". Greying the mask too would
-          // make a fact the holder has look exactly like a fact they do not,
+          // make an attribute the holder has look exactly like an attribute they do not,
           // and the difference is the one thing a hidden value must still say.
           color: withheld ? c.faint : c.text,
-          ...(masked && !shown ? { fontFamily: font.mono, letterSpacing: 0.5 } : {}),
+          ...(covered ? { fontFamily: font.mono, letterSpacing: 0.5 } : {}),
           ...textStyle,
         }}
       >
-        {masked && !shown ? hidden : text}
+        {covered ? hidden : text}
       </span>
-      {masked && (
+      {refused && (
+        <span style={{ flexShrink: 0, fontSize: t.xs, color: c.warn }}>— {refused}</span>
+      )}
+      {pressable && (
         <button
-          // The fact card underneath is itself a click target — it selects the
-          // fact. Without this, revealing a value also moves the selection, and
+          // The attribute card underneath is itself a click target — it selects the
+          // attribute. Without this, revealing a value also moves the selection, and
           // the strip the operator was reading changes under them.
           onClick={(e) => {
             e.stopPropagation();
-            setShown((s) => !s);
+            if (revealed !== null || shown) hide();
+            else if (withheld) void ask();
+            else setShown(true);
           }}
+          disabled={asking}
           title={
-            shown
-              ? "Hide it again."
-              : "Hidden because this kind of fact is sensitive. Showing it changes what is on your " +
-                "screen, not what this page holds — your agent has already sent the value here."
+            shown || revealed !== null
+              ? "Hide it again — a value this page asked for is dropped, not covered over."
+              : withheld
+                ? "Your agent has not sent this value to this page. Show asks it for this one value."
+                : "Hidden because this kind of attribute is sensitive. Showing it changes what is on your " +
+                  "screen, not what this page holds — your agent has already sent the value here."
           }
           style={{
             flexShrink: 0,
@@ -166,10 +280,10 @@ export function FactValue({
             fontSize: t.xs,
             fontWeight: 600,
             fontFamily: "inherit",
-            cursor: "pointer",
+            cursor: asking ? "default" : "pointer",
           }}
         >
-          {shown ? "Hide" : "Show"}
+          {label}
         </button>
       )}
     </span>
@@ -242,6 +356,29 @@ export function parseValue(
 
 /** The raw form of a stored value, for editing. The inverse of `parseValue`
  *  for every type it round-trips, and JSON for the one it does not. */
+/**
+ * The holder's decision about the attribute a claim came from.
+ *
+ * A claim inside a face or a binding is a **copy**, and the copy carries no
+ * `sensitivity` — the decision lives on the pool attribute it was materialised
+ * from, above the boundary these screens sit below. Without this lookup the
+ * console showed the holder four bullets on a value they had just marked
+ * *show it*, one panel away from the card that showed it in the clear: the same
+ * person, the same value, two answers.
+ *
+ * Matched on `attributeId`, which a resolved claim carries when it came from
+ * the pool. An **inline** claim has none — it exists only inside that face and
+ * has no pool ancestor to have decided anything about — so it falls to the
+ * registry, which is the right answer for it rather than a gap in this one.
+ */
+export function decidedSensitivity(
+  pool: readonly PoolAttribute[] | undefined,
+  attributeId: string | undefined,
+): Sensitivity | undefined {
+  if (!pool || attributeId === undefined) return undefined;
+  return pool.find((a) => a.attributeId === attributeId)?.sensitivity;
+}
+
 export function rawValue(value: unknown): string {
   if (value === undefined || value === null) return "";
   if (typeof value === "string") return value;
@@ -250,6 +387,41 @@ export function rawValue(value: unknown): string {
 }
 
 
+/**
+ * The holder's own answer, or the registry's.
+ *
+ * A `<select>` with three options rather than a checkbox, because "not decided"
+ * is a real state and not the same as choosing the value the registry happens
+ * to give today. `persona/attribute/put` is emphatic about why: sending back a
+ * *resolved* default freezes the attribute to today's table, so a later
+ * tightening of the registry would protect every new attribute and leave this
+ * one exposed. `""` is that third state and maps to omitting the member.
+ */
+function Decision<Value extends string>({
+  value,
+  onChange,
+  fallback,
+  options,
+}: {
+  value: Value | "";
+  onChange: (next: Value | "") => void;
+  /** What the registry answers today, named in the default option so the
+   *  person can see what they would be changing away from. */
+  fallback: string;
+  options: { value: Value; label: string }[];
+}) {
+  return (
+    <select style={fieldStyle} value={value} onChange={(e) => onChange(e.target.value as Value | "")}>
+      <option value="">Let your agent decide — today that means {fallback}</option>
+      {options.map((o) => (
+        <option key={o.value} value={o.value}>
+          {o.label}
+        </option>
+      ))}
+    </select>
+  );
+}
+
 export function AttributeEditor({
   parties,
   authority,
@@ -257,6 +429,7 @@ export function AttributeEditor({
   onDone,
   onCancel,
   cancelLabel = "Cancel",
+  registry,
 }: {
   parties: Parties;
   authority: Authority | null;
@@ -269,17 +442,88 @@ export function AttributeEditor({
    *  that is where its button goes. */
   cancelLabel?: string | undefined;
   onDone: () => void;
+  /** The agent's claim-type table, or `null` while it loads. A caller must not
+   *  substitute a compiled-in one — that is the copy this replaced. */
+  registry: ClaimTypeRegistry | null;
 }) {
   const [type, setType] = useState(existing?.type ?? "");
   const [label, setLabel] = useState(existing?.label ?? "");
   const [valueType, setValueType] = useState<AttributeValueType>(existing?.valueType ?? "string");
   const [raw, setRaw] = useState(rawValue(existing?.value));
+  /**
+   * Whether this editor is holding the value it is about to write.
+   *
+   * **A put REPLACES the record, so a form field is a loaded gun.** The pane
+   * lists without `includeSensitive`, which is the whole point — the plaintext
+   * of a sensitive attribute is not in the page until someone asks for it — so
+   * an existing attribute arrives here with `value: undefined`, `rawValue`
+   * turns that into `""`, the field opens blank, and *Save* writes an empty
+   * string over a value the console never saw. Every `sensitivity: high`
+   * attribute, which is every unregistered one, silently emptied by an edit
+   * that meant to change a label.
+   *
+   * So the value is fetched before the form can be trusted, and until it is
+   * here — or the person types one themselves — this editor refuses to write.
+   * `held` is the only state in which a save may carry `raw` for an existing
+   * attribute.
+   */
+  const [valueState, setValueState] = useState<"held" | "loading" | "failed">(
+    !existing || existing.value !== undefined ? "held" : "loading",
+  );
+  const [valueRefused, setValueRefused] = useState<string | null>(null);
+  /** Set the moment a person edits the field, which is the other way the
+   *  editor comes to hold a value: they typed it. */
+  const [typed, setTyped] = useState(false);
+  // Both start from the record, so an edit that touches neither sends back what
+  // was there. A put REPLACES the attribute, so an editor that simply never
+  // mentioned these cleared the holder's decision on every save — silently,
+  // because nothing in the response says a member was dropped.
+  const [sensitivity, setSensitivity] = useState<Sensitivity | "">(existing?.sensitivity ?? "");
+  const [release, setRelease] = useState<"consent" | "stepUp" | "">(existing?.release ?? "");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [pending, setPending] = useState<ConsentRequiredError | null>(null);
   const [correlation, setCorrelation] = useState<string | null>(null);
+  /** Whether the note after a save warns of a link, or only reports where the edit landed. */
+  const [linksWarned, setLinksWarned] = useState(false);
 
   const denied = holderGate(authority);
+
+  /** Every control that edits the value goes through here. A control that set
+   *  `raw` directly would leave `typed` false, and the guard below would refuse
+   *  a save the person had every right to make — or, worse, a later edit to the
+   *  guard could read that as "we hold the value" and write the blank. */
+  const editValue = useCallback((next: string) => {
+    setRaw(next);
+    setTyped(true);
+  }, []);
+
+  // Asked once, on open, and only where the record came without its value.
+  // This is the same request *Show* makes on the map — one attribute, by type
+  // and id — and it is made here because an editor that cannot see the value
+  // cannot safely write the record that holds it.
+  useEffect(() => {
+    if (!existing || existing.value !== undefined) return;
+    let live = true;
+    void (async () => {
+      try {
+        const value = await revealAttributeValue(managerSender, parties, {
+          attributeId: existing.attributeId,
+          type: existing.type,
+        });
+        if (!live) return;
+        setRaw(rawValue(value));
+        setValueState("held");
+      } catch (e) {
+        if (!live) return;
+        setValueRefused(e instanceof Error ? e.message : String(e));
+        setValueState("failed");
+      }
+    })();
+    return () => {
+      live = false;
+    };
+  }, [existing, parties]);
 
   // An existing attribute keeps the provenance it was created with, verbatim.
   //
@@ -291,9 +535,23 @@ export function AttributeEditor({
   // sends back the object the agent gave us, and a credential-backed attribute
   // does not quietly become self-asserted because someone fixed its label.
   const provenance: AttributeProvenance = existing?.provenance ?? { kind: "selfAsserted" };
-  const derived = provenance.kind === "credentialBacked";
+  const backedByCredential = provenance.kind === "credentialBacked";
 
   const save = useCallback(async () => {
+    // The guard, and it is deliberately separate from the fetch above: a save
+    // that would replace a value this editor never held is refused even if
+    // every other path here changes. The fetch is the convenience; this is the
+    // property.
+    if (valueState !== "held" && !typed) {
+      setError(
+        valueState === "loading"
+          ? "Still asking your agent for the current value — saving now would replace it with an empty one."
+          : `Your agent did not hand over the current value (${valueRefused ?? "no reason given"}), so this ` +
+            `page is not holding it. Saving would replace it with an empty one. Type the value in yourself ` +
+            `to overwrite it deliberately, or close this and try again.`,
+      );
+      return;
+    }
     const parsed = parseValue(raw, valueType);
     if (!parsed.ok) {
       setError(parsed.why);
@@ -320,6 +578,15 @@ export function AttributeEditor({
           value: parsed.value,
           provenance,
           ...(label.trim() ? { label: label.trim() } : {}),
+          // Omitted where the person left it to the agent, which is how a
+          // decision is *cleared* as well as how one is never made. Never the
+          // resolved default — see `Decision` above.
+          ...(sensitivity ? { sensitivity } : {}),
+          ...(release ? { release } : {}),
+          // A put replaces the record, so endorsements the editor loaded go
+          // back unchanged — this editor has no control for them, and one it
+          // silently dropped would be a vouch the holder lost by fixing a label.
+          ...(existing?.endorsements?.length ? { endorsements: existing.endorsements } : {}),
           ...(existing ? { attributeId: existing.attributeId, expectedVersion: existing.version } : {}),
         });
         // Advisory, and it arrives with the write rather than before it: the
@@ -327,10 +594,18 @@ export function AttributeEditor({
         // refusing on correlation grounds would be the agent deciding who the
         // holder is allowed to be. Shown, never acted on.
         const shared = res.correlation?.sharedWithProfileCount ?? 0;
-        if (res.correlation?.severity === "high" || shared > 0) {
-          linked =
-            `Saved. ${shared} other fact(s) hold this exact value — anyone who sees both ` +
-            `knows they are the same person, permanently.`;
+        // Where the edit landed. Kept on screen with the correlation warning
+        // rather than closing the editor, for the same reason: a change that
+        // reached nine counterparties is worth one more glance.
+        const reach = editReachWords(res);
+        const warning =
+          res.correlation?.severity === "high" || shared > 0
+            ? `${shared} other attribute(s) hold this exact value — anyone who sees both ` +
+              `knows they are the same person, permanently.`
+            : null;
+        if (warning || reach) {
+          linked = ["Saved.", reach, warning].filter(Boolean).join(" ");
+          setLinksWarned(warning !== null);
           setCorrelation(linked);
         }
       },
@@ -338,17 +613,17 @@ export function AttributeEditor({
     );
     setBusy(false);
     if (ok && linked === null) onDone();
-  }, [parties, type, label, valueType, raw, provenance, existing, onDone]);
+  }, [parties, type, label, valueType, raw, provenance, sensitivity, release, existing, valueState, typed, valueRefused, onDone]);
 
   return (
     <Panel
-      title={existing ? `Edit ${existing.label ?? existing.type}` : "Add a fact"}
+      title={existing ? `Edit ${existing.label ?? existing.type}` : "Add an attribute"}
       description={
         existing
-          ? "Editing writes a new version. A face that shows this fact live picks the change up " +
+          ? "Editing writes a new version. A face that shows this attribute live picks the change up " +
             "everywhere it is worn — which is the point of selecting rather than copying, and " +
             "worth remembering before changing a value rather than adding one."
-          : "A fact about you, held once. Faces select it; a context receives a copy only when " +
+          : "Something you say about yourself, held once. Faces select it; a context receives a copy only when " +
             "a persona there wears one of them."
       }
     >
@@ -402,7 +677,7 @@ export function AttributeEditor({
         <label style={{ display: "grid", gap: 4 }}>
           <Label>VALUE</Label>
           {valueType === "boolean" ? (
-            <select style={fieldStyle} value={raw} onChange={(e) => setRaw(e.target.value)}>
+            <select style={fieldStyle} value={raw} onChange={(e) => editValue(e.target.value)}>
               <option value="true">true</option>
               <option value="false">false</option>
             </select>
@@ -410,14 +685,14 @@ export function AttributeEditor({
             <textarea
               style={{ ...fieldStyle, minHeight: 110, fontFamily: font.mono, resize: "vertical" }}
               value={raw}
-              onChange={(e) => setRaw(e.target.value)}
+              onChange={(e) => editValue(e.target.value)}
               placeholder='{"street": "…"}'
             />
           ) : (
             <input
               style={fieldStyle}
               value={raw}
-              onChange={(e) => setRaw(e.target.value)}
+              onChange={(e) => editValue(e.target.value)}
               placeholder={valueType === "date" ? "1978-04-02" : ""}
             />
           )}
@@ -426,10 +701,59 @@ export function AttributeEditor({
           </span>
         </label>
 
-        {derived && (
+        {/* ── What happens to this value, decided here ──
+            Two questions, not one, because they are answered by different
+            things at different moments: the first is about your own screen and
+            about what your agent hands this page, the second is about a value
+            leaving for somebody else. The claim-type registry answers both
+            unless you say otherwise, and leaving them alone is a real answer —
+            it means "keep following the registry", so a later tightening
+            reaches this attribute too. */}
+        <label style={{ display: "grid", gap: 4 }}>
+          <Label>SHOWING IT TO YOU</Label>
+          <Decision
+            value={sensitivity}
+            onChange={setSensitivity}
+            fallback={
+              treatmentFor(registry, type.trim()).treatment.sensitivity === "high"
+                ? "kept back until you ask"
+                : "shown"
+            }
+            options={[
+              { value: "normal" as const, label: "Show it — no need to hide this one" },
+              { value: "high" as const, label: "Keep it back until I ask for it" },
+            ]}
+          />
+          <span style={{ fontSize: t.xs, color: c.faint, lineHeight: 1.5 }}>
+            Kept back means your agent does not send the value to this page at all until you press
+            <em> Show</em> on it. It is also what hides it on screen — for a token the registry does
+            not know, like <code>profile.github</code>, saying <em>show it</em> is what takes the
+            bullets off the card.
+          </span>
+        </label>
+
+        <label style={{ display: "grid", gap: 4 }}>
+          <Label>LETTING IT LEAVE</Label>
+          <Decision
+            value={release}
+            onChange={setRelease}
+            fallback="you approve it once, before it goes"
+            options={[
+              { value: "consent" as const, label: "I approve it once, before it goes" },
+              { value: "stepUp" as const, label: "Ask me again, on my device, every single time" },
+            ]}
+          />
+          <span style={{ fontSize: t.xs, color: c.faint, lineHeight: 1.5 }}>
+            <em>Every single time</em> binds the approval to that one departure rather than to
+            being signed in — which is the difference between "each time" and "once per login".
+            Your agent refuses to hand the value over without it.
+          </span>
+        </label>
+
+        {backedByCredential && (
           <Note tone="warn">
-            This fact is backed by a <strong>credential</strong>, and that is kept as it stands —
-            nothing here can turn a fact you can prove into one you merely said.
+            This attribute is backed by a <strong>credential</strong>, and that is kept as it stands —
+            nothing here can turn an attribute you can prove into one you merely said.
             The value is a display cache: the agent re-derives it from the credential and may
             overwrite what you type.
           </Note>
@@ -438,7 +762,7 @@ export function AttributeEditor({
         {error && <Note tone="danger">{error}</Note>}
         {pending && <ConsentCeremony pending={pending} />}
         {correlation && (
-          <Note tone="warn">
+          <Note tone={linksWarned ? "warn" : "accent"}>
             <div style={{ display: "grid", gap: 8 }}>
               <span>{correlation}</span>
               <div>
@@ -457,7 +781,7 @@ export function AttributeEditor({
             {...(denied ? { title: denied } : {})}
             onClick={() => void save()}
           >
-            {busy ? "Saving…" : existing ? "Save" : "Add fact"}
+            {busy ? "Saving…" : existing ? "Save" : "Add attribute"}
           </Button>
           {onCancel && (
             <Button kind="quiet" disabled={busy} onClick={onCancel}>
@@ -472,11 +796,15 @@ export function AttributeEditor({
 }
 
 
+/** The `CALLS ITSELF` option meaning "leave the inline name as it is". */
+const KEEP_INLINE = "\u0000inline";
+
 export function ProfileEditor({
   parties,
   authority,
   attributes,
   existing,
+  contexts,
   onPreview,
   onDone,
   onCancel,
@@ -486,6 +814,12 @@ export function ProfileEditor({
   authority: Authority | null;
   attributes: PoolAttribute[];
   existing?: PoolProfile;
+  /**
+   * The contexts this agent has, to offer as a face's reach. Absent hides the
+   * control and leaves any reach the face already has exactly as it is — the
+   * editor omits `reach`, and the agent keeps the stored one.
+   */
+  contexts?: readonly { id: string; label: string }[] | undefined;
   /**
    * The current name and ticks, reported as they change, so a caller can show
    * what this face would hand over. The guided setup renders its card from it.
@@ -502,8 +836,21 @@ export function ProfileEditor({
   cancelLabel?: string | undefined;
 }) {
   const [name, setName] = useState(existing?.name ?? "");
+  // Where the face may be worn. Held as edited, and sent only when it differs
+  // from what was loaded: an omitted reach keeps the stored one, so an editor
+  // that always sent its own copy could only ever be a way to lose one.
+  const loadedReach: FaceReach = existing?.reach ?? { kind: "anywhere" };
+  const [reach, setReach] = useState<FaceReach>(loadedReach);
+  const reachChanged = JSON.stringify(reach) !== JSON.stringify(loadedReach);
   const [selected, setSelected] = useState<Set<string>>(
     () => new Set(tickedFrom(existing?.entries ?? [])),
+  );
+  /** The attribute this face calls itself by — its `displayName` slot. `""`
+   *  is "no name". An inline name, typed into the face and not in the pool, is
+   *  kept as it is unless the holder picks something else. */
+  const inlineName = useMemo(() => displayNameIsInline(existing?.entries ?? []), [existing]);
+  const [nameAttr, setNameAttr] = useState<string>(
+    () => displayNameOf(existing?.entries ?? []) ?? (inlineName ? KEEP_INLINE : ""),
   );
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -523,13 +870,20 @@ export function ProfileEditor({
     setBusy(true);
     setError(null);
     setPending(null);
-    const entries = composeEntries(existing?.entries ?? [], selected);
+    // `undefined` leaves the name as the face has it — the inline case, which
+    // the tick list cannot express and so must not overwrite.
+    const entries = composeEntriesWithSlots(
+      existing?.entries ?? [],
+      selected,
+      nameAttr === KEEP_INLINE ? undefined : nameAttr === "" ? null : nameAttr,
+    );
     const ok = await runMutation(
       async () => {
         await personaProfilePut(managerSender, {
           ...parties,
           name: name.trim(),
           entries,
+          ...(reachChanged ? { reach } : {}),
           ...(existing
             ? {
                 profileId: existing.profileId,
@@ -545,7 +899,7 @@ export function ProfileEditor({
     );
     setBusy(false);
     if (ok) onDone();
-  }, [parties, name, selected, existing, onDone]);
+  }, [parties, name, selected, nameAttr, existing, reach, reachChanged, onDone]);
 
   // Reported from a ref, not from the dependency list. `onPreview` is nearly
   // always an inline arrow, so keying the effect on it would fire on every
@@ -569,8 +923,8 @@ export function ProfileEditor({
   return (
     <Panel
       title={existing ? `Edit ${existing.name}` : "New face"}
-      description="A face is the set of facts you show together. What you leave unticked stays
-        out — including facts you add later, which is the whole reason it works that way round."
+      description="A face is the set of attributes you show together. What you leave unticked stays
+        out — including attributes you add later, which is the whole reason it works that way round."
     >
       <div style={{ display: "grid", gap: 12 }}>
         <label style={{ display: "grid", gap: 4 }}>
@@ -582,7 +936,8 @@ export function ProfileEditor({
             placeholder="work"
           />
           <span style={{ fontSize: t.xs, color: c.faint }}>
-            Contexts see this name too. Pick one that says who you are there, not where you use it.
+            Only you see this name. A community is told whatever you choose when a persona there
+            wears this face — or nothing.
           </span>
         </label>
 
@@ -590,7 +945,7 @@ export function ProfileEditor({
           <Label>SHOWS</Label>
           {attributes.length === 0 ? (
             <span style={{ fontSize: t.sm, color: c.faint }}>
-              No facts to show yet. Add one first.
+              No attributes to show yet. Add one first.
             </span>
           ) : (
             <div style={{ display: "grid", gap: 6 }}>
@@ -623,10 +978,92 @@ export function ProfileEditor({
             </div>
           )}
           <span style={{ fontSize: t.xs, color: c.faint, lineHeight: 1.5 }}>
-            Ticked facts are <em>live</em>: change a phone number once and every face that shows
+            Ticked attributes are <em>live</em>: change a phone number once and every face that shows
             it changes with it.
           </span>
         </div>
+
+        {(() => {
+          // Offered from what the face actually shows: naming it by an
+          // attribute it does not present would be a name nobody is shown.
+          const shown = attributes.filter(
+            (a) => selected.has(a.attributeId) || preservedRefs.has(a.attributeId),
+          );
+          return (
+            <label style={{ display: "grid", gap: 4 }}>
+              <Label>CALLS ITSELF</Label>
+              <select
+                style={fieldStyle}
+                value={nameAttr}
+                onChange={(e) => setNameAttr(e.target.value)}
+              >
+                <option value="">— no name —</option>
+                {inlineName && (
+                  <option value={KEEP_INLINE}>the name typed into this face (kept)</option>
+                )}
+                {shown.map((a) => (
+                  <option key={a.attributeId} value={a.attributeId}>
+                    {a.label ? `${a.label} (${a.type})` : a.type}
+                  </option>
+                ))}
+              </select>
+              <span style={{ fontSize: t.xs, color: c.faint }}>
+                A face can show more than one name — a legal one and the one it goes by. This says
+                which one is the face's own.
+              </span>
+            </label>
+          );
+        })()}
+
+        {contexts && contexts.length > 0 && (
+          <div style={{ display: "grid", gap: 4 }}>
+            <Label>MAY BE WORN</Label>
+            <select
+              style={fieldStyle}
+              value={reach.kind}
+              onChange={(e) =>
+                setReach(
+                  e.target.value === "only"
+                    ? { kind: "only", contextIds: [contexts[0]!.id] }
+                    : { kind: "anywhere" },
+                )
+              }
+            >
+              <option value="anywhere">anywhere</option>
+              <option value="only">only in the contexts I choose</option>
+            </select>
+            {reach.kind === "only" && (
+              <div style={{ display: "grid", gap: 2, paddingLeft: 4 }}>
+                {contexts.map((ctx) => {
+                  const on = reach.contextIds.includes(ctx.id);
+                  const last = on && reach.contextIds.length === 1;
+                  return (
+                    <label key={ctx.id} style={{ display: "flex", gap: 6, fontSize: t.sm }}>
+                      <input
+                        type="checkbox"
+                        checked={on}
+                        // At least one: "nowhere" is not a reach, it is a
+                        // retired face, and the wire refuses an empty list.
+                        disabled={last}
+                        onChange={() => {
+                          const ids = on
+                            ? reach.contextIds.filter((id) => id !== ctx.id)
+                            : [...reach.contextIds, ctx.id];
+                          if (ids.length > 0) setReach({ kind: "only", contextIds: [ids[0]!, ...ids.slice(1)] });
+                        }}
+                      />
+                      {ctx.label}
+                    </label>
+                  );
+                })}
+              </div>
+            )}
+            <span style={{ fontSize: t.xs, color: c.faint }}>
+              Your agent refuses to wear this face anywhere else. Narrowing it past a context it is worn
+              in now is refused too — take it off there first.
+            </span>
+          </div>
+        )}
 
         {preserved.length > 0 && (
           <Note tone="accent">
@@ -712,6 +1149,41 @@ export function DeleteProfile({
     | { kind: "error"; message: string };
 
   const [phase, setPhase] = useState<Phase>({ kind: "idle" });
+  const [retired, setRetired] = useState<string | null>(null);
+
+  // How far this face has spoken, read once the holder is on the way to
+  // deleting it: a delete does not un-tell anyone, and the moment to say so is
+  // before, not after. Not read while idle — it is a read of the holder's
+  // disclosure history, and nothing is being decided yet.
+  const spoken = useAsync(
+    async () =>
+      phase.kind === "confirm" || phase.kind === "blocked"
+        ? personaProfileGet(managerSender, { ...parties, profileId: profile.profileId })
+        : null,
+    [parties.holder.did, parties.service.did, profile.profileId, phase.kind === "confirm" || phase.kind === "blocked"],
+  );
+  const unTell = unTellWords(spoken.data?.disclosedTo);
+
+  // The middle of three ways to remove a face — "not anywhere, but keep it".
+  // Offered beside delete because it is usually what someone reaching for
+  // delete means.
+  const retire = useCallback(async () => {
+    setPhase({ kind: "working" });
+    const ok = await runMutation(
+      async () => {
+        const res = await personaProfileRetire(managerSender, { ...parties, profileId: profile.profileId });
+        setRetired(retiredWords(res.unbound));
+      },
+      {
+        onConsent: (pending) => setPhase({ kind: "consent", pending }),
+        onError: (message) => setPhase({ kind: "error", message }),
+      },
+    );
+    if (ok) {
+      setPhase({ kind: "idle" });
+      onDone();
+    }
+  }, [parties, profile.profileId, onDone]);
 
   const run = useCallback(
     async (unbind: boolean) => {
@@ -747,12 +1219,14 @@ export function DeleteProfile({
 
   if (phase.kind === "idle") {
     return (
-      <Button
-        kind="danger"
-        onClick={() => setPhase({ kind: "confirm" })}
-      >
-        Delete
-      </Button>
+      <div style={{ display: "grid", gap: 6 }}>
+        {retired && <Note tone="accent">{retired}</Note>}
+        <div>
+          <Button kind="danger" onClick={() => setPhase({ kind: "confirm" })}>
+            Delete
+          </Button>
+        </div>
+      </div>
     );
   }
 
@@ -805,6 +1279,7 @@ export function DeleteProfile({
                 {phase.personas.map((did) => (
                   <span key={did} style={{ fontFamily: font.mono, fontSize: t.xs, wordBreak: "break-all" }}>
                     {did}
+                    <DidQrButton value={did} />
                   </span>
                 ))}
               </>
@@ -813,9 +1288,13 @@ export function DeleteProfile({
               That is a legal state, and one you will not be warned about again. Nothing already
               shared is affected — that has left.
             </span>
+            {unTell && <strong>{unTell}</strong>}
           </div>
         </Note>
         <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+          <Button kind="primary" onClick={() => void retire()}>
+            Retire it instead
+          </Button>
           <Button kind="danger" onClick={() => void run(true)}>
             Take it off {phase.personas === null ? "them" : `${phase.personas.length}`} and delete
           </Button>
@@ -834,16 +1313,24 @@ export function DeleteProfile({
         <div style={{ display: "grid", gap: 8 }}>
           <strong>Deleting “{profile.name}” cannot be undone.</strong>
           <span>
-            It shows {profile.entries.length} fact(s). The facts themselves are untouched — a
+            It shows {profile.entries.length} attribute(s). The attributes themselves are untouched — a
             face is a selection over them, not a copy.
           </span>
           <span>
             If any persona is still wearing it, your agent will refuse and name them, and you can
             decide then.
           </span>
+          {unTell && <strong>{unTell}</strong>}
+          <span>
+            To stop being this face without losing it, retire it instead: it comes off everywhere, is
+            kept with its history, and can be reinstated.
+          </span>
         </div>
       </Note>
       <div style={{ display: "flex", gap: 8 }}>
+        <Button kind="primary" disabled={busy} onClick={() => void retire()}>
+          Retire instead
+        </Button>
         <Button kind="danger" disabled={busy} onClick={() => void run(false)}>
           {busy ? "Working…" : "Delete face"}
         </Button>
@@ -876,11 +1363,21 @@ export function ResolvedProfile({
   parties,
   profileId,
   name,
+  registry,
+  pool,
 }: {
   parties: Parties;
   profileId: string;
   /** How to name it while loading and when it holds nothing. */
   name: string;
+  /** The agent's claim-type table, or `null` while it loads. A caller must not
+   *  substitute a compiled-in one — that is the copy this replaced. */
+  registry: ClaimTypeRegistry | null;
+  /** The holder's attributes, so a claim can be shown under the decision they
+   *  made about it rather than under the registry's default — see
+   *  `decidedSensitivity`. Optional: a caller without the pool gets the
+   *  registry's answer, which is a weaker answer and never a wrong one. */
+  pool?: readonly PoolAttribute[] | undefined;
 }) {
   const resolved = useAsync(
     async () => personaProfileGet(managerSender, { ...parties, profileId, resolve: true }),
@@ -894,7 +1391,7 @@ export function ResolvedProfile({
   if (claims.length === 0) {
     return (
       <div style={{ fontSize: t.sm, color: c.faint, padding: "6px 0" }}>
-        This face shows nothing. A persona wearing it hands over no facts.
+        This face shows nothing. A persona wearing it hands over no attributes.
       </div>
     );
   }
@@ -915,7 +1412,13 @@ export function ResolvedProfile({
             style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "baseline" }}
           >
             <span style={{ fontFamily: font.mono, fontSize: t.xs, minWidth: 150 }}>{claim.type}</span>
-            <FactValue type={claim.type} value={claim.value} textStyle={{ wordBreak: "break-word" }} />
+            <AttributeValue
+              registry={registry}
+              type={claim.type}
+              value={claim.value}
+              sensitivity={decidedSensitivity(pool, claim.attributeId)}
+              textStyle={{ wordBreak: "break-word" }}
+            />
             {inline && <Pill tone="accent">only in this face</Pill>}
             {claim.stale && <Pill tone="warn">stale</Pill>}
           </div>
@@ -959,11 +1462,19 @@ export function PersonaClaims({
   contextId,
   personaDid,
   profileName,
+  registry,
+  pool,
 }: {
   parties: Parties;
   contextId: string;
   personaDid: string;
   profileName: string;
+  /** The agent's claim-type table, or `null` while it loads. A caller must not
+   *  substitute a compiled-in one — that is the copy this replaced. */
+  registry: ClaimTypeRegistry | null;
+  /** Threaded through to `ResolvedProfile` — the copy in a context knows
+   *  nothing about what the holder decided upstream of it. */
+  pool?: readonly PoolAttribute[] | undefined;
 }) {
   const bound = useAsync(
     async () => getBinding(managerSender, { ...parties, contextId, personaDid }),
@@ -984,10 +1495,11 @@ export function PersonaClaims({
   }
 
   return (
-    <ResolvedProfile
+    <ResolvedProfile registry={registry}
       parties={parties}
       profileId={bound.data.profileId}
       name={bound.data.profileName ?? profileName}
+      {...(pool ? { pool } : {})}
     />
   );
 }
@@ -1037,6 +1549,7 @@ export function DisclosureHistoryPanel({
         <div style={{ display: "grid", gap: 3 }}>
           <span style={{ fontFamily: font.mono, fontSize: t.xs, wordBreak: "break-all" }}>
             {d.verifierDid}
+            <DidQrButton value={d.verifierDid} />
           </span>
           <span style={{ color: c.faint, fontSize: t.xs }}>in {d.contextId}</span>
         </div>
@@ -1048,6 +1561,7 @@ export function DisclosureHistoryPanel({
       render: (d) => (
         <span style={{ fontFamily: font.mono, fontSize: t.xs, wordBreak: "break-all" }}>
           {d.personaDid}
+          <DidQrButton value={d.personaDid} />
         </span>
       ),
     },
@@ -1057,6 +1571,18 @@ export function DisclosureHistoryPanel({
       render: (d) => (
         <div style={{ display: "grid", gap: 3 }}>
           <span>{d.claimTypes.join(", ")}</span>
+          {/* Per claim, and only where there is something to say: a current
+              value needs no words, and a row of "current" is noise. */}
+          {currencyOf(d)
+            .filter((cl) => cl.currency !== "current")
+            .map((cl) => (
+              <span
+                key={cl.claimType}
+                style={{ fontSize: t.xs, color: cl.currency === "changed" ? c.warn : c.faint }}
+              >
+                {cl.claimType}: {currencyWords(cl.currency)}
+              </span>
+            ))}
           {d.rungs && d.rungs.length > 0 && (
             <span style={{ color: c.muted, fontSize: t.xs }}>as {d.rungs.join(", ")}</span>
           )}
@@ -1105,6 +1631,38 @@ export function DisclosureHistoryPanel({
 
         {history.error && <LoadError what="what has left" error={history.error} />}
         {history.loading && !history.data && <Loading what="what has left" />}
+        {history.data && (() => {
+          // Who holds a value you have since changed. Stated above the table
+          // because it is the question after a change, and the table answers
+          // it only row by row. A disclosure cannot be recalled; what can be
+          // done is to present the new value to them again, from that context.
+          const outdated = outdatedHolders(history.data.disclosures);
+          if (outdated.length === 0) return null;
+          return (
+            <Note tone="warn">
+              <div style={{ display: "grid", gap: 6 }}>
+                <strong>
+                  {outdated.length === 1
+                    ? "One party holds a value you have since changed."
+                    : `${outdated.length} parties hold values you have since changed.`}
+                </strong>
+                {outdated.map((o) => (
+                  <span key={`${o.verifierDid} ${o.contextId} ${o.personaDid}`} style={{ fontSize: t.sm }}>
+                    <span style={{ fontFamily: font.mono, fontSize: t.xs, wordBreak: "break-all" }}>
+                      {o.verifierDid}
+                      <DidQrButton value={o.verifierDid} />
+                    </span>{" "}
+                    in {o.contextId} — {o.claimTypes.join(", ")}
+                  </span>
+                ))}
+                <span style={{ fontSize: t.sm, color: c.muted }}>
+                  They keep what they were given. To bring them up to date, present the new value to
+                  them again from that context.
+                </span>
+              </div>
+            </Note>
+          );
+        })()}
         {history.data && (
           <>
             <Table
@@ -1375,6 +1933,12 @@ export function BindingForm({
 }) {
   const [personaDid, setPersonaDid] = useState(initialDid ?? "");
   const [profileId, setProfileId] = useState<string>(profiles[0]?.profileId ?? "");
+  /** What this context may call the face. Never the face's own name: that is
+   *  the holder's, and wearing a face is not consent to share it. Empty gives
+   *  the context no name at all. */
+  const [nameForContext, setNameForContext] = useState("");
+  /** When wearing it here ends on its own, as the `datetime-local` value. */
+  const [ends, setEnds] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [pending, setPending] = useState<ConsentRequiredError | null>(null);
@@ -1392,7 +1956,14 @@ export function BindingForm({
     [parties.holder.did, parties.service.did, contextId, initialDid],
   );
   useEffect(() => {
-    if (current.data) setProfileId(current.data.profileId ?? "");
+    if (current.data) {
+      setProfileId(current.data.profileId ?? "");
+      // `binding/set` replaces the binding, so the label it already has must
+      // be sent back or a face change silently clears it. The same for its end:
+      // changing a face must not quietly turn a weekend into forever.
+      setNameForContext(current.data.label ?? "");
+      setEnds(untilToLocalInput(current.data.until));
+    }
   }, [current.data]);
 
   const isKnown = known?.personas.find((b) => b.personaDid === personaDid.trim());
@@ -1400,6 +1971,11 @@ export function BindingForm({
   const refusal = denied ?? (wouldNoOp ? "This persona wears nothing already — choose a face to put on." : null);
 
   const submit = useCallback(async () => {
+    const end = profileId === "" ? { ok: true as const, until: null } : untilFromLocalInput(ends);
+    if (!end.ok) {
+      setError(end.why);
+      return;
+    }
     setBusy(true);
     setError(null);
     setPending(null);
@@ -1413,12 +1989,17 @@ export function BindingForm({
           // An empty selection is an explicit take-off, not an omission: `null`
           // clears the binding, an absent member leaves it as it stands.
           profileId: profileId === "" ? null : profileId,
+          ...(profileId !== "" && nameForContext.trim() ? { label: nameForContext.trim() } : {}),
+          ...(end.until ? { until: end.until } : {}),
         });
         const also = res.correlation?.alsoBoundPersonaCount ?? 0;
         outcome =
           profileId === ""
             ? "Taken off. That persona now shows nothing here."
-            : `Done. ${res.materialisedClaimCount ?? 0} fact(s) were copied into ${contextLabel}.` +
+            : `Done. ${res.materialisedClaimCount ?? 0} attribute(s) were copied into ${contextLabel}.` +
+              (end.until
+                ? ` It ${untilWords(end.until)}; then it comes off, and the face is retired if it is worn nowhere else.`
+                : "") +
               (also > 0
                 ? ` ${also} other persona(s) already wear this face — anyone who sees two of them knows they are the same person, and no later change undoes that.`
                 : "");
@@ -1427,12 +2008,12 @@ export function BindingForm({
     );
     setBusy(false);
     if (ok) onDone(outcome);
-  }, [parties, contextId, contextLabel, personaDid, profileId, onDone]);
+  }, [parties, contextId, contextLabel, personaDid, profileId, nameForContext, ends, onDone]);
 
   return (
     <Panel
       title={initialDid ? `Change face in ${contextLabel}` : `Be known in ${contextLabel} as…`}
-      description="A persona wears a face inside one context. Your agent copies the face's facts down into
+      description="A persona wears a face inside one context. Your agent copies the face's attributes down into
         the context; the context never reaches back up."
     >
       <div style={{ display: "grid", gap: 10, maxWidth: 560 }}>
@@ -1441,6 +2022,7 @@ export function BindingForm({
             <Label>PERSONA</Label>
             <span style={{ fontFamily: font.mono, fontSize: t.xs, wordBreak: "break-all", padding: "6px 0" }}>
               {initialDid}
+              <DidQrButton value={initialDid} />
             </span>
           </div>
         ) : (
@@ -1464,11 +2046,43 @@ export function BindingForm({
             <option value="">— nothing (take it off) —</option>
             {profiles.map((p) => (
               <option key={p.profileId} value={p.profileId}>
-                {p.name} ({p.entries.length} fact(s))
+                {p.name} ({p.entries.length} attribute(s))
               </option>
             ))}
           </select>
         </label>
+
+        {profileId !== "" && (
+          <label style={{ display: "grid", gap: 4 }}>
+            <Label>WHAT {contextLabel.toUpperCase()} MAY CALL IT</Label>
+            <input
+              style={fieldStyle}
+              value={nameForContext}
+              maxLength={128}
+              onChange={(e) => setNameForContext(e.target.value)}
+              placeholder="leave empty to give it no name"
+            />
+            <span style={{ fontSize: t.xs, color: c.faint }}>
+              {contextLabel} never sees your own name for this face. It sees this, or nothing.
+            </span>
+          </label>
+        )}
+
+        {profileId !== "" && (
+          <label style={{ display: "grid", gap: 4 }}>
+            <Label>ENDS</Label>
+            <input
+              type="datetime-local"
+              style={fieldStyle}
+              value={ends}
+              onChange={(e) => setEnds(e.target.value)}
+            />
+            <span style={{ fontSize: t.xs, color: c.faint }}>
+              Optional. For a face worn for a weekend — a conference, a listing. At this time it comes off
+              here by itself, and the face is retired if nothing else wears it. Never deleted.
+            </span>
+          </label>
+        )}
 
         {error && <Note tone="danger">{error}</Note>}
         {pending && <ConsentCeremony pending={pending} />}
@@ -1492,4 +2106,703 @@ export function BindingForm({
       </div>
     </Panel>
   );
+}
+
+/**
+ * Where a face is worn now, where it may be, and what it has done — the
+ * holder's own history of one face, oldest first. Design note
+ * `persona-context-first.md` §5.4, §9.6.
+ *
+ * Safe to render whole: no timeline event carries a value or a private label,
+ * so there is nothing here to mask.
+ */
+export function FaceHistory({
+  parties,
+  profileId,
+  contextName,
+}: {
+  parties: Parties;
+  profileId: string;
+  contextName: (id: string) => string;
+}) {
+  const usage = useAsync(
+    async () => personaProfileUsage(managerSender, { ...parties, profileId }),
+    [parties.holder.did, parties.service.did, profileId],
+  );
+  const timeline = useAsync(
+    async () => personaProfileTimeline(managerSender, { ...parties, profileId }),
+    [parties.holder.did, parties.service.did, profileId],
+  );
+  return (
+    <div style={{ display: "grid", gap: 10, fontSize: t.sm }}>
+      <div style={{ display: "grid", gap: 3 }}>
+        <Label>WORN NOW</Label>
+        {usage.loading ? (
+          <Loading what="where this face is worn" />
+        ) : usage.error ? (
+          <LoadError what="where this face is worn" error={usage.error} />
+        ) : (
+          <>
+            <span style={{ color: c.faint }}>This face {reachWords(usage.data?.reach)}.</span>
+            {(usage.data?.usage ?? []).length === 0 ? (
+              <span>Nowhere.</span>
+            ) : (
+              (usage.data?.usage ?? []).map((u) => (
+                <span key={`${u.contextId}\u0000${u.personaDid}`}>
+                  in <strong>{contextName(u.contextId)}</strong>{" "}
+                  <span style={{ fontFamily: font.mono, fontSize: t.xs }}>{u.personaDid}</span><DidQrButton value={u.personaDid} />
+                  {u.until ? <span style={{ color: c.faint }}> · {untilWords(u.until)}</span> : null}
+                </span>
+              ))
+            )}
+          </>
+        )}
+      </div>
+      <div style={{ display: "grid", gap: 3 }}>
+        <Label>WHAT IT HAS DONE</Label>
+        {timeline.loading ? (
+          <Loading what="this face's history" />
+        ) : timeline.error ? (
+          <LoadError what="this face's history" error={timeline.error} />
+        ) : (
+          (timeline.data ?? []).map((e, i) => (
+            <span key={i}>
+              <span style={{ color: c.faint }}>{formatInstant(e.at)}</span> — {timelineWords(e, contextName)}
+            </span>
+          ))
+        )}
+        <span style={{ fontSize: t.xs, color: c.faint }}>
+          Types and parties only. The history never holds a value, or a name you gave something.
+        </span>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Retire a face, or reinstate a retired one. Retiring takes it off every
+ * context and keeps it; reinstating makes it wearable and wears it nowhere.
+ */
+export function RetireFace({
+  parties,
+  profile,
+  onDone,
+}: {
+  parties: Parties;
+  profile: PoolProfile;
+  onDone: (outcome: string) => void;
+}) {
+  const retired = profile.status === "retired";
+  const [confirming, setConfirming] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [pending, setPending] = useState<ConsentRequiredError | null>(null);
+  const run = useCallback(async () => {
+    setBusy(true);
+    setError(null);
+    let outcome = "";
+    const ok = await runMutation(
+      async () => {
+        if (retired) {
+          await personaProfileReinstate(managerSender, { ...parties, profileId: profile.profileId });
+          outcome = "Reinstated. It is wearable again, and worn nowhere until you wear it somewhere.";
+        } else {
+          const res = await personaProfileRetire(managerSender, { ...parties, profileId: profile.profileId });
+          outcome = retiredWords(res.unbound);
+        }
+      },
+      { onConsent: setPending, onError: setError },
+    );
+    setBusy(false);
+    setConfirming(false);
+    if (ok) onDone(outcome);
+  }, [parties, profile.profileId, retired, onDone]);
+
+  if (retired) {
+    return (
+      <Button kind="quiet" disabled={busy} onClick={() => void run()}>
+        {busy ? "Working…" : "Reinstate"}
+      </Button>
+    );
+  }
+  if (!confirming) {
+    return (
+      <Button kind="quiet" onClick={() => setConfirming(true)}>
+        Retire
+      </Button>
+    );
+  }
+  return (
+    <div style={{ display: "grid", gap: 8, maxWidth: 460 }}>
+      <Note tone="warn">
+        Retiring “{profile.name}” takes it off every context it is worn in. It is kept — values and
+        history — and hidden from pickers until you reinstate it. Nothing already shared is affected.
+      </Note>
+      {error && <Note tone="danger">{error}</Note>}
+      {pending && <ConsentCeremony pending={pending} />}
+      <div style={{ display: "flex", gap: 8 }}>
+        <Button kind="primary" disabled={busy} onClick={() => void run()}>
+          {busy ? "Working…" : "Retire it"}
+        </Button>
+        <Button kind="quiet" disabled={busy} onClick={() => setConfirming(false)}>
+          Cancel
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Faces the holder has retired: kept, worn nowhere, out of every picker.
+ * Listed here — and only here — so one can be brought back.
+ */
+export function RetiredFaces({
+  parties,
+  faces,
+  onChanged,
+}: {
+  parties: Parties;
+  faces: readonly PoolProfile[];
+  onChanged: () => void;
+}) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div style={{ display: "grid", gap: 6, fontSize: t.sm, color: c.muted }}>
+      <button
+        onClick={() => setOpen(!open)}
+        style={{ border: "none", background: "none", padding: 0, color: "var(--w-accent)", cursor: "pointer", font: "inherit", textAlign: "left" }}
+      >
+        {open ? "Hide" : "Show"} {faces.length} retired face{faces.length === 1 ? "" : "s"}
+      </button>
+      {open &&
+        faces.map((f) => (
+          <div key={f.profileId} style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+            <strong style={{ color: c.text }}>{f.name}</strong>
+            {f.retiredAt && <span style={{ color: c.faint }}>retired {formatInstant(f.retiredAt)}</span>}
+            <RetireFace parties={parties} profile={f} onDone={() => onChanged()} />
+          </div>
+        ))}
+    </div>
+  );
+}
+
+/**
+ * Make a face for one context, where it is asked for — `persona/profile/compose`.
+ *
+ * Local by default: a typed value stays in this face unless the holder ticks
+ * "use in my other faces too". Each typed value is checked against the rest of
+ * the holder's identity as it is entered (`correlation/analyze` with a
+ * candidate), because the warning that changes a mind is the one before the
+ * write. Design note `persona-context-first.md` §5.3.
+ */
+export function ComposeFace({
+  parties,
+  authority,
+  contextId,
+  contextLabel,
+  attributes,
+  personas,
+  onDone,
+  onCancel,
+}: {
+  parties: Parties;
+  authority: Authority | null;
+  contextId: string;
+  contextLabel: string;
+  attributes: PoolAttribute[];
+  /** Persona DIDs already known in this context, to offer as the wearer. */
+  personas: readonly string[];
+  onDone: (outcome: string) => void;
+  onCancel: () => void;
+}) {
+  const [name, setName] = useState("");
+  const [rows, setRows] = useState<ComposeRow[]>([{ kind: "new", type: "name.display", value: "", share: false }]);
+  const [linked, setLinked] = useState<Record<number, string>>({});
+  const [personaDid, setPersonaDid] = useState(personas[0] ?? "");
+  const [label, setLabel] = useState("");
+  const [ends, setEnds] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [pending, setPending] = useState<ConsentRequiredError | null>(null);
+  const denied = holderGate(authority);
+
+  const setRow = (i: number, row: ComposeRow) => setRows(rows.map((r, j) => (j === i ? row : r)));
+
+  // The pre-write warning: is this value already held somewhere else?
+  const check = useCallback(
+    async (i: number, type: string, value: string) => {
+      if (!value.trim() || !type.trim()) return;
+      try {
+        const findings = await personaCorrelationAnalyze(managerSender, {
+          ...parties,
+          candidate: { type: type.trim(), valueType: "string", value: value.trim() },
+        });
+        setLinked((prev) => {
+          const next = { ...prev };
+          const hit = findings[0];
+          if (hit) next[i] = hit.why;
+          else delete next[i];
+          return next;
+        });
+      } catch {
+        // Advisory: a failed check says nothing, rather than a false all-clear.
+      }
+    },
+    [parties],
+  );
+
+  const submit = useCallback(async () => {
+    const claims = composeClaimsFrom(rows);
+    if (!claims.ok) {
+      setError(claims.why);
+      return;
+    }
+    const wear = personaDid.trim();
+    const end = wear ? untilFromLocalInput(ends) : ({ ok: true, until: null } as const);
+    if (!end.ok) {
+      setError(end.why);
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    let outcome = "";
+    const ok = await runMutation(
+      async () => {
+        const res = await personaProfileCompose(managerSender, {
+          ...parties,
+          contextId,
+          name: name.trim(),
+          claims: claims.claims,
+          ...(wear ? { personaDid: wear } : {}),
+          ...(wear && label.trim() ? { label: label.trim() } : {}),
+          ...(wear && end.until ? { until: end.until } : {}),
+        });
+        outcome = composedWords(res);
+      },
+      { onConsent: setPending, onError: setError },
+    );
+    setBusy(false);
+    if (ok) onDone(outcome);
+  }, [parties, contextId, name, rows, personaDid, label, ends, onDone]);
+
+  return (
+    <div style={{ display: "grid", gap: 10, maxWidth: 560 }}>
+      <label style={{ display: "grid", gap: 4 }}>
+        <Label>YOUR NAME FOR IT</Label>
+        <input style={fieldStyle} value={name} maxLength={128} onChange={(e) => setName(e.target.value)} placeholder={`e.g. ${contextLabel}`} />
+      </label>
+      <div style={{ display: "grid", gap: 6 }}>
+        <Label>SHOWS</Label>
+        {rows.map((row, i) =>
+          row.kind === "held" ? (
+            <div key={i} style={{ display: "flex", gap: 6 }}>
+              <select style={fieldStyle} value={row.attributeId} onChange={(e) => setRow(i, { kind: "held", attributeId: e.target.value })}>
+                {attributes.map((a) => (
+                  <option key={a.attributeId} value={a.attributeId}>
+                    {a.label ? `${a.label} (${a.type})` : a.type}
+                  </option>
+                ))}
+              </select>
+              <Button kind="quiet" onClick={() => setRows(rows.filter((_, j) => j !== i))}>Remove</Button>
+            </div>
+          ) : (
+            <div key={i} style={{ display: "grid", gap: 4 }}>
+              <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                <input style={{ ...fieldStyle, width: 160 }} value={row.type} onChange={(e) => setRow(i, { ...row, type: e.target.value })} placeholder="name.display" />
+                <input
+                  style={{ ...fieldStyle, flex: 1, minWidth: 140 }}
+                  value={row.value}
+                  onChange={(e) => setRow(i, { ...row, value: e.target.value })}
+                  onBlur={() => void check(i, row.type, row.value)}
+                  placeholder="value"
+                />
+                <Button kind="quiet" onClick={() => setRows(rows.filter((_, j) => j !== i))}>Remove</Button>
+              </div>
+              <label style={{ display: "flex", gap: 6, fontSize: t.xs, color: c.muted }}>
+                <input type="checkbox" checked={row.share} onChange={(e) => setRow(i, { ...row, share: e.target.checked })} />
+                use in my other faces too (it becomes reusable; otherwise it stays in this face alone)
+              </label>
+              {linked[i] && <Note tone="warn">{linked[i]}</Note>}
+            </div>
+          ),
+        )}
+        <div style={{ display: "flex", gap: 6 }}>
+          <Button kind="quiet" onClick={() => setRows([...rows, { kind: "new", type: "", value: "", share: false }])}>
+            Type a value
+          </Button>
+          {attributes.length > 0 && (
+            <Button kind="quiet" onClick={() => setRows([...rows, { kind: "held", attributeId: attributes[0]!.attributeId }])}>
+              Use one I keep
+            </Button>
+          )}
+        </div>
+      </div>
+      <label style={{ display: "grid", gap: 4 }}>
+        <Label>WEAR IT NOW AS</Label>
+        <input style={fieldStyle} list={`personas-${contextId}`} value={personaDid} onChange={(e) => setPersonaDid(e.target.value)} placeholder="a persona DID in this context — or leave empty" />
+        <datalist id={`personas-${contextId}`}>
+          {personas.map((d) => (
+            <option key={d} value={d} />
+          ))}
+        </datalist>
+      </label>
+      {personaDid.trim() && (
+        <>
+          <label style={{ display: "grid", gap: 4 }}>
+            <Label>WHAT {contextLabel.toUpperCase()} MAY CALL IT</Label>
+            <input style={fieldStyle} value={label} maxLength={128} onChange={(e) => setLabel(e.target.value)} placeholder="leave empty to give it no name" />
+          </label>
+          <label style={{ display: "grid", gap: 4 }}>
+            <Label>ENDS</Label>
+            <input type="datetime-local" style={fieldStyle} value={ends} onChange={(e) => setEnds(e.target.value)} />
+            <span style={{ fontSize: t.xs, color: c.faint }}>Optional. At this time it comes off here by itself.</span>
+          </label>
+        </>
+      )}
+      {error && <Note tone="danger">{error}</Note>}
+      {pending && <ConsentCeremony pending={pending} />}
+      <div style={{ display: "flex", gap: 8 }}>
+        <Button kind="primary" disabled={busy || !name.trim() || Boolean(denied)} {...(denied ? { title: denied } : {})} onClick={() => void submit()}>
+          {busy ? "Making…" : "Make this face"}
+        </Button>
+        <Button kind="quiet" disabled={busy} onClick={onCancel}>Cancel</Button>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * The faces made inside one context — values typed there and kept there — and
+ * the one-way step that makes a value reusable (`persona/attribute/promote`).
+ */
+export function LocalFaces({
+  parties,
+  contextId,
+  personaDid,
+  onChanged,
+}: {
+  parties: Parties;
+  contextId: string;
+  /** The persona this context knows, which is who wears a face made here.
+   *  `null` when none is bound yet — then a face can be made but not worn. */
+  personaDid?: string | null;
+  onChanged: (outcome: string) => void;
+}) {
+  // The listing carries names and counts; promotion addresses entries by
+  // position against a version, so each face is read whole.
+  const faces = useAsync(
+    async () => {
+      const summaries = (await listLocalProfiles(managerSender, { ...parties, contextId, limit: 500 })).profiles ?? [];
+      return Promise.all(
+        summaries.map(async (s) => (await getLocalProfile(managerSender, { ...parties, contextId, profileId: s.profileId })).profile),
+      );
+    },
+    [parties.holder.did, parties.service.did, contextId],
+  );
+  const [chosen, setChosen] = useState<Record<string, number[]>>({});
+  const [busy, setBusy] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const promote = useCallback(
+    async (profileId: string, version: number) => {
+      const positions = chosen[profileId] ?? [];
+      const [first, ...rest] = positions;
+      if (first === undefined) return;
+      setBusy(profileId);
+      setError(null);
+      const ok = await runMutation(
+        async () => {
+          await personaAttributePromote(managerSender, {
+            ...parties,
+            contextId,
+            profileId,
+            entries: [first, ...rest],
+            expectedVersion: version,
+          });
+        },
+        { onConsent: () => setError("Your agent asked for an approval first — try again once it is given."), onError: setError },
+      );
+      setBusy(null);
+      if (ok) {
+        faces.reload();
+        onChanged("Made reusable. The face now lives in your pool, with the same id and everyone who wore it.");
+      }
+    },
+    [parties, contextId, chosen, faces, onChanged],
+  );
+
+  const wear = useCallback(
+    async (profileId: string) => {
+      if (!personaDid) return;
+      setBusy(profileId);
+      setError(null);
+      const ok = await runMutation(
+        async () => {
+          await setLocalBinding(managerSender, { ...parties, contextId, personaDid, profileId });
+        },
+        { onConsent: () => setError("Your agent asked for an approval first — try again once it is given."), onError: setError },
+      );
+      setBusy(null);
+      if (ok) {
+        faces.reload();
+        onChanged("Put on here. Nothing from your pool went with it — a face made here has nothing of yours in it.");
+      }
+    },
+    [parties, contextId, personaDid, faces, onChanged],
+  );
+
+  const remove = useCallback(
+    async (profileId: string) => {
+      setBusy(profileId);
+      setError(null);
+      const ok = await runMutation(
+        async () => {
+          // `unbind` because the question the holder answered said the face
+          // comes off as it goes. Without it the agent refuses while it is
+          // worn, which would make delete work only sometimes.
+          await deleteLocalProfile(managerSender, { ...parties, contextId, profileId, unbind: true });
+        },
+        { onConsent: () => setError("Your agent asked for an approval first — try again once it is given."), onError: setError },
+      );
+      setBusy(null);
+      if (ok) {
+        faces.reload();
+        onChanged("Deleted. Anyone wearing it here now shows nothing.");
+      }
+    },
+    [parties, contextId, faces, onChanged],
+  );
+
+  if (faces.loading) return <Loading what="faces made here" />;
+  if (faces.error) return <LoadError what="faces made here" error={faces.error} />;
+  const list = faces.data ?? [];
+  if (list.length === 0) {
+    return (
+      <div style={{ display: "grid", gap: 8, fontSize: t.sm }}>
+        <span style={{ color: c.faint }}>No face was made here.</span>
+        <MakeLocalFace
+          parties={parties}
+          contextId={contextId}
+          onDone={(outcome) => {
+            faces.reload();
+            onChanged(outcome);
+          }}
+        />
+      </div>
+    );
+  }
+  return (
+    <div style={{ display: "grid", gap: 10, fontSize: t.sm }}>
+      {list.map((f) => (
+        <div key={f.profileId} style={{ display: "grid", gap: 4 }}>
+          <strong>{f.name}</strong>
+          {f.entries.map((e, i) => {
+            const inline = inlineOf(e);
+            if (!inline) return null;
+            const on = (chosen[f.profileId] ?? []).includes(i);
+            return (
+              <label key={i} style={{ display: "flex", gap: 6 }}>
+                <input
+                  type="checkbox"
+                  checked={on}
+                  onChange={() =>
+                    setChosen({
+                      ...chosen,
+                      [f.profileId]: on
+                        ? (chosen[f.profileId] ?? []).filter((x) => x !== i)
+                        : [...(chosen[f.profileId] ?? []), i],
+                    })
+                  }
+                />
+                <span style={{ fontFamily: font.mono }}>{inline.type}</span>
+              </label>
+            );
+          })}
+          {(chosen[f.profileId] ?? []).length > 0 && (
+            <Note tone="warn">
+              Making these reusable lets your other faces show them, and moves this face into your pool.
+              It cannot be undone — a value other faces may come to show cannot be made local again.
+            </Note>
+          )}
+          <div>
+            <Button
+              kind="quiet"
+              disabled={busy !== null || (chosen[f.profileId] ?? []).length === 0}
+              onClick={() => void promote(f.profileId, f.version)}
+            >
+              {busy === f.profileId ? "Working…" : "Make reusable"}
+            </Button>
+            <Button
+              kind="quiet"
+              disabled={busy !== null || !personaDid}
+              {...(personaDid
+                ? {}
+                : { title: "No persona of yours is known here yet, so there is nobody to wear it." })}
+              onClick={() => void wear(f.profileId)}
+            >
+              Wear it here
+            </Button>
+            <Destructive<{ name: string }>
+              label="Delete"
+              preview={() => Promise.resolve({ name: f.name })}
+              renderPreview={(p) => (
+                <span>
+                  Deleting &ldquo;{p.name}&rdquo; takes it off here as it goes, so anyone wearing it
+                  shows nothing afterwards. Its values were only ever here, so nothing in your pool
+                  changes.
+                </span>
+              )}
+              commit={() => remove(f.profileId)}
+              onDone={() => undefined}
+            />
+          </div>
+        </div>
+      ))}
+      <MakeLocalFace
+        parties={parties}
+        contextId={contextId}
+        onDone={(outcome) => {
+          faces.reload();
+          onChanged(outcome);
+        }}
+      />
+      {error && <Note tone="danger">{error}</Note>}
+    </div>
+  );
+}
+
+/**
+ * Making a face inside one context.
+ *
+ * Inline values only, and that is the boundary rather than a shortcut: a
+ * context-local face has nowhere in its wire type to name a pool attribute, so
+ * there is nothing here to tick. Making one of these values reusable is the
+ * separate, one-way promote step above.
+ */
+function MakeLocalFace({
+  parties,
+  contextId,
+  onDone,
+}: {
+  parties: Parties;
+  contextId: string;
+  onDone: (outcome: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [name, setName] = useState("");
+  const [rows, setRows] = useState<{ type: string; value: string }[]>([{ type: "", value: "" }]);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  if (!open) {
+    return (
+      <div>
+        <Button kind="quiet" onClick={() => setOpen(true)}>
+          Make a face here
+        </Button>
+      </div>
+    );
+  }
+
+  const submit = async () => {
+    const filled = rows.filter((r) => r.type.trim() !== "" || r.value.trim() !== "");
+    if (filled.some((r) => r.type.trim() === "" || r.value.trim() === "")) {
+      setError("Each value needs both what it is and what it says.");
+      return;
+    }
+    if (!name.trim() || filled.length === 0) {
+      setError("A face needs a name and at least one value.");
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    const ok = await runMutation(
+      async () => {
+        await putLocalProfile(managerSender, {
+          ...parties,
+          contextId,
+          name: name.trim(),
+          // No `provenance`, and its absence is the rule rather than an
+          // omission: the schema has no such member for a context-local entry
+          // and refuses one (`additionalProperties: false`). A value authored
+          // inside a context is self-asserted by construction — a
+          // credentialBacked provenance names a credentialId and a claimPath,
+          // and a context has nowhere to put either.
+          //
+          // It was sent here until a round-trip against a real agent returned
+          // "Additional properties are not allowed ('provenance' was
+          // unexpected)". TypeScript did not catch it: excess-property checking
+          // does not reach through the inferred return type of a `.map()`.
+          entries: filled.map((r) => ({
+            inline: {
+              type: r.type.trim(),
+              value: r.value.trim(),
+              valueType: "string" as const,
+            },
+          })),
+        });
+      },
+      { onConsent: () => setError("Your agent asked for an approval first — try again once it is given."), onError: setError },
+    );
+    setBusy(false);
+    if (ok) {
+      setOpen(false);
+      setName("");
+      setRows([{ type: "", value: "" }]);
+      onDone("Made. It lives in this context and shows nothing from your pool.");
+    }
+  };
+
+  return (
+    <div style={{ display: "grid", gap: 8 }}>
+      <Note tone="accent">
+        What you type here stays in this context. It cannot show anything from your attributes —
+        that is what a face made here means.
+      </Note>
+      <label style={{ display: "grid", gap: 4 }}>
+        <Label>YOUR NAME FOR IT</Label>
+        <input style={fieldStyle} value={name} maxLength={64} onChange={(e) => setName(e.target.value)} />
+      </label>
+      {rows.map((r, i) => (
+        <div key={i} style={{ display: "flex", gap: 8 }}>
+          <input
+            style={{ ...fieldStyle, fontFamily: font.mono, flex: 1 }}
+            placeholder="what it is (name.display)"
+            value={r.type}
+            onChange={(e) => setRows(rows.map((x, j) => (j === i ? { ...x, type: e.target.value } : x)))}
+          />
+          <input
+            style={{ ...fieldStyle, flex: 1 }}
+            placeholder="value"
+            value={r.value}
+            onChange={(e) => setRows(rows.map((x, j) => (j === i ? { ...x, value: e.target.value } : x)))}
+          />
+        </div>
+      ))}
+      <div>
+        <Button kind="quiet" onClick={() => setRows([...rows, { type: "", value: "" }])}>
+          Add a value
+        </Button>
+      </div>
+      {error && <Note tone="danger">{error}</Note>}
+      <div style={{ display: "flex", gap: 8 }}>
+        <Button kind="primary" disabled={busy} onClick={() => void submit()}>
+          {busy ? "Making…" : "Make it"}
+        </Button>
+        <Button kind="quiet" disabled={busy} onClick={() => setOpen(false)}>
+          Cancel
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+/** The inline value of a context-local entry, read defensively: the listing
+ *  types entries loosely, and a local face is inline-only by construction. */
+function inlineOf(entry: unknown): { type: string } | null {
+  if (typeof entry !== "object" || entry === null || !("inline" in entry)) return null;
+  const inline = (entry as { inline: unknown }).inline;
+  if (typeof inline !== "object" || inline === null) return null;
+  const type = (inline as { type?: unknown }).type;
+  return typeof type === "string" ? { type } : null;
 }

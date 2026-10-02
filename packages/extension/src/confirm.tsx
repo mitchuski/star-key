@@ -8,7 +8,6 @@ import { HOLDER_IDENTITY } from "./site-identity.js";
 import { extractAgentNames, withoutScheme } from "./agent-name.js";
 import "./theme.css";
 import {
-  RUNTIME_CONSENT_RESULT,
   RUNTIME_LIST_DIDS,
   RUNTIME_VERIFY_RP_DID,
   type DidRecordView,
@@ -26,6 +25,9 @@ import {
 import { base64url } from "@openvtc/vti-didcomm-js";
 import { runApproverUnlockCeremony } from "./webauthn-prf-unlock.js";
 import { DisclosureConsent } from "./disclosure-consent.js";
+import { consentResultSender } from "./consent-result.js";
+import { DidQrButton } from "./did-qr-view.js";
+import { SessionKeyNotice } from "./session-key-notice.js";
 
 // Consent prompt shown in a popup window before the wallet logs into an RP.
 // The background opens it with the request details as query params and
@@ -44,7 +46,7 @@ const isTaskConsent = params.get("kind") === "task";
 // `kind=disclosure` selects the persona-disclosure surface. It is its own
 // surface rather than a variant of the login prompt because what it authorizes
 // is different in kind: the login prompt says "let this site sign you in", and
-// this one says "let this verifier keep these facts about you". Sharing a
+// this one says "let this verifier keep these attributes about you". Sharing a
 // component would mean one screen trying to word both.
 const isDisclosureConsent = params.get("kind") === "disclosure";
 // The biometric-gated approver surface: Approve must run a fresh WebAuthn
@@ -84,6 +86,24 @@ const allowsHolder = params.get("allowHolder") === "1";
 // louder warning so the operator sees the swap and decides
 // whether to approve it.
 const changedFromRpDid = params.get("changedFrom");
+// When set, the base URL this origin's login previously went to; the login now
+// names a different one. Warned about like an RP change, because step-up from
+// this origin may only go to the pinned base URL.
+const changedFromBaseUrl = params.get("changedFromBase");
+// Set when the action is allowed only because this origin is pinned to `rpDid`
+// by an earlier approved sign-in (signTrustTask, step-up). The prompt shows the
+// pairing so the human can see which relying party the page is bound to.
+const isPinned = params.get("pinned") === "1";
+const pinnedBaseUrl = params.get("pinnedBase");
+// Set when this sign-in binds a session key (`auth/authenticate/0.2`). The
+// background validated it as a `did:key` before opening this window.
+const sessionKey = params.get("sessionKey");
+
+// Sends the decision, waits for the background to acknowledge it, and only then
+// closes the window. Closing in the same tick let the window's removal overtake
+// the result and turn an Approve into a Deny (Keyring VTI-40) — see
+// `consent-result.ts` and `consent-window.ts`.
+const sendConsentResult = consentResultSender(consentId);
 
 function decide(
   approved: boolean,
@@ -91,15 +111,12 @@ function decide(
   prfOutputB64u?: string,
   selectedDid?: string,
 ): void {
-  chrome.runtime.sendMessage({
-    type: RUNTIME_CONSENT_RESULT,
-    consentId,
+  void sendConsentResult({
     approved,
     remember,
     ...(prfOutputB64u ? { prfOutputB64u } : {}),
     ...(selectedDid ? { selectedDid } : {}),
   });
-  window.close();
 }
 
 /** `collapseDid` as a plain string.
@@ -331,6 +348,7 @@ function DidField({
         <button type="button" onClick={copy} style={linkButtonStyle}>
           {copied ? "Copied ✓" : "Copy"}
         </button>
+        <DidQrButton value={value} />
       </div>
     </div>
   );
@@ -617,6 +635,75 @@ function Confirm() {
           </div>
         </div>
       )}
+
+      {changedFromBaseUrl && (
+        <div
+          role="alert"
+          style={{
+            border: `1px solid var(--w-danger)`,
+            background: colours.dangerBg,
+            color: "var(--w-danger)",
+            padding: 12,
+            margin: "0 0 14px",
+            borderRadius: 8,
+          }}
+        >
+          <strong style={{ display: "block", marginBottom: 4 }}>
+            ⚠ Relying-party address changed
+          </strong>
+          <div style={{ marginBottom: 6, fontSize: 12 }}>
+            This site previously signed you in through a different address. Approving pins the
+            new one: later step-ups from this site will go there.
+          </div>
+          <div style={{ color: colours.textMuted, fontSize: 11, marginBottom: 2 }}>Previously:</div>
+          <div style={{ wordBreak: "break-all", fontSize: 11, fontFamily: colours.mono }}>
+            {changedFromBaseUrl}
+          </div>
+        </div>
+      )}
+
+      {/* The pinned origin ↔ relying-party pairing this action is bound to. */}
+      {isPinned && rpDid && (
+        <div
+          data-testid="pinned-pairing"
+          style={{
+            background: colours.card,
+            border: `1px solid ${colours.border}`,
+            borderLeft: `3px solid ${colours.primary}`,
+            borderRadius: 10,
+            padding: 12,
+            marginBottom: 12,
+            fontSize: 12,
+          }}
+        >
+          <div
+            style={{
+              color: colours.textMuted,
+              fontSize: 11,
+              fontWeight: 600,
+              letterSpacing: 0.3,
+              textTransform: "uppercase",
+              marginBottom: 6,
+            }}
+          >
+            Pinned relying party
+          </div>
+          <div style={{ wordBreak: "break-all", fontFamily: colours.mono }}>
+            {origin || "unknown page"} ↔ {rpDid}
+          </div>
+          {pinnedBaseUrl && (
+            <div style={{ wordBreak: "break-all", fontFamily: colours.mono, marginTop: 4 }}>
+              via {pinnedBaseUrl}
+            </div>
+          )}
+          <p style={{ margin: "6px 0 0", fontSize: 11, color: colours.textMuted }}>
+            You confirmed this pairing when you signed in from this site. The wallet acts for
+            this page only toward that relying party.
+          </p>
+        </div>
+      )}
+
+      {sessionKey && <SessionKeyNotice sessionKey={sessionKey} />}
 
       {/* Step-up reason — the RP's stated purpose for wanting elevation,
           pulled from INSIDE its signed approve-request (verified in the

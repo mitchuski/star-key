@@ -27,9 +27,20 @@ jobs:
         node: ["24", "26"]
 
     steps:
-      - uses: actions/checkout@v5
+      # Every `actions/*` ref is a commit SHA, with the tag it came from in the
+      # comment beside it. A tag is mutable: `@v5` is a promise its owner — or
+      # whoever takes that account — can move, and whatever it moves to then
+      # runs here, in a job that has this repo's token in its environment. The
+      # SHA is what runs; the comment is what a human reads. `dependabot.yml`
+      # rewrites the two together, which is what keeps a pin from going stale.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Nothing in this workflow writes to the repository. The default
+          # leaves the job's token in `.git/config`, where every later step can
+          # read it — `npm ci`'s install scripts included.
+          persist-credentials: false
 
-      - uses: actions/setup-node@v5
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: ${{ matrix.node }}
           cache: npm
@@ -83,7 +94,7 @@ jobs:
       # contain this" a structural property rather than a convention.
       - name: Assert agent-administration surface is confined to the console
         run: |
-          for task in 'acl/grant/0.1' 'acl/revoke/0.1' 'acl/update/0.1' 'contexts/delete/1.0' 'keys/create/0.1' 'keys/sign/0.1' 'policy/upsert/0.2' 'device/wipe/0.1' 'config/patch/0.1' 'vta/did-templates/create/2.0' 'consent/approver-set/1.0' 'keys/import/0.1' 'did-management/did/delete/0.1' 'vta/services/enable/1.0' 'vta/services/disable/1.0' 'vta/credentials/issue/0.1' 'vta/credentials/revoke/0.1'; do
+          for task in 'acl/grant/0.1' 'acl/revoke/0.1' 'acl/update/0.1' 'contexts/delete/1.0' 'keys/create/0.1' 'keys/sign/0.1' 'policy/upsert/0.2' 'device/wipe/0.1' 'config/patch/0.1' 'vta/did-templates/create/2.0' 'vta/did-templates/list/2.0' 'vta/did-templates/update/2.0' 'vta/did-templates/delete/2.0' 'vta/did-templates/render/2.0' 'consent/approver-set/1.0' 'keys/import/0.1' 'did-management/did/delete/0.1' 'vta/services/enable/1.0' 'vta/services/disable/1.0' 'vta/credentials/issue/0.1' 'vta/credentials/revoke/0.1'; do
             leaked=$(grep -rlF "$task" packages/extension/dist/ | grep -v '^packages/extension/dist/manager\.js$' || true)
             if [ -n "$leaked" ]; then
               echo "::error::$leaked contains $task — @openvtc/pnm-core/admin must not be reachable from any wallet surface (check for a root-barrel import, or a shared chunk)"
@@ -162,7 +173,7 @@ jobs:
       # file" structural; the assertion below fails if it is ever lost.
       - name: Assert the holder-scoped half of persona is confined to the console
         run: |
-          for task in 'persona/attribute/put/1.0' 'persona/attribute/list/1.0' 'persona/attribute/delete/1.0' 'persona/profile/put/1.0' 'persona/profile/get/1.0' 'persona/profile/list/1.0' 'persona/profile/delete/1.0' 'persona/binding/set/1.0' 'persona/correlation/analyze/1.0' 'persona/disclosure/history/1.0'; do
+          for task in 'persona/attribute/put/1.0' 'persona/attribute/list/1.0' 'persona/attribute/delete/1.0' 'persona/attribute/purge-version/1.0' 'persona/attribute/promote/1.0' 'persona/profile/compose/1.0' 'persona/profile/retire/1.0' 'persona/profile/reinstate/1.0' 'persona/profile/usage/1.0' 'persona/profile/timeline/1.0' 'persona/profile/put/1.0' 'persona/profile/get/1.0' 'persona/profile/list/1.0' 'persona/profile/delete/1.0' 'persona/binding/set/1.0' 'persona/facet/put/1.0' 'persona/facet/list/1.0' 'persona/facet/delete/1.0' 'persona/correlation/analyze/1.0' 'persona/disclosure/history/1.0'; do
             leaked=$(grep -rlF "$task" packages/extension/dist/ | grep -v '^packages/extension/dist/manager\.js$' || true)
             if [ -n "$leaked" ]; then
               echo "::error::$leaked contains $task — this half of persona/* reads or writes the holder's attribute pool, which sits above every trust context. A wallet surface naming it is the boundary being crossed the wrong way; only the console may. Check for an import of @openvtc/pnm-core/admin from a wallet entry, or a shared chunk. See packages/core/src/admin/persona.ts."
@@ -188,13 +199,59 @@ jobs:
       - name: Assert the console still carries the persona surface it is the exception for
         run: |
           bundle=packages/extension/dist/manager.js
-          for task in 'persona/attribute/put/1.0' 'persona/attribute/list/1.0' 'persona/attribute/delete/1.0' 'persona/profile/put/1.0' 'persona/profile/get/1.0' 'persona/profile/list/1.0' 'persona/profile/delete/1.0' 'persona/binding/set/1.0' 'persona/correlation/analyze/1.0' 'persona/disclosure/history/1.0'; do
+          for task in 'persona/attribute/put/1.0' 'persona/attribute/list/1.0' 'persona/attribute/delete/1.0' 'persona/attribute/purge-version/1.0' 'persona/attribute/promote/1.0' 'persona/profile/compose/1.0' 'persona/profile/retire/1.0' 'persona/profile/reinstate/1.0' 'persona/profile/usage/1.0' 'persona/profile/timeline/1.0' 'persona/profile/put/1.0' 'persona/profile/get/1.0' 'persona/profile/list/1.0' 'persona/profile/delete/1.0' 'persona/binding/set/1.0' 'persona/facet/put/1.0' 'persona/facet/list/1.0' 'persona/facet/delete/1.0' 'persona/correlation/analyze/1.0' 'persona/disclosure/history/1.0'; do
             if ! grep -qF "$task" "$bundle"; then
               echo "::error::$bundle no longer contains $task. The guard above permits it here precisely because the console's persona pane calls it; a build without it is a pane that cannot do what it offers. If the pane genuinely dropped this task, remove it from BOTH lists in the same change."
               exit 1
             fi
           done
-          echo "OK: the console carries all ten holder-scoped persona tasks"
+          echo "OK: the console carries all twenty holder-scoped persona tasks"
+
+      # A fourth guard: the mediator's operations surface (`messaging/*`, via
+      # `@openvtc/pnm-core/mediator`) — the Mediator Lens.
+      #
+      # These run at a *mediator*, over the session the wallet holds with it for
+      # an agent's inbox, and an admin standing there sees every account's
+      # queues and a live feed of who talks to whom. That is operator surface,
+      # so it is banned from every wallet bundle — with TWO permitted files
+      # rather than one, and the second is not a relaxation:
+      #
+      #   manager.js    composes the tasks (the lens pane).
+      #   offscreen     (`assets/offscreen-<hash>.js`, the entry chunk
+      #                 `offscreen.html` loads) is the one place that signs, and it owns the traffic
+      #                 monitor's lease — subscribing, renewing and releasing it
+      #                 has to live where MV3 teardown is observable, or a closed
+      #                 tab holds one of the mediator's three slots. It also
+      #                 enforces the lens's task allow-list.
+      #
+      # Every page-reachable surface — the service worker (which forwards the
+      # lens op opaquely and never names a task), content, page-world, popup,
+      # confirm, options — must stay clean.
+      - name: Assert the mediator operations surface is confined to the console and its signer
+        run: |
+          for task in 'messaging/stats/show/0.1' 'messaging/queue/list/0.1' 'messaging/queue/status/0.1' 'messaging/queue/purge/0.1' 'messaging/account/get/0.1' 'messaging/account/list/0.1' 'messaging/account/update/0.1' 'messaging/message/list/0.1' 'messaging/message/delete/0.1' 'messaging/monitor/subscribe/0.1' 'messaging/monitor/unsubscribe/0.1'; do
+            leaked=$(grep -rlF "$task" packages/extension/dist/ | grep -v -e '^packages/extension/dist/manager\.js$' -e '^packages/extension/dist/assets/offscreen-[A-Za-z0-9_-]*\.js$' || true)
+            if [ -n "$leaked" ]; then
+              echo "::error::$leaked contains $task — the mediator operations surface must not be reachable from a wallet surface. Only the console (manager.js) composes these and only the offscreen document signs them. Check for an import of @openvtc/pnm-core/mediator from a wallet entry, or a shared chunk."
+              exit 1
+            fi
+          done
+          echo "OK: mediator operations task URIs appear only in manager.js and the offscreen entry"
+
+      # …and present where the exception is claimed, for the reason the persona
+      # presence check gives: a lens pane whose tasks were tree-shaken out is a
+      # green build and a pane that does nothing.
+      - name: Assert the lens still carries the mediator surface it is the exception for
+        run: |
+          for task in 'messaging/stats/show/0.1' 'messaging/queue/list/0.1' 'messaging/queue/status/0.1' 'messaging/queue/purge/0.1' 'messaging/account/get/0.1' 'messaging/account/list/0.1'; do
+            grep -qF "$task" packages/extension/dist/manager.js || { echo "::error::manager.js no longer contains $task — the lens pane cannot do what it offers"; exit 1; }
+          done
+          offscreen=$(grep -o 'src="/assets/offscreen-[^"]*\.js"' packages/extension/dist/offscreen.html | sed 's|src="/||; s|"$||')
+          test -n "$offscreen" || { echo "::error::offscreen.html loads no assets/offscreen-*.js — the guard above names a file that no longer exists"; exit 1; }
+          for task in 'messaging/monitor/subscribe/0.1' 'messaging/monitor/unsubscribe/0.1'; do
+            grep -qF "$task" "packages/extension/dist/$offscreen" || { echo "::error::$offscreen no longer contains $task — the live traffic feed has no one to hold its lease"; exit 1; }
+          done
+          echo "OK: the lens and its signer carry the mediator surface"
 
       # The console's isolation rests on it being one self-contained file: the
       # guard above names exactly one exception, so a second chunk would be a
@@ -270,8 +327,30 @@ jobs:
       # and the zip is identical across the Node matrix.
       - name: Upload Web Store zip
         if: matrix.node == '26'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: vta-wallet-extension
           path: packages/extension/release/*.zip
           if-no-files-found: error
+
+  # The pinning above is a property of this file, so it is asserted rather than
+  # remembered. A `uses:` carrying a tag or a branch is how the next person
+  # reintroduces exactly what the SHAs exist to prevent, and it looks like every
+  # example anyone will copy from.
+  actions-are-pinned:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Assert every `uses:` names a 40-hex commit
+        run: |
+          bad=$(grep -rhoE '^[[:space:]]*(-[[:space:]]+)?uses:[[:space:]]*[^[:space:]]+' .github/workflows/ \
+            | grep -vE 'uses:[[:space:]]*(\./|[^@]+@[0-9a-f]{40}$)' || true)
+          if [ -n "$bad" ]; then
+            echo "::error::these action refs are not pinned to a commit SHA:"
+            echo "$bad"
+            exit 1
+          fi
+          echo "OK: every action ref is a commit SHA"

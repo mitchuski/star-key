@@ -25,9 +25,11 @@ import { ConsentCeremony, Destructive, runMutation } from "../destructive.js";
 import { Loading, LoadError, Table, type Column } from "../table.js";
 import { useAsync } from "../use-async.js";
 import { formatInstant } from "../format.js";
+import { lensHref } from "../mediator-lens-model.js";
 import { useTransportHealth } from "../../use-transport-health.js";
 import { hasRole, type Authority, type Parties } from "../use-vta.js";
 import type { Transport, TransportObservation } from "../../transports.js";
+import { MailDid } from "../mail-did.js";
 
 /** `ServiceKind` → the name `TransportHealth` records observations under. */
 const OBSERVED_AS: Partial<Record<ServiceState["kind"], Transport>> = {
@@ -149,7 +151,17 @@ export function ServicesPane({
       header: "Endpoint",
       render: (s) => (
         <div style={{ display: "grid", gap: 2, maxWidth: 380 }}>
-          {s.mediatorDid && <Did value={s.mediatorDid} size={t.xs} />}
+          {s.mediatorDid && (
+            <>
+              <MailDid value={s.mediatorDid} size={t.xs} />
+              <a
+                href={lensHref({ mediatorDid: s.mediatorDid, vtaDid: parties.service.did })}
+                style={{ color: c.accent, fontSize: t.xs }}
+              >
+                Look inside this relay →
+              </a>
+            </>
+          )}
           {s.url && (
             <span style={{ fontFamily: font.mono, fontSize: t.xs, wordBreak: "break-all" }}>
               {s.url}
@@ -266,8 +278,22 @@ export function ServicesPane({
       >
         <Table
           columns={[
-            { key: "mediator", header: "Mediator", render: (s) => <Did value={s.mediatorDid} /> },
-            { key: "vta", header: "For agent", render: (s) => <Did value={s.vtaDid} /> },
+            {
+              key: "mediator",
+              header: "Mediator",
+              render: (s) => (
+                <div style={{ display: "grid", gap: 2 }}>
+                  <MailDid value={s.mediatorDid} />
+                  <a
+                    href={lensHref({ mediatorDid: s.mediatorDid, vtaDid: s.vtaDid })}
+                    style={{ color: c.accent, fontSize: t.xs }}
+                  >
+                    Look inside this relay →
+                  </a>
+                </div>
+              ),
+            },
+            { key: "vta", header: "For agent", render: (s) => <MailDid value={s.vtaDid} /> },
             {
               key: "inbox",
               header: "Role",

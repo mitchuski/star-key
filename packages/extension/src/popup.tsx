@@ -9,11 +9,13 @@ import { c, t } from "./theme.js";
 import { encryptHolderSecretInPopup } from "./encrypt-holder.js";
 import { readActiveVtaDid } from "./active-vta.js";
 import { CopyButton, VaultPanel } from "./vault-panel.js";
+import { DidQrButton } from "./did-qr-view.js";
 import { releaseSelectAfterPointerChange } from "./select-wheel.js";
 import {
   useActiveConnection,
   useConnectionStore,
   useLockStateStore,
+  withRefreshedTransports,
   type Connection,
 } from "./store.js";
 import {
@@ -163,6 +165,7 @@ function VtaSwitcher({
       >
         <span style={{ color: "var(--w-muted)" }}>
           VTA: <code style={mono}>{truncateDid(activeConnection.vtaDid)}</code>
+          <DidQrButton value={activeConnection.vtaDid} />
           {vtaList.length > 1 && (
             <span style={{ color: "var(--w-muted)", marginLeft: 6 }}>
               ({vtaList.length} configured)
@@ -228,6 +231,7 @@ function VtaSwitcher({
                   {isActive ? "●" : "○"}
                 </span>
                 <code style={{ ...mono, flex: 1 }}>{c.vtaDid}</code>
+                <DidQrButton value={c.vtaDid} />
               </div>
               <div style={{ display: "flex", gap: 6, justifyContent: "flex-end" }}>
                 {!isActive && (
@@ -421,12 +425,14 @@ function ConnectedView({
       <div style={{ fontSize: 12, color: "var(--w-muted)" }}>VTA</div>
       <div style={{ display: "flex", alignItems: "flex-start", gap: 6 }}>
         <code style={{ ...mono, flex: 1 }}>{connection.vtaDid}</code>
+        <DidQrButton value={connection.vtaDid} />
         <CopyButton text={connection.vtaDid} />
       </div>
 
       <div style={{ fontSize: 12, color: "var(--w-muted)" }}>Holder (your wallet DID)</div>
       <div style={{ display: "flex", alignItems: "flex-start", gap: 6 }}>
         <code style={{ ...mono, flex: 1 }}>{connection.holderDid}</code>
+        <DidQrButton value={connection.holderDid} />
         <CopyButton text={connection.holderDid} />
       </div>
 
@@ -832,18 +838,7 @@ function Popup() {
     const tspChanged = (fresh.tspMediatorDid ?? null) !== (current.tspMediatorDid ?? null);
     if (!restChanged && !medChanged && !tspChanged) return;
 
-    // Rebuild the connection without unset transports — JS spread keeps
-    // the old value if the new field is absent; building fresh lets us
-    // CLEAR a transport the VTA stopped advertising.
-    const updated: Connection = {
-      vtaDid: current.vtaDid,
-      holderDid: current.holderDid,
-      role: current.role,
-      connectedAt: current.connectedAt,
-      ...(fresh.restBaseUrl ? { restBaseUrl: fresh.restBaseUrl } : {}),
-      ...(fresh.mediatorDid ? { mediatorDid: fresh.mediatorDid } : {}),
-      ...(fresh.tspMediatorDid ? { tspMediatorDid: fresh.tspMediatorDid } : {}),
-    };
+    const updated = withRefreshedTransports(current, fresh);
     console.info(
       "[pnm] VTA transports refreshed:",
       { tsp: !!fresh.tspMediatorDid, rest: !!fresh.restBaseUrl, didcomm: !!fresh.mediatorDid },
@@ -872,7 +867,8 @@ function Popup() {
         ⚠ VTA advertises no transports
       </strong>
       <small style={{ color: "var(--w-danger)" }}>
-        <code style={mono}>{connection.vtaDid}</code> currently advertises neither{" "}
+        <code style={mono}>{connection.vtaDid}</code>
+        <DidQrButton value={connection.vtaDid} /> currently advertises neither{" "}
         <code>#vta-rest</code> nor <code>#vta-didcomm</code>. Wallet operations will fail until
         the VTA re-enables at least one transport (<code>vta services {`{rest,didcomm}`} enable</code>).
       </small>

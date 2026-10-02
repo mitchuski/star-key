@@ -48,7 +48,14 @@ function payload(over = {}) {
   };
 }
 
-/** A signed, correctly-addressed inbound request from `as` (default: the VTA). */
+/**
+ * A signed, correctly-addressed inbound request from `as` (default: the VTA).
+ *
+ * `recipient: null` omits the member entirely, and omits it *before* signing —
+ * deleting it afterwards would break the proof, and the request would then be
+ * refused for tampering rather than for being unaddressed, which is a different
+ * test that already exists.
+ */
 async function inbound({ as = VTA, over = {}, drop = [], recipient = HOLDER, unsigned = false } = {}) {
   const p = payload(over);
   for (const k of drop) delete p[k];
@@ -56,7 +63,7 @@ async function inbound({ as = VTA, over = {}, drop = [], recipient = HOLDER, uns
     id: "urn:uuid:00000000-0000-0000-0000-000000000001",
     type: TASK_CONSENT_REQUEST_TYPE,
     issuer: as.did,
-    recipient,
+    ...(recipient === null ? {} : { recipient }),
     issuedAt: new Date().toISOString(),
     payload: p,
   };
@@ -115,6 +122,22 @@ test("a request addressed to another device is refused", async () => {
   assert.equal(res.ok, false);
   assert.equal(res.reason, "untrusted_issuer");
   assert.match(res.detail, /another device/);
+});
+
+test("a request naming no recipient is refused, not waved through", async () => {
+  // The check read `typeof recipient === "string" && recipient !== holderDid`,
+  // so leaving the member out skipped it — the addressing gate defeated by
+  // omission rather than by naming someone else.
+  //
+  // The proof stops an attacker stripping it from a signed document; what this
+  // catches is an *enrolled executor* sending one unaddressed, which every
+  // approver enrolled with it would then accept, each seeing a request that
+  // looks addressed to them. `task-consent/request/0.1` declares
+  // `isRecipientRequired: true` and nothing else on this path enforces it.
+  const res = await parseTaskConsentRequest(await inbound({ recipient: null }), opts);
+  assert.equal(res.ok, false);
+  assert.equal(res.reason, "untrusted_issuer");
+  assert.match(res.detail, /names no recipient/);
 });
 
 test("a lapsed request is refused rather than shown", async () => {
@@ -267,40 +290,46 @@ function grantedEnvelope({ digest = "zQmGrantedDigest", from = VTA.did, issuer =
 }
 
 test("parseTaskConsentGranted accepts the enveloped notice the VTA sends", () => {
-  assert.deepEqual(parseTaskConsentGranted(grantedEnvelope(), VTA.did), {
+  assert.deepEqual(parseTaskConsentGranted(grantedEnvelope(), VTA.did, VTA.did), {
     payloadDigest: "zQmGrantedDigest",
   });
 });
 
 test("parseTaskConsentGranted ignores a non-envelope message type", () => {
   const msg = { type: "other", from: VTA.did, body: { payloadDigest: "x" } };
-  assert.equal(parseTaskConsentGranted(msg, VTA.did), null);
+  assert.equal(parseTaskConsentGranted(msg, VTA.did, VTA.did), null);
 });
 
 test("parseTaskConsentGranted ignores an envelope carrying another task", () => {
   const msg = grantedEnvelope();
   msg.body.type = TASK_CONSENT_REQUEST_TYPE;
-  assert.equal(parseTaskConsentGranted(msg, VTA.did), null);
+  assert.equal(parseTaskConsentGranted(msg, VTA.did, VTA.did), null);
 });
 
-test("parseTaskConsentGranted rejects a sender that is not our VTA", () => {
-  assert.equal(parseTaskConsentGranted(grantedEnvelope({ from: IMPOSTOR.did }), VTA.did), null);
+test("parseTaskConsentGranted rejects an authenticated sender that is not our VTA", () => {
+  assert.equal(parseTaskConsentGranted(grantedEnvelope({ from: IMPOSTOR.did }), VTA.did, IMPOSTOR.did), null);
+});
+
+test("parseTaskConsentGranted goes by the authenticated sender, not `from`", () => {
+  // `from` names the VTA; the transport authenticated someone else.
+  assert.equal(parseTaskConsentGranted(grantedEnvelope(), VTA.did, IMPOSTOR.did), null);
 });
 
 test("parseTaskConsentGranted rejects an in-band issuer that is not our VTA", () => {
   const msg = grantedEnvelope({ from: null, issuer: IMPOSTOR.did });
-  assert.equal(parseTaskConsentGranted(msg, VTA.did), null);
+  assert.equal(parseTaskConsentGranted(msg, VTA.did, VTA.did), null);
 });
 
-test("parseTaskConsentGranted tolerates a missing sender (page re-checks the digest)", () => {
+test("parseTaskConsentGranted drops a notice with no authenticated sender", () => {
   const msg = grantedEnvelope({ from: null, issuer: null });
-  assert.deepEqual(parseTaskConsentGranted(msg, VTA.did), { payloadDigest: "zQmGrantedDigest" });
+  assert.equal(parseTaskConsentGranted(msg, VTA.did, null), null);
+  assert.equal(parseTaskConsentGranted(grantedEnvelope(), VTA.did, undefined), null);
 });
 
 test("parseTaskConsentGranted requires a string payloadDigest", () => {
   const msg = grantedEnvelope();
   delete msg.body.payload.payloadDigest;
-  assert.equal(parseTaskConsentGranted(msg, VTA.did), null);
+  assert.equal(parseTaskConsentGranted(msg, VTA.did, VTA.did), null);
 });
 
 // The regression, stated as the shape it was: a bare pre-spec body must not be
@@ -312,5 +341,5 @@ test("parseTaskConsentGranted rejects the pre-spec bare body", () => {
     from: VTA.did,
     body: { status: "granted", payloadDigest: "abc123", taskType: "t" },
   };
-  assert.equal(parseTaskConsentGranted(msg, VTA.did), null);
+  assert.equal(parseTaskConsentGranted(msg, VTA.did, VTA.did), null);
 });

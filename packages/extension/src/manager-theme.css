@@ -37,6 +37,55 @@
   --m-act-data: #0e6f78;
   --m-act-data-soft: #e2f2f4;
 
+  /* Family colours — the second categorical set, and the only other one.
+   *
+   * The identity map groups a holder's attributes by the family their claim
+   * type comes from (`attribute-family.ts`), and carries that colour onto the
+   * type chips of every face, so a composition can be read without opening it.
+   * Like the act colours these are *categorical*: they say which vocabulary a
+   * token belongs to and never whether anything is wrong. `--m-fam-gated`
+   * names the one family the registry marks `release: stepUp` — an agent
+   * behaviour, not a warning — and is deliberately a plum rather than anything
+   * near `--w-danger`, which would read as an alarm on a value that is
+   * perfectly healthy.
+   *
+   * Held at lower chroma than both the act and the semantic sets on purpose:
+   * they appear as a 3px stripe and a 6px dot beside a card whose border is
+   * already carrying selection and reach, and a saturated stripe would win a
+   * competition it is not in. */
+  --m-fam-identity: #7a58c9;
+  --m-fam-contact: #3f6ea8;
+  --m-fam-public: #4f7d5e;
+  --m-fam-gated: #a15381;
+  --m-fam-unregistered: #8a92a3;
+
+  /* World colours — the holder's own choice, and the THIRD categorical set.
+   *
+   * A world (`persona/facet` on the wire) is a part of a person's life, and
+   * these eight are the only colours one may wear. The wire carries a *name*
+   * — `teal`, `plum` — and never a literal, so a world stays legible in this
+   * console, in a terminal and on a phone, each resolving the name against its
+   * own palette. That is also what makes the closed set enforceable: given an
+   * arbitrary hex from a holder, this file could not keep a decorative choice
+   * out of the one channel that means something.
+   *
+   * None is named for, or drawn near, `--w-ok` / `--w-warn` / `--w-danger`.
+   * That constraint is not a matter of taste and is asserted in
+   * `manager-world-colour.test.mts`: a holder who names a world "Work" and
+   * picks the red one would otherwise have every card in it reading as an
+   * alarm, and no way to discover why.
+   *
+   * Held at the same low chroma as the family set, for the same reason — they
+   * fill a small chip beside a name, never a border or a pill. */
+  --m-world-slate: #5c6b80;
+  --m-world-indigo: #5b5fbf;
+  --m-world-teal: #2c7c85;
+  --m-world-moss: #4f7d5e;
+  --m-world-sand: #8a7440;
+  --m-world-clay: #a2664a;
+  --m-world-rose: #b05878;
+  --m-world-plum: #8455a8;
+
   /* The rail's own ground — a half-step off `--w-ground` so the three columns
    * read as three columns without a hard border doing the work. */
   --m-rail: #f2f4f8;
@@ -54,6 +103,23 @@
     --m-act-data: #4dc4d0;
     --m-act-data-soft: #0e2326;
 
+    --m-fam-identity: #a48ce0;
+    --m-fam-contact: #7aa6d8;
+    --m-fam-public: #85b795;
+    --m-fam-gated: #d18cb2;
+    --m-fam-unregistered: #6f7a8c;
+
+    /* Lifted for a dark ground, same hues and the same distance from the
+     * semantic three. */
+    --m-world-slate: #8d9bb0;
+    --m-world-indigo: #8f92e0;
+    --m-world-teal: #58aeb8;
+    --m-world-moss: #85b795;
+    --m-world-sand: #c0a668;
+    --m-world-clay: #d1937a;
+    --m-world-rose: #e08aa8;
+    --m-world-plum: #b98cd8;
+
     --m-rail: #0e131c;
     --m-tree: #10151f;
   }
@@ -70,4 +136,21 @@ body,
 
 body {
   overflow: hidden;
+}
+
+/* ── Popover content must fit the popover ───────────────────────────────────
+ *
+ * A grid or flex item's `min-width` defaults to `auto`, which refuses to shrink
+ * below its content's min-content width. Inside a popover — a box with a fixed
+ * width — that means one long help paragraph, or an unbreakable mono token like
+ * `phone.mobile`, sizes its whole column past the edge and the text is clipped
+ * at the border. The editors shown in popovers are built from several layers of
+ * nested, inline-styled grids, so this is one rule rather than a prop threaded
+ * through each of them.
+ *
+ * Safe as a stylesheet rule precisely because it is one: any component that
+ * genuinely needs a minimum sets it inline, and an inline style wins.
+ */
+[role="dialog"] * {
+  min-width: 0;
 }

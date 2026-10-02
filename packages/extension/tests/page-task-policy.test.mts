@@ -7,7 +7,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { pageTaskRefusal } from "../src/page-task-policy.ts";
+import { pageSignRefusal, pageTaskRefusal } from "../src/page-task-policy.ts";
 
 const P = "https://trusttasks.org/spec/persona/";
 
@@ -41,6 +41,50 @@ test("a page cannot read the holder's contacts", () => {
 // admitted by omission — which is the direction this guard must fail in.
 test("the refusal covers the family, not a list of known members", () => {
   assert.notEqual(pageTaskRefusal(`${P}some/future/task/9.9`), null);
+});
+
+// ── The rooms family ────────────────────────────────────────────────────────
+//
+// Same shape as persona, aimed at a room instead of the holder. `keys/open`
+// returns plaintext the room withholds from its own host, and `requestTask`
+// hands the VTA's reply straight to the page.
+const R = "https://trusttasks.org/spec/rooms/";
+
+test("a page cannot open a sealed record", () => {
+  const why = pageTaskRefusal(`${R}keys/open/0.1`);
+  assert.notEqual(why, null);
+  assert.match(why, /plaintext/);
+});
+
+// The worst of the three: these mint credentials in the ROOM's name, so one
+// prompt got past an owner is a page issuing itself membership or admin.
+test("a page cannot mint a room's own credentials", () => {
+  for (const verb of ["invite", "issue-membership", "issue-authority"]) {
+    assert.notEqual(
+      pageTaskRefusal(`${R}owner/${verb}/0.1`),
+      null,
+      `owner/${verb} should be refused`,
+    );
+  }
+});
+
+// Which rooms someone holds keys for is the membership of every one of them,
+// seen from their side — the fact a `private` room exists to withhold.
+test("a page cannot enumerate the holder's rooms", () => {
+  assert.notEqual(pageTaskRefusal(`${R}keys/list/0.1`), null);
+});
+
+// Host-served verbs are refused here too. A page reaching them through the
+// wallet would be borrowing the member's standing to read or write a room,
+// which is the same borrowing whichever party ends up serving the request.
+test("the refusal covers the host-served half as well", () => {
+  for (const uri of [`${R}records/get/0.1`, `${R}records/put/0.1`, `${R}create/0.1`]) {
+    assert.notEqual(pageTaskRefusal(uri), null, `${uri} should be refused`);
+  }
+});
+
+test("the rooms refusal covers the family, not a list of known members", () => {
+  assert.notEqual(pageTaskRefusal(`${R}some/future/task/9.9`), null);
 });
 
 // And it must not become a blanket ban: the wallet's other page-facing tasks
@@ -91,4 +135,67 @@ test("a site cannot choose which face answers", () => {
   // profile entry for this origin.
   params.contextId = "ctx-of-my-choosing";
   assert.ok(!keys.has("personaDid") && !keys.has("contextId"));
+});
+
+// ── What a page may ask the wallet to sign ──────────────────────────────────
+//
+// A page-signed document carries an `authentication` proof: at a relying party
+// it is the holder's own request. These are the shapes refused before any
+// prompt is raised.
+const AGENT = "did:webvh:agent.example";
+const RP = "did:webvh:hosting.example";
+const DM = "https://trusttasks.org/spec/did-management/";
+
+test("a page may have the wallet sign its request to a relying party", () => {
+  assert.equal(pageSignRefusal({ type: `${DM}did/list/0.1`, recipient: RP }, AGENT), null);
+});
+
+test("a page cannot have the wallet sign an unaddressed document", () => {
+  for (const recipient of [undefined, ""]) {
+    const why = pageSignRefusal({ type: `${DM}did/delete/0.1`, recipient }, AGENT);
+    assert.notEqual(why, null);
+    assert.match(why, /no recipient/);
+  }
+});
+
+test("a page cannot have the wallet sign a document to the holder's own agent", () => {
+  const why = pageSignRefusal({ type: "https://trusttasks.org/spec/acl/grant/0.1", recipient: AGENT }, AGENT);
+  assert.notEqual(why, null);
+  assert.match(why, /own agent/);
+});
+
+test("a page cannot have the wallet sign a step-up approval", () => {
+  for (const t of [
+    "https://trusttasks.org/spec/auth/step-up/approve-response/0.5",
+    "https://trusttasks.org/spec/auth/step-up/approve-response/0.3",
+    "https://trusttasks.org/spec/auth/step-up/approve-request/0.3",
+  ]) {
+    const why = pageSignRefusal({ type: t, recipient: RP }, AGENT);
+    assert.notEqual(why, null, t);
+    assert.match(why, /stepUpVta/);
+  }
+});
+
+test("a page cannot have the wallet sign a sign-in", () => {
+  for (const t of [
+    "https://trusttasks.org/spec/auth/authenticate/0.2",
+    "https://trusttasks.org/spec/auth/authenticate/0.1",
+  ]) {
+    const why = pageSignRefusal({ type: t, recipient: RP }, AGENT);
+    assert.notEqual(why, null, t);
+    assert.match(why, /login\(\)/);
+  }
+});
+
+test("a page cannot have the wallet sign a family it may not request", () => {
+  assert.notEqual(
+    pageSignRefusal({ type: `${P}disclosure/present/1.0`, recipient: RP }, AGENT),
+    null,
+  );
+});
+
+test("a page cannot have the wallet sign something that is not a document", () => {
+  for (const env of [undefined, null, "doc", [], { recipient: RP }]) {
+    assert.notEqual(pageSignRefusal(env, AGENT), null, JSON.stringify(env));
+  }
 });

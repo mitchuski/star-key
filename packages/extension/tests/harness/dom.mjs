@@ -44,6 +44,17 @@ function installGlobals(window) {
     define(name, name === "window" ? window : name === "document" ? document : window[name]);
   }
   define("getComputedStyle", window.getComputedStyle.bind(window));
+  // The bare window globals. A component written for a browser says
+  // `addEventListener(...)` and `innerHeight`, not `window.addEventListener` —
+  // `shell.tsx` and `popover.tsx` both do — and without these it throws
+  // `ReferenceError` on mount, in a file the failing test never names. They are
+  // part of "a DOM exists" in exactly the way `document` is.
+  for (const name of ["addEventListener", "removeEventListener", "dispatchEvent", "requestIdleCallback", "matchMedia", "scrollTo", "scrollBy"]) {
+    if (typeof window[name] === "function") define(name, window[name].bind(window));
+  }
+  for (const name of ["innerWidth", "innerHeight", "scrollX", "scrollY", "location", "localStorage", "sessionStorage", "KeyboardEvent", "DragEvent", "DataTransfer", "SVGElement"]) {
+    if (window[name] !== undefined) define(name, window[name]);
+  }
   define("requestAnimationFrame", (fn) => setTimeout(() => fn(Date.now()), 0));
   define("cancelAnimationFrame", (id) => clearTimeout(id));
   // The map measures cards to draw its edges. happy-dom has no layout, so every
@@ -175,9 +186,36 @@ export async function render(element, { chrome: chromeStub } = {}) {
       }
       return found;
     },
+    /**
+     * Press a key on the window.
+     *
+     * On the window rather than on an element because that is where the
+     * listeners under test live: a popover's Escape handler is bound globally
+     * so it fires wherever the caret happens to be, which is the whole point of
+     * it. Through `act` like every other event, so React settles the same way
+     * the browser would.
+     */
+    key: async (key) => {
+      await act(async () => {
+        window.dispatchEvent(new window.KeyboardEvent("keydown", { key, bubbles: true }));
+      });
+    },
     click: async (el) => {
       await act(async () => {
         el.dispatchEvent(new window.MouseEvent("click", { bubbles: true }));
+      });
+    },
+    /**
+     * Click holding a modifier — shift-range selection and nothing else so far.
+     *
+     * Its own helper rather than an argument to `click` because it must go
+     * through `act` like every other event: a raw `dispatchEvent` from a test
+     * updates React outside the batch, which warns, and settles in a different
+     * order than the browser would.
+     */
+    clickWith: async (el, init) => {
+      await act(async () => {
+        el.dispatchEvent(new window.MouseEvent("click", { bubbles: true, ...init }));
       });
     },
     /**
@@ -191,7 +229,9 @@ export async function render(element, { chrome: chromeStub } = {}) {
      * shows the text, the component's state stays empty, and the assertion that
      * follows fails somewhere far away with a screen that looks right.
      * Clearing the tracker's cached value makes the dispatch read as a real
-     * edit.
+     * edit. The cached value must differ from the one being typed, so clearing
+     * a field (`type(el, "")`) resets it to a sentinel rather than to `""` —
+     * otherwise the one edit that empties a field is the one React ignores.
      */
     type: async (el, value) => {
       await act(async () => {
@@ -199,7 +239,7 @@ export async function render(element, { chrome: chromeStub } = {}) {
           el.tagName === "TEXTAREA" ? window.HTMLTextAreaElement : window.HTMLInputElement;
         const setter = Object.getOwnPropertyDescriptor(proto.prototype, "value")?.set;
         setter ? setter.call(el, value) : (el.value = value);
-        el._valueTracker?.setValue("");
+        el._valueTracker?.setValue(value === "" ? "\u0000" : "");
         el.dispatchEvent(new window.Event("input", { bubbles: true }));
         el.dispatchEvent(new window.Event("change", { bubbles: true }));
       });
@@ -250,4 +290,4 @@ export const PARTIES = {
 };
 
 /** `whoAmI`'s answer for a caller the agent treats as an unscoped holder. */
-export const UNSCOPED_HOLDER = { session: { id: "s" }, roles: ["admin"], scopes: [] };
+export const UNSCOPED_HOLDER = { session: { id: "s", subject: "did:key:zHolder" }, roles: ["admin"], scopes: [], capabilities: ["persona-holder"] };

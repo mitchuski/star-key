@@ -1,6 +1,7 @@
 // DIDComm session login to a did-hosting Relying Party.
 //
-// Unlike the REST SIOPv2 flow (`loginViaSiop`), there is **no `id_token`**.
+// Unlike the Trust Task login (`loginViaTrustTask`), there is **no signed
+// authenticate document**.
 // Over DIDComm the authcrypt layer (ECDH-1PU) already authenticates the
 // sender DID to the recipient, so "login" is just: authcrypt an
 // `authenticate` message to the RP's control DID → the RP checks its ACL on
@@ -103,7 +104,12 @@ export async function loginViaDidcomm(opts: DidcommLoginOptions): Promise<Didcom
     ]);
   }
 
-  const reply = await bridge.sendAndAwaitReply(outer, requestId, { timeoutMs });
+  // Only the RP answers a login: a reply on this thread from anyone else is
+  // never handed back.
+  const reply = await bridge.sendAndAwaitReply(outer, requestId, {
+    timeoutMs,
+    from: service.did,
+  });
 
   if (reply.thid !== requestId) {
     throw new Error(`didcomm login: reply thid ${reply.thid ?? "(none)"} != request ${requestId}`);

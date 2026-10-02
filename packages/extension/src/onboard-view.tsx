@@ -46,12 +46,13 @@
 // The provisioning sequence itself is otherwise unchanged.
 
 import { useEffect, useState } from "react";
-import { useConnectionStore } from "./store.js";
+import { useConnectionStore, type Connection } from "./store.js";
 import { didWebvhDomain, type AdminScope } from "@openvtc/pnm-core";
 import {
   looksLikeAgentName,
   parseAgentName,
 } from "./agent-name.js";
+import { grantsPersonaHolder, needsSuperAdminOperator } from "./grant-command.js";
 import {
   MEDIATOR_REQUIRED,
   ONBOARD_STAGES,
@@ -76,6 +77,7 @@ import {
 } from "./host-permissions.js";
 import { encryptHolderSecretInPopup } from "./encrypt-holder.js";
 import { button, c, microLabel, t } from "./theme.js";
+import { DidQrButton } from "./did-qr-view.js";
 
 /** `chrome.storage.session` key holding the VTA DID of an onboarding that a
  *  host-permission dialog interrupted. Session-scoped: a UI breadcrumb that
@@ -115,6 +117,11 @@ export function OnboardView({
   // afterwards, from `contexts` below.
   const [homeContext, setHomeContext] = useState("");
   const [createIfMissing, setCreateIfMissing] = useState(false);
+  // Whether a context-scoped wallet also asks for `persona-holder` — authority
+  // over the holder's own attributes and faces, which no role carries. Opt-in
+  // there because only an unscoped operator can confer it; an unrestricted
+  // wallet always gets it. See `grant-command.ts`.
+  const [personaHolder, setPersonaHolder] = useState(false);
   const [prep, setPrep] = useState<OnboardPrepareResult | null>(null);
   const [status, setStatus] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -136,27 +143,15 @@ export function OnboardView({
   // Which phase the offscreen connect is in. Null when not connecting.
   const [stage, setStage] = useState<OnboardStage | null>(null);
 
-  // Between "onboard succeeded" and "ConnectedView renders" we
-  // optionally show an Encrypt-your-wallet prompt. Offscreen can't
-  // run WebAuthn (it's hidden), so the seed lands plaintext after
-  // onboarding; the popup (visible, has fresh user gesture from the
-  // operator's clicks through the prompt) is the right place to run
-  // the WebAuthn-PRF ceremony and re-wrap the record in place. The
-  // setConnection call is deferred until the operator either
-  // encrypts or skips — that way the Popup wrapper's `connection`
-  // check doesn't transition to ConnectedView prematurely.
+  // After a successful onboard (already committed to the store) we offer to
+  // encrypt the just-installed holder secret. Offscreen can't run WebAuthn
+  // (it's hidden), so the seed lands plaintext; this visible, gestured page
+  // is the right place to run the WebAuthn-PRF ceremony and re-wrap the
+  // record in place. The prompt is optional and holds no state that matters:
+  // closing the page here leaves a working, unencrypted wallet.
   interface PendingConnect {
     vtaDid: string;
     holderDid: string;
-    role: string;
-    /** What the agent said it did, carried through to the stored connection
-     *  unchanged. Never the ask — see `OnboardConnectResult`. */
-    homeContext: string;
-    agentScope: AdminScope;
-    restBaseUrl?: string;
-    mediatorDid?: string;
-    connectedAt: number;
-    secretEncrypted: boolean;
   }
   // Set when the VTA published no mediator and onboarding needs one supplied.
   // Distinct from an error: it is a question with an answer that retries.
@@ -306,6 +301,7 @@ export function OnboardView({
         // unrestricted grant would be sending a value the command must not
         // contain, which is the "too narrow" failure in `grant-command.ts`.
         ...(contextNeededBeforeGrant && effectiveContext ? { context: effectiveContext } : {}),
+        ...(adminScope === "context" && personaHolder ? { personaHolder: true } : {}),
       })) as RuntimeOnboardPrepareResponse;
       if (!res.ok) throw new Error(res.error);
       setPrep(res.result);
@@ -395,16 +391,8 @@ export function OnboardView({
         // and no deployment could produce.
         throw new Error(res.error);
       }
-      // Stash the connection info but don't commit to ConnectedView
-      // yet. The next screen offers to encrypt the just-installed
-      // holder identity in the popup's visible context — running the
-      // WebAuthn ceremony here works (popup is focused, the operator
-      // is right there) where the same call from offscreen hangs.
-      // If the offscreen path ever DOES return `secretEncrypted: true`
-      // (a future popup-driven install pipeline), the prompt screen
-      // detects that and transitions through automatically.
       setPrep(null);
-      const connected = {
+      const connected: Connection = {
         vtaDid: vtaDid.trim(),
         holderDid: res.result.holderDid,
         role: res.result.role,
@@ -416,17 +404,25 @@ export function OnboardView({
         ...(prep?.restBaseUrl ? { restBaseUrl: prep.restBaseUrl } : {}),
         ...(prep?.mediatorDid ? { mediatorDid: prep.mediatorDid } : {}),
         connectedAt: Date.now(),
-        secretEncrypted: res.result.secretEncrypted,
       };
+      // Commit NOW, before anything else is shown. By this point the agent
+      // has granted the holder and the offscreen document has stored its key,
+      // so the wallet is onboarded whether or not the operator touches another
+      // button. This used to wait for Encrypt or Skip on the prompt below, and
+      // a person who read "Wallet onboarded ✓" as the end — and closed the
+      // tab — lost the connection while the agent kept the ACL entry.
+      setConnection(connected);
       // Embedded in the setup spine, the lock is step 3 and owns that prompt.
       // Showing this component's own encrypt screen as well asked the same
-      // question twice in a row, in two different visual languages. Commit
-      // and let the spine advance to locking.
-      if (!standalone && !onCancel) {
-        finalizeConnection(connected);
-        return;
+      // question twice in a row, in two different visual languages.
+      if (!standalone && !onCancel) return;
+      // Otherwise offer encryption as an optional follow-up. Nothing depends on
+      // the answer: the key can be encrypted later from the plaintext banner.
+      if (!res.result.secretEncrypted) {
+        setPendingConnect({ vtaDid: connected.vtaDid, holderDid: connected.holderDid });
+      } else {
+        onCancel?.();
       }
-      setPendingConnect(connected);
     } catch (e) {
       setStatus(e instanceof Error ? e.message : String(e));
     } finally {
@@ -449,20 +445,12 @@ export function OnboardView({
     setCommandCopied(true);
   }
 
-  // Finalize the pending connection: commit to zustand → ConnectedView.
-  function finalizeConnection(pc: PendingConnect) {
-    setConnection({
-      vtaDid: pc.vtaDid,
-      holderDid: pc.holderDid,
-      role: pc.role,
-      homeContext: pc.homeContext,
-      agentScope: pc.agentScope,
-      ...(pc.restBaseUrl ? { restBaseUrl: pc.restBaseUrl } : {}),
-      ...(pc.mediatorDid ? { mediatorDid: pc.mediatorDid } : {}),
-      connectedAt: pc.connectedAt,
-    });
+  /** Leave the post-onboard encrypt prompt. The connection was committed when
+   *  connect succeeded; this only closes the add-another panel. */
+  function dismissPrompt() {
     setPendingConnect(null);
     setEncryptError(null);
+    onCancel?.();
   }
 
   // Run the WebAuthn-PRF ceremony in the popup's visible context and
@@ -475,7 +463,7 @@ export function OnboardView({
     setEncryptError(null);
     try {
       await encryptHolderSecretInPopup(pc.vtaDid);
-      finalizeConnection({ ...pc, secretEncrypted: true });
+      dismissPrompt();
     } catch (e) {
       setEncryptError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -484,17 +472,12 @@ export function OnboardView({
   }
 
   if (pendingConnect) {
-    // If offscreen managed to encrypt on its own (future popup-driven
-    // install pipeline), skip the prompt — the work is already done.
-    if (pendingConnect.secretEncrypted) {
-      finalizeConnection(pendingConnect);
-      return null;
-    }
     return (
       <div style={box}>
         <h3 style={{ margin: 0 }}>Wallet onboarded ✓</h3>
         <small>
-          Your wallet&apos;s long-term identity is now <code style={mono}>{pendingConnect.holderDid}</code>.
+          Your wallet&apos;s long-term identity is now <code style={mono}>{pendingConnect.holderDid}</code>
+          <DidQrButton value={pendingConnect.holderDid} />.
         </small>
         <small style={{ color: "var(--w-muted)" }}>
           It&apos;s currently stored on this device <strong>without encryption</strong>. Anyone with
@@ -555,7 +538,7 @@ export function OnboardView({
         )}
         <div style={{ textAlign: "center", marginTop: 4 }}>
           <button
-            onClick={() => finalizeConnection(pendingConnect)}
+            onClick={dismissPrompt}
             disabled={encryptBusy}
             style={{
               background: "transparent",
@@ -593,7 +576,14 @@ export function OnboardView({
             </>
           )}
         </small>
-        {adminScope === "unrestricted" && (
+        {grantsPersonaHolder(adminScope, personaHolder) && (
+          <small>
+            It also grants <strong>your own identity</strong> — the attributes and faces
+            above every context (<code style={mono}>persona-holder</code>). No role includes
+            it, so the command names it.
+          </small>
+        )}
+        {needsSuperAdminOperator(adminScope, personaHolder) && (
           <small style={{ color: c.muted }}>
             You&apos;ll need to be running this as someone who already has the whole agent —
             an admin scoped to one context can&apos;t hand out more than they hold.
@@ -878,7 +868,10 @@ export function OnboardView({
           <span style={{ fontSize: t.xs, color: c.muted }}>
             That DID&apos;s own record claims this name. Connecting to:
           </span>
-          <code style={{ ...mono, fontSize: t.xs }}>{resolvedFrom.did}</code>
+          <span>
+            <code style={{ ...mono, fontSize: t.xs }}>{resolvedFrom.did}</code>
+            <DidQrButton value={resolvedFrom.did} />
+          </span>
         </div>
       )}
 
@@ -927,6 +920,24 @@ export function OnboardView({
         {/* Asked here only for the scope whose grant command carries it.
             The other half asks after the grant, from the agent's real list —
             see the header comment on why the order differs. */}
+        {adminScope === "context" && (
+          <label style={{ fontSize: t.sm, display: "flex", gap: 8, alignItems: "flex-start", marginTop: 4 }}>
+            <input
+              type="checkbox"
+              checked={personaHolder}
+              onChange={(e) => setPersonaHolder(e.target.checked)}
+              style={{ width: "auto", padding: 0, marginTop: 3 }}
+            />
+            <span>
+              Also manage your own identity
+              <span style={{ color: c.muted }}>
+                {" "}— your attributes and faces, which sit above every context. Only someone who
+                has the whole agent can grant this.
+              </span>
+            </span>
+          </label>
+        )}
+
         {contextNeededBeforeGrant ? (
           <label style={{ display: "grid", gap: 5, marginTop: 4 }}>
             <span style={{ fontSize: t.sm, fontWeight: 600 }}>Which context?</span>

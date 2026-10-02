@@ -43,6 +43,7 @@ const MODE_AUTH = 0x02;
 const NSECRET = 32; // DHKEM(X25519) shared secret
 const NK = 32; // ChaCha20Poly1305 key
 const NN = 12; // ChaCha20Poly1305 nonce
+const NX25519 = 32; // X25519 public key, and its DH output
 
 const HPKE_V1 = new TextEncoder().encode("HPKE-v1");
 const EMPTY = new Uint8Array(0);
@@ -113,6 +114,27 @@ function dh(sk: Uint8Array, pk: Uint8Array): Uint8Array {
 // breaks both confidentiality and integrity. Never pass it in production; the
 // public `hpke.ts` wrappers deliberately do not forward it.
 type UnsafeFixedEphemeral = { __unsafeFixedEphemeralSk?: Uint8Array };
+
+/**
+ * §7.1.3 DeriveKeyPair for DHKEM(X25519, HKDF-SHA256): `ikm` → `(skE, pkE)`.
+ *
+ * Exported for test-vector verification only. RFC 9180 and TSP Appendix A
+ * publish the ephemeral as `ikmE`, the input to this function, so a vector's
+ * `enc` can only be reproduced by running it. X25519 needs no rejection
+ * sampling: every 32-byte string is a valid scalar (clamped at use).
+ *
+ * Nothing on a production path calls this. A random ephemeral is drawn from
+ * `x25519.utils.randomSecretKey()` directly, and deriving one from caller
+ * input is exactly the reuse the `__unsafe…` hooks warn about.
+ */
+export function deriveKeyPair(ikm: Uint8Array): { sk: Uint8Array; pk: Uint8Array } {
+  if (ikm.length < NX25519) {
+    throw new Error(`tsp: DeriveKeyPair input must be at least ${NX25519} bytes`);
+  }
+  const dkpPrk = labeledExtract(KEM_SUITE_ID, EMPTY, "dkp_prk", ikm);
+  const sk = labeledExpand(KEM_SUITE_ID, dkpPrk, "sk", EMPTY, NX25519);
+  return { sk, pk: x25519.getPublicKey(sk) };
+}
 
 /** §4.1 Encap (base mode). Exported for test-vector verification. */
 export function encap(recipientPk: Uint8Array, unsafe?: UnsafeFixedEphemeral): {
@@ -206,5 +228,134 @@ export async function openBase(
 ): Promise<Uint8Array> {
   const sharedSecret = decap(enc, recipientSk);
   const { key, baseNonce } = keySchedule(MODE_BASE, sharedSecret, info);
+  return chacha20poly1305(key, baseNonce, aad).decrypt(ciphertext);
+}
+
+/**
+ * A capability that can compute the raw X25519 Diffie-Hellman shared secret
+ * with a peer's public key, without ever exposing the private key itself —
+ * e.g. non-exporting software custody (an Askar-backed KMS) whose only DH
+ * primitive is "give me the shared secret", never "give me the key". Note
+ * this is NOT an enclave/HSM claim: Secure Enclave, StrongBox, and mainstream
+ * cloud KMS ECDH (AWS `DeriveSharedSecret`, GCP raw ECDH) are NIST-curve-only
+ * and cannot perform X25519 ECDH, so none of them can satisfy this interface
+ * on the KEM this suite pins.
+ * `publicKey` is the identity's own public key; `agree` returns the RAW ECDH
+ * output, no KDF applied — this is exactly the static-key half of AuthEncap/
+ * AuthDecap's DH, nothing more.
+ *
+ * Both members are validated on every call — see `checkedAgree`.
+ */
+export interface KeyAgreement {
+  publicKey: Uint8Array;
+  agree(peerPublicKey: Uint8Array): Promise<Uint8Array>;
+}
+
+// A `KeyAgreement` is foreign code, so its two outputs get the validation
+// noble gives a raw key. Two distinct reasons, and the first is the sharp one:
+//
+// §4.1 makes the all-zero abort MANDATORY for X25519, and on the raw path
+// `dh()` is the only place it happens. A backend whose DH is opaque — Askar, a
+// `crypto_scalarmult`-style primitive, a KMS's raw ECDH — has no reason to
+// reject a low-order peer key on our behalf, so taking its output unchecked
+// moves the whole guarantee into the backend. That matters because `enc` is
+// attacker-chosen and `senderPk` comes from the peer's own DID document: with
+// both DH terms of AuthDecap derived from low-order points, `shared_secret`
+// becomes a constant the attacker can compute, and HPKE-Auth's sender
+// authentication — TSP's only sender proof for the ciphertext — is forgeable.
+//
+// The lengths are the quieter half: a backend handing back a DER- or
+// multibase-wrapped secret, or a `publicKey` that is the identity's Ed25519
+// key rather than its X25519 one, otherwise produces well-formed ciphertext
+// that no recipient can open, failing at the AEAD tag with nothing pointing
+// back at the adapter.
+async function checkedAgree(ka: KeyAgreement, peerPublicKey: Uint8Array): Promise<Uint8Array> {
+  const shared = await ka.agree(peerPublicKey);
+  if (shared.length !== NX25519) {
+    throw new Error(`tsp: KeyAgreement.agree returned ${shared.length} bytes, expected ${NX25519}`);
+  }
+  // Same message as `dh()`: the two paths must be indistinguishable here.
+  if (shared.every((b) => b === 0)) throw new Error("tsp: DH produced the all-zero shared secret");
+  return shared;
+}
+
+/** The capability's own public key, which goes into `kem_context` verbatim. */
+function checkedPublicKey(ka: KeyAgreement): Uint8Array {
+  if (ka.publicKey.length !== NX25519) {
+    throw new Error(`tsp: KeyAgreement.publicKey is ${ka.publicKey.length} bytes, expected ${NX25519}`);
+  }
+  return ka.publicKey;
+}
+
+/**
+ * `authEncap`, ported to a `KeyAgreement` capability instead of a raw private
+ * key. The ephemeral half of the DH is still minted here directly (never
+ * custody-sensitive — freshly generated per call, discarded after); only the
+ * static-key half goes through `senderKeyAgreement.agree(...)`. Identical
+ * output to `authEncap(recipientPk, senderSk)` when `senderKeyAgreement`
+ * wraps `senderSk` directly.
+ */
+export async function authEncapWithKeyAgreement(
+  recipientPk: Uint8Array,
+  senderKeyAgreement: KeyAgreement,
+  unsafe?: UnsafeFixedEphemeral,
+): Promise<{ sharedSecret: Uint8Array; enc: Uint8Array }> {
+  const senderPk = checkedPublicKey(senderKeyAgreement);
+  const skE = unsafe?.__unsafeFixedEphemeralSk ?? x25519.utils.randomSecretKey();
+  const enc = x25519.getPublicKey(skE);
+  const staticDh = await checkedAgree(senderKeyAgreement, recipientPk);
+  const dhBytes = cat(dh(skE, recipientPk), staticDh);
+  const kemContext = cat(enc, recipientPk, senderPk);
+  return { sharedSecret: extractAndExpand(dhBytes, kemContext), enc };
+}
+
+/**
+ * `authDecap`, ported to a `KeyAgreement` capability. Both DH terms are the
+ * recipient's static key against a different peer public key each time, so
+ * both go through the capability — there is no non-custodial half here.
+ */
+export async function authDecapWithKeyAgreement(
+  enc: Uint8Array,
+  recipientKeyAgreement: KeyAgreement,
+  senderPk: Uint8Array,
+): Promise<Uint8Array> {
+  const recipientPk = checkedPublicKey(recipientKeyAgreement);
+  // Both terms are the same static key against a different peer key, so the
+  // two calls are independent. Awaiting them in sequence doubles decap latency
+  // against exactly the network- or IPC-backed custody this interface exists
+  // for, for no ordering the KEM cares about.
+  const [dhWithEnc, dhWithSender] = await Promise.all([
+    checkedAgree(recipientKeyAgreement, enc),
+    checkedAgree(recipientKeyAgreement, senderPk),
+  ]);
+  const kemContext = cat(enc, recipientPk, senderPk);
+  return extractAndExpand(cat(dhWithEnc, dhWithSender), kemContext);
+}
+
+/** `seal`, ported — same contract as `seal`, minus the raw sender key. */
+export async function sealWithKeyAgreement(
+  plaintext: Uint8Array,
+  aad: Uint8Array,
+  senderKeyAgreement: KeyAgreement,
+  recipientPk: Uint8Array,
+  info: Uint8Array,
+  unsafe?: UnsafeFixedEphemeral,
+): Promise<SealResult> {
+  const { sharedSecret, enc } = await authEncapWithKeyAgreement(recipientPk, senderKeyAgreement, unsafe);
+  const { key, baseNonce } = keySchedule(MODE_AUTH, sharedSecret, info);
+  return { enc, ciphertext: chacha20poly1305(key, baseNonce, aad).encrypt(plaintext) };
+}
+
+/** `open`, ported. */
+export async function openWithKeyAgreement(
+  ciphertext: Uint8Array,
+  aad: Uint8Array,
+  enc: Uint8Array,
+  recipientKeyAgreement: KeyAgreement,
+  senderPk: Uint8Array,
+  info: Uint8Array,
+): Promise<Uint8Array> {
+  const sharedSecret = await authDecapWithKeyAgreement(enc, recipientKeyAgreement, senderPk);
+  const { key, baseNonce } = keySchedule(MODE_AUTH, sharedSecret, info);
   return chacha20poly1305(key, baseNonce, aad).decrypt(ciphertext);
 }

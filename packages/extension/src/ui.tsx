@@ -5,10 +5,11 @@
 // rendering, which is how the extension ended up with two visual identities
 // and ~20 ad-hoc hex literals.
 
-import type { CSSProperties, ReactNode } from "react";
+import { createContext, useContext, useEffect, useLayoutEffect, useRef, useState, type CSSProperties, type MouseEvent, type ReactNode } from "react";
 import { splitDid, didHost, type DidPart } from "./did-display.js";
 import { displayAgentName, type AgentName } from "./agent-name.js";
 import { c, t, font, button, pill, type ButtonKind, type PillTone } from "./theme.js";
+import { DidQrButton } from "./did-qr-view.js";
 
 const ROLE_STYLE: Record<DidPart["role"], CSSProperties> = {
   // The method prefix is identical on every DID the user will ever see, so it
@@ -26,21 +27,74 @@ const ROLE_STYLE: Record<DidPart["role"], CSSProperties> = {
  * `verified` tints the host with the semantic "verified" colour, for use only
  * where resolution actually succeeded — it is a claim about cryptographic
  * state, not decoration.
+ *
+ * Every DID carries a QR button after it (`did-qr-view.tsx`), so a phone can
+ * scan any identifier this extension shows. `qr={false}` drops it — only for a
+ * DID that sits inside another control, where a nested button is invalid.
  */
 export function Did({
   value,
   verified = false,
   size = t.sm,
+  href,
+  title,
+  qr = true,
 }: {
   value: string;
   verified?: boolean;
   size?: string;
+  /** Make the DID a link — the console points it at the DID's mail. A click
+   *  does not also reach a row or card it sits in. */
+  href?: string;
+  title?: string;
+  /** Show the QR button. Off only inside a `<button>` or `<label>`. */
+  qr?: boolean;
+}) {
+  const did = <DidText value={value} verified={verified} size={size} href={href} title={title} />;
+  if (!qr) return did;
+  // One wrapper, so a flex or grid parent still sees a single item — the
+  // button trails the DID's last line rather than becoming a column of its own.
+  return (
+    <span style={{ minWidth: 0 }}>
+      {did}
+      <DidQrButton value={value} />
+    </span>
+  );
+}
+
+function DidText({
+  value,
+  verified,
+  size,
+  href,
+  title,
+}: {
+  value: string;
+  verified: boolean;
+  size: string;
+  href: string | undefined;
+  title: string | undefined;
 }) {
   const parts = splitDid(value);
   const host = didHost(value);
+  const Tag = href ? "a" : "span";
   return (
-    <span
-      style={{ fontFamily: font.mono, fontSize: size, wordBreak: "break-all", lineHeight: 1.45 }}
+    <Tag
+      {...(href
+        ? {
+            href,
+            title: title ?? undefined,
+            onClick: (e: MouseEvent<HTMLAnchorElement>) => e.stopPropagation(),
+            className: "did-link",
+          }
+        : {})}
+      style={{
+        fontFamily: font.mono,
+        fontSize: size,
+        wordBreak: "break-all",
+        lineHeight: 1.45,
+        ...(href ? { color: "inherit", textDecoration: "none", borderBottom: `1px dotted ${c.faint}` } : {}),
+      }}
       // Screen readers get the same emphasis the visual treatment gives:
       // lead with the host rather than reading fifty opaque characters first.
       aria-label={host ? `DID at ${host}: ${value}` : value}
@@ -57,7 +111,7 @@ export function Did({
           {p.text}
         </span>
       ))}
-    </span>
+    </Tag>
   );
 }
 
@@ -122,7 +176,7 @@ export function Button({
   style,
 }: {
   kind?: ButtonKind;
-  onClick?: () => void;
+  onClick?: ((e: MouseEvent<HTMLButtonElement>) => void) | undefined;
   disabled?: boolean;
   title?: string;
   children: ReactNode;
@@ -143,6 +197,92 @@ export function Button({
 /** A bordered panel with an optional heading and explanatory line. The
  *  description slot is not optional decoration — every setting in this wallet
  *  has a consequence, and the panel makes room for saying what it is. */
+/**
+ * Whether the surrounding surface has already drawn a card.
+ *
+ * A `Panel` inside a popover would paint a second bordered, padded box inside
+ * one that already has a border and padding — a frame around a frame, 16px in
+ * from an edge that is itself 15px in. Rather than thread a `bare` prop through
+ * every editor that renders a Panel (four of them, none of which knows or
+ * should know where it is being shown), the surface that owns the chrome says
+ * so once, here.
+ *
+ * Deliberately a boolean about *chrome*, not about "popover": a future
+ * side-drawer or inline expansion has the same problem and the same answer.
+ */
+export const ChromeProvided = createContext(false);
+
+/**
+ * A panel's explanation, clamped to its opening claim.
+ *
+ * The writing on these panes is unusually good and unusually long — two or
+ * three sentences before anything actionable, on every pane, every visit. That
+ * is load-bearing on the first read and furniture on the hundredth, and the
+ * hundredth is the common case for a console.
+ *
+ * So the **first two lines stay** — which is where the claim is; the sentences
+ * that follow are the elaboration — and the rest is one click away. Clamped by
+ * line count rather than by sentence: splitting prose on full stops breaks on
+ * `did:webvh:…`, on `0.3`, and on every abbreviation, and a paragraph cut in
+ * the wrong place reads as a rendering fault.
+ *
+ * Deliberately not remembered. A disclosure that stays open is a preference
+ * worth storing; this one costs a click and reopening it is how someone
+ * re-reads a sentence they half remember.
+ */
+function Explanation({ children }: { children: ReactNode }) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLParagraphElement | null>(null);
+  const [clamped, setClamped] = useState(false);
+
+  // Whether there is anything hidden at all. Measured rather than guessed from
+  // character count: the same string is two lines in one column width and four
+  // in another, and a "more" button that reveals nothing is worse than no
+  // button.
+  useLayoutEffect(() => {
+    const el = ref.current;
+    if (el) setClamped(el.scrollHeight > el.clientHeight + 1);
+  }, [children]);
+
+  return (
+    <div style={{ display: "grid", gap: 2 }}>
+      <p
+        ref={ref}
+        style={{
+          margin: 0,
+          fontSize: t.sm,
+          color: c.muted,
+          lineHeight: 1.55,
+          maxWidth: "82ch",
+          ...(open
+            ? {}
+            : { display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical", overflow: "hidden" }),
+        }}
+      >
+        {children}
+      </p>
+      {(clamped || open) && (
+        <button
+          onClick={() => setOpen((v) => !v)}
+          aria-expanded={open}
+          style={{
+            justifySelf: "start",
+            border: "none",
+            background: "transparent",
+            color: c.accent,
+            fontSize: t.xs,
+            fontWeight: 600,
+            cursor: "pointer",
+            padding: "1px 0",
+          }}
+        >
+          {open ? "Less" : "Why this matters"}
+        </button>
+      )}
+    </div>
+  );
+}
+
 export function Panel({
   title,
   description,
@@ -152,6 +292,16 @@ export function Panel({
   description?: ReactNode;
   children?: ReactNode;
 }) {
+  const bare = useContext(ChromeProvided);
+  if (bare) {
+    return (
+      <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr)", gap: 10 }}>
+        {title && <h2 style={{ margin: 0, fontSize: t.md, fontWeight: 640, paddingRight: 26 }}>{title}</h2>}
+        {description && <Explanation>{description}</Explanation>}
+        {children}
+      </div>
+    );
+  }
   return (
     <section
       style={{
@@ -164,11 +314,7 @@ export function Panel({
       }}
     >
       {title && <h2 style={{ margin: 0, fontSize: t.md, fontWeight: 640 }}>{title}</h2>}
-      {description && (
-        <p style={{ margin: 0, fontSize: t.sm, color: c.muted, lineHeight: 1.55, maxWidth: "82ch" }}>
-          {description}
-        </p>
-      )}
+      {description && <Explanation>{description}</Explanation>}
       {children}
     </section>
   );
@@ -208,5 +354,56 @@ export function Note({ tone = "warn", children }: { tone?: NoteTone; children: R
 export function Empty({ children }: { children: ReactNode }) {
   return (
     <div style={{ fontSize: t.sm, color: c.faint, padding: "10px 0" }}>{children}</div>
+  );
+}
+
+/**
+ * Copy a value to the clipboard, and say whether it worked.
+ *
+ * **The refusal is the reason this is a component.** `navigator.clipboard`
+ * rejects — a document without focus, a browser that has not granted the
+ * permission — and the six places that had grown their own copy button each had
+ * to remember that. A button that flips to "Copied" on a promise nobody awaited
+ * tells the operator their DID is on the clipboard when it is not, and they find
+ * out by pasting something else.
+ *
+ * Two seconds, then back: long enough to read, short enough that a second copy
+ * of a *different* value is not mistaken for the first one still showing.
+ */
+export function CopyButton({
+  value,
+  label = "Copy",
+  kind = "quiet",
+  title,
+}: {
+  value: string;
+  label?: string;
+  kind?: ButtonKind;
+  /** Which value this copies, for the accessible name. A row of identical
+   *  "Copy" buttons is unusable with a screen reader without it. */
+  title?: string;
+}) {
+  const [state, setState] = useState<"idle" | "done" | "refused">("idle");
+  const timer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+
+  useEffect(() => () => clearTimeout(timer.current), []);
+
+  const copy = () => {
+    clearTimeout(timer.current);
+    navigator.clipboard.writeText(value).then(
+      () => setState("done"),
+      () => setState("refused"),
+    );
+    timer.current = setTimeout(() => setState("idle"), 2000);
+  };
+
+  return (
+    <Button
+      kind={kind}
+      onClick={copy}
+      {...(title ? { title: state === "refused" ? `${title} — the browser refused clipboard access` : title } : {})}
+    >
+      {state === "done" ? "Copied" : state === "refused" ? "Refused" : label}
+    </Button>
   );
 }

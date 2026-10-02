@@ -34,6 +34,12 @@ import {
   type Response as DidsListResponse,
 } from "@openvtc/trust-tasks/vta/webvh/dids/list/1.0/payload";
 import {
+  TYPE_URI as DIDS_REALIGN_KEYS,
+  RESPONSE_TYPE_URI as DIDS_REALIGN_KEYS_RESPONSE,
+  type Payload as DidsRealignKeysPayload,
+  type Response as DidsRealignKeysResponse,
+} from "@openvtc/trust-tasks/vta/webvh/dids/realign-keys/1.0/payload";
+import {
   TYPE_URI as DIDS_UPDATE,
   RESPONSE_TYPE_URI as DIDS_UPDATE_RESPONSE,
   type Payload as DidsUpdatePayload,
@@ -95,10 +101,103 @@ export interface WebvhDidCreateParams extends WebvhCall {
   serverId?: string;
   /** Where the log will be served, for the serverless case. */
   url?: string;
-  /** How the path under the host is chosen. */
+  /**
+   * How the path under the host is chosen. Absent means `autoAssign` — the
+   * hosting server allocates one.
+   *
+   * The specification also accepts a bare `path` as shorthand for
+   * `{ mode: "explicit", path }`, and **sending both is an error**. Only the
+   * structured member is exposed here, so there is one way to say it and no
+   * way to say it twice.
+   */
   pathMode?: WebvhPathMode;
+  /** Hosting domain to publish under, where the server serves more than one. */
+  domain?: string;
+  /** A human-readable label for the agent's own record. Not published — it
+   *  does not reach the DID document or the log. */
+  label?: string;
   /** Allow the DID to move location later. Cannot be added afterwards. */
   portable?: boolean;
+  /**
+   * Whether this DID becomes its context's own identity (`ctx.did`).
+   *
+   * **Absent is not "no".** The agent defaults it to `true` and overwrites
+   * whatever the context acted as before, so a caller that says nothing replaces
+   * the context's identity with every DID it mints. That matters wherever
+   * something serves *as* its context's DID — a room-host fetches that DID's
+   * keys at startup — so a DID minted beside another one must say `false`.
+   */
+  setPrimary?: boolean;
+  /**
+   * Publish a `DIDCommMessaging` entry naming the agent's own mediator.
+   *
+   * The mediator is the agent's, not the caller's to choose: this says *whether*
+   * the DID advertises one, and the agent fills in which. A DID with no such
+   * entry is reachable only by whoever already knows how to reach it.
+   */
+  addMediatorService?: boolean;
+  /**
+   * Publish a `TSPTransport` entry at the mediator the document names for
+   * DIDComm, beside that entry.
+   *
+   * Opt-in at the agent, and a claim about the DID's holder: a DID advertising
+   * a transport nothing behind it decodes is one clients will choose and cannot
+   * use.
+   */
+  addTspService?: boolean;
+  /**
+   * Further service entries, written into the document verbatim.
+   *
+   * **The agent does not compose these and does not check them.** Whatever is
+   * here is published as-is and is then part of a log entry, which is append-only
+   * — a malformed entry is corrected by a further update rather than removed. A
+   * caller building these from a form validates before it sends.
+   */
+  additionalServices?: Record<string, unknown>[];
+  /**
+   * How many successor keys to commit in advance.
+   *
+   * **`0` disables pre-rotation**, and disabling it is not merely a smaller
+   * commitment: with no successor committed, a thief holding the current key can
+   * rotate to their own as convincingly as the owner can, so a compromise cannot
+   * be recovered from. Absent leaves the agent's default, which is the answer a
+   * caller with no reason to differ should give.
+   */
+  preRotationCount?: number;
+  /** An existing key to sign log entries with. Absent mints a fresh one. */
+  signingKeyId?: string;
+  /** An existing key-agreement key to publish. Absent mints a fresh one. */
+  kaKeyId?: string;
+  /**
+   * Render the document from a stored or built-in DID template.
+   *
+   * The reason a caller reaches for this rather than composing a document: a
+   * template already encodes the method, the service endpoints and the key
+   * shapes for a *kind* of thing, so "mint a room" is a template name instead
+   * of a document a surface has to get right. `room` is the built-in for a
+   * data room's own identity.
+   */
+  template?: string;
+  /**
+   * Context whose templates to resolve `template` against.
+   *
+   * Absent means the global scope, which is a **different namespace** — it may
+   * hold a different template under the same name.
+   */
+  templateContext?: string;
+  /**
+   * Values for the template's placeholders.
+   *
+   * The agent injects the ambient ones itself (`DID`, `SIGNING_KEY_MB`,
+   * `KA_KEY_MB`, `VTA_DID`, `VTA_URL`, `CONTEXT_ID`, `CONTEXT_DID`, `NOW`), so
+   * these are the template's own. **Every one of its `requiredVars` must be
+   * here or the render fails**, including any the document never substitutes:
+   * `room` requires `WEBVH_SERVER` and nothing in its document reads it, so a
+   * caller publishing through a server passes the id twice — once as
+   * `serverId`, which is what actually decides hosting, and once here, which
+   * only satisfies the check.
+   */
+  templateVars?: Record<string, string>;
 }
 
 /**
@@ -121,6 +220,26 @@ export async function webvhDidCreate(
     ...(rest.url ? { url: rest.url } : {}),
     ...(rest.pathMode ? { pathMode: rest.pathMode } : {}),
     ...(rest.portable !== undefined ? { portable: rest.portable } : {}),
+    // `!== undefined` for the same reason as `portable`: `false` is the caller
+    // keeping the context's identity, and dropping it lets the agent's `true`
+    // default replace it.
+    ...(rest.setPrimary !== undefined ? { setPrimary: rest.setPrimary } : {}),
+    ...(rest.domain ? { domain: rest.domain } : {}),
+    ...(rest.label ? { label: rest.label } : {}),
+    ...(rest.addMediatorService !== undefined
+      ? { addMediatorService: rest.addMediatorService }
+      : {}),
+    ...(rest.addTspService !== undefined ? { addTspService: rest.addTspService } : {}),
+    ...(rest.additionalServices?.length ? { additionalServices: rest.additionalServices } : {}),
+    // `!== undefined` rather than truthy: `0` is the caller switching
+    // pre-rotation off, and a truthy test would drop it and silently leave the
+    // agent's default on.
+    ...(rest.preRotationCount !== undefined ? { preRotationCount: rest.preRotationCount } : {}),
+    ...(rest.signingKeyId ? { signingKeyId: rest.signingKeyId } : {}),
+    ...(rest.kaKeyId ? { kaKeyId: rest.kaKeyId } : {}),
+    ...(rest.template ? { template: rest.template } : {}),
+    ...(rest.templateContext ? { templateContext: rest.templateContext } : {}),
+    ...(rest.templateVars ? { templateVars: rest.templateVars } : {}),
   };
   return send(sender, { holder, service }, DIDS_CREATE, DIDS_CREATE_RESPONSE,
     "vta/webvh/dids/create/1.0", payload);
@@ -216,4 +335,33 @@ export async function webvhDidRegisterWithServer(
   return send(sender, { holder, service }, DIDS_REGISTER_WITH_SERVER,
     DIDS_REGISTER_WITH_SERVER_RESPONSE,
     "vta/webvh/dids/register-with-server/1.0", payload);
+}
+
+/**
+ * Rename a DID's key records onto the verification-method ids its published
+ * document declares.
+ *
+ * **The repair for records the agent named without reading its own document.**
+ * A key record's id is a verification-method id — it is what a mediator matches
+ * an inbound JWE recipient against, and what anyone reading the document would
+ * hand to a signing task. Where the two disagree, the agent holds a key the
+ * document addresses under a name the agent does not answer to.
+ *
+ * `keys/rename` cannot fix that and is not meant to: its identifier gate refuses
+ * `:` and `#` so that a rename is not a way to write verification-method-shaped
+ * names into a key store. So this call names nothing — `did` and `dryRun` are
+ * the whole payload, and the agent derives every target from that DID's own
+ * published log, matching records to methods by public key.
+ *
+ * **Send it once with `dryRun` before sending it without.** The response is the
+ * same shape either way and says which it is, so a caller can show the plan and
+ * then apply exactly what was shown.
+ */
+export async function webvhDidRealignKeys(
+  sender: TrustTaskSender,
+  params: WebvhCall & DidsRealignKeysPayload,
+): Promise<DidsRealignKeysResponse> {
+  const { holder, service, ...payload } = params;
+  return send(sender, { holder, service }, DIDS_REALIGN_KEYS, DIDS_REALIGN_KEYS_RESPONSE,
+    "vta/webvh/dids/realign-keys/1.0", payload);
 }

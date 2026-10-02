@@ -38,6 +38,11 @@ const CANONICAL = new Map(SURFACE.tasks.map((t) => [t.uri, t]));
  * boundary list: every entry is justified, and the test fails when one stops
  * being needed, so it can only shrink.
  */
+const MEDIATOR_SERVED =
+  "Mediator-served: addressed to the mediator's own DID and answered by " +
+  "affinidi-messaging-mediator about itself (trust_tasks.rs served_tasks!). The VTA " +
+  "is not the counterparty.";
+
 const NOT_IN_SDK = [
   {
     prefix: "https://trusttasks.org/spec/trust-task-error/",
@@ -58,10 +63,81 @@ const NOT_IN_SDK = [
       "in did-hosting, so vta-sdk carries the approve-*response* half only.",
   },
   {
+    prefix: "https://trusttasks.org/spec/auth/step-up/start/",
+    why:
+      "Served by the did-hosting control plane, the relying party a session is stepped " +
+      "up at (rp-login/step-up.ts). The VTA is not the counterparty.",
+  },
+  {
+    prefix: "https://trusttasks.org/spec/auth/step-up/approve-response/0.5",
+    why:
+      "The version the did-hosting control plane serves (rp-login/step-up.ts). The agent " +
+      "takes 0.3, which vta-sdk carries and the persona path sends.",
+  },
+  {
+    prefix: "https://trusttasks.org/spec/auth/authenticate/0.2",
+    why:
+      "The version the did-hosting control plane serves for `login()`, where the " +
+      "wallet binds a session key (rp-login/trust-task.ts). The relying party is " +
+      "the counterparty, not the VTA.",
+  },
+  {
     prefix: "https://trusttasks.org/spec/task-consent/granted/",
     why:
       "Inbound notification from the agent once an approver decided. Not a request this " +
       "library can send, so it has no client constant.",
+  },
+  // The rooms family is split across two recipients on purpose, and this list is
+  // where that split becomes visible. `rooms/keys/*` and `rooms/owner/*`
+  // terminate at a VTA — the member's own key holder, or the owner's — so they
+  // are vta-sdk constants and are checked above. The five below are served by
+  // the room's HOST, which holds ciphertext it cannot read and never holds a
+  // key. A host is not a VTA, so no vta-sdk constant should exist for them, and
+  // one appearing here would mean the boundary had moved.
+  {
+    prefix: "https://trusttasks.org/spec/rooms/create/",
+    why:
+      "Host-served: mints the room at whoever is hosting it (vti-rooms::wire, " +
+      "served by vtc-service/src/rooms). The VTA is not the counterparty.",
+  },
+  {
+    prefix: "https://trusttasks.org/spec/rooms/records/",
+    why:
+      "Host-served: list/get/put move sealed bytes to and from the host. Sealing " +
+      "and opening happen at the member's VTA under `rooms/keys/*`, which is the " +
+      "half that does have SDK constants.",
+  },
+  {
+    prefix: "https://trusttasks.org/spec/rooms/epoch/",
+    why:
+      "Host-served: the host records that an epoch advanced and serves the key " +
+      "chain. It never learns a key — the rung it carries is sealed under the " +
+      "incoming epoch, which only members hold.",
+  },
+  // The mediator's own operations surface (`@openvtc/pnm-core/mediator`). These
+  // are addressed to the MEDIATOR's DID and served by affinidi-messaging-mediator
+  // about itself — its statistics, its accounts' queues and messages, its
+  // traffic monitor. A VTA serves none of them, so a vta-sdk constant for one
+  // would mean the recipient had moved.
+  {
+    prefix: "https://trusttasks.org/spec/messaging/stats/",
+    why: MEDIATOR_SERVED,
+  },
+  {
+    prefix: "https://trusttasks.org/spec/messaging/queue/",
+    why: MEDIATOR_SERVED,
+  },
+  {
+    prefix: "https://trusttasks.org/spec/messaging/message/",
+    why: MEDIATOR_SERVED,
+  },
+  {
+    prefix: "https://trusttasks.org/spec/messaging/monitor/",
+    why: MEDIATOR_SERVED,
+  },
+  {
+    prefix: "https://trusttasks.org/spec/messaging/account/",
+    why: MEDIATOR_SERVED,
   },
 ];
 
@@ -279,7 +355,74 @@ test("coverage against the agent's surface is recorded, not discovered", () => {
   // the agent does not name, rather than as a deprecation warning. That is the
   // expected shape of a cutover here: nothing is deployed, so neither side
   // keeps an old version alive.
-  const expected = 187;
+  // 188 -> 194 is the rooms family, and the canonical total moved 208 -> 214
+  // with it (six new SDK constants: `rooms/keys/{list,seal,chain}` and
+  // `rooms/owner/{invite,issue-membership,issue-authority}`, implemented at
+  // OpenVTC/verifiable-trust-infrastructure#1320 and #1329). The six this
+  // library gained are those minus `keys/chain`, plus `keys/open`, which was
+  // canonical and unimplemented until the rooms pane needed to read a record.
+  //
+  // 194 -> 196 closes that: `rooms/keys/chain` (the delivery that repairs a
+  // member reading only from where they joined) and `rooms/keys/present` (the
+  // presentation oracle). The canonical total does not move — both were already
+  // in the SDK and merely unimplemented here.
+  //
+  // **`present` was the load-bearing one, and its absence was not visible as a
+  // gap.** Every host-served room task takes an authority presentation, and
+  // nothing in this library could produce one — so `records/{list,get,put}` and
+  // `epoch/mint` were exported, typechecked, and impossible to call. A count
+  // does not catch that; the missing family was in a *different* half of the
+  // surface from the ones it made unreachable.
+  //
+  // The three remaining `rooms/keys/*` — commit, key-package, welcome — are MLS
+  // group operations a browser does not perform. They belong to whatever holds
+  // the group state, which is the VTA, not this library.
+  // 196 -> 198, and the canonical total 214 -> 216, are the two tasks that let a
+  // surface reach a room's host without being able to address one:
+  // `rooms/keys/backfill` and `rooms/owner/register`
+  // (trustoverip/dtgwg-trust-tasks-tf#402, implemented at
+  // OpenVTC/verifiable-trust-infrastructure#1332). Both terminate at the
+  // member's own agent, which is the whole point — the agent makes the host
+  // call, being the party with a channel to one.
+  //
+  // Their host-served counterparts stay in NOT_IN_SDK and stay uncallable from
+  // the console. That is not a gap left open: `rooms/create` and
+  // `rooms/epoch/chain` are what the agent sends onward, and a second copy of
+  // that call from here would be one that never arrives.
+  // 198 → 201: persona/facet/{put,list,delete}, the holder's arrangement of
+  // their own identity (dtgwg-trust-tasks-tf#405, VTI#1338).
+  // 201 → 204: rooms/keys/{read,browse} — the console reads a record through
+  // its own agent, because `rooms/records/*` is served by a host it cannot
+  // address (dtgwg-trust-tasks-tf#426). The third is `rooms/keys/present/0.2`
+  // and `rooms/owner/issue-authority/0.2` counting as new families beside the
+  // 0.1 this library had drifted behind.
+  //
+  // 204 → 205 is `vta/webvh/dids/realign-keys/1.0` — the repair for a DID whose
+  // key records are not named after the verification methods it publishes
+  // (dtgwg-trust-tasks-tf#456, VTI#1466 and #1470).
+  //
+  // **The canonical total jumps 227 → 235 in the same commit, and only one of
+  // those eight is this task.** The other seven were always in the SDK and
+  // invisible to the scanner: `vta-sdk` derives a growing number of constants
+  // from the generated payload type rather than writing the URI out, and
+  // `sync-task-surface.mjs` matched only literals until it was taught to
+  // resolve them. So this is not the agent growing seven families — it is a
+  // snapshot that had been under-counting the denominator, and with it the gap
+  // this number exists to keep reviewable.
+  //
+  // 205 → 206 is `persona/attribute/purge-version/1.0` — removing an earlier
+  // value the agent kept for a pinned face (dtgwg-trust-tasks-tf#538). The
+  // canonical total moves 235 → 240 with the snapshot resynced from vta-sdk
+  // 0.45.1; the other four are families the agent gained since, not this one.
+  //
+  // 206 → 212 is the face lifecycle: `persona/profile/compose/1.0` and
+  // `persona/attribute/promote/1.0` (dtgwg-trust-tasks-tf#569),
+  // `persona/profile/{retire,reinstate}/1.0` (#570) and
+  // `persona/profile/{usage,timeline}/1.0` (#577). The canonical total moves
+  // 240 → 246 with the snapshot resynced from vta-sdk 0.47.0 — exactly these
+  // six. The resync also taught the scanner that a constant taken from a
+  // generated `error_codes::NAME.code` is an error code, not a task.
+  const expected = 212;
   assert.equal(
     implemented.size,
     expected,

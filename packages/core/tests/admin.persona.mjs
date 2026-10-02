@@ -16,16 +16,27 @@ import {
   personaAttributeList,
   personaAttributePut,
   personaAttributeDelete,
+  personaAttributePurgeVersion,
+  personaAttributePromote,
+  personaProfileCompose,
+  personaProfileRetire,
+  personaProfileReinstate,
+  personaProfileUsage,
+  personaProfileTimeline,
   personaProfileList,
   personaProfileGet,
   personaProfilePut,
   personaProfileDelete,
   personaBindingSet,
+  personaFacetPut,
+  personaFacetList,
+  personaFacetDelete,
   personaCorrelationAnalyze,
   personaDisclosureHistory,
   personasBlockingDelete,
   PROFILE_DELETE_BOUND,
 } from "../dist/admin/index.js";
+import { listBindings } from "../dist/persona/index.js";
 
 const HOLDER = { did: "did:key:zHolder" };
 const SERVICE = { did: "did:webvh:QmAgent:agent.example" };
@@ -64,6 +75,53 @@ test("every task names its 1.0 URI, request and response", async () => {
       "persona/attribute/delete/1.0",
       { attributeId: "01J", existed: true },
     ],
+    [
+      personaAttributePurgeVersion,
+      { ...PARTIES, attributeId: "01J", versions: [3] },
+      "persona/attribute/purge-version/1.0",
+      { attributeId: "01J", purged: [3] },
+    ],
+    [
+      personaAttributePromote,
+      { ...PARTIES, contextId: "ctx", profileId: "01P", entries: [1], expectedVersion: 4 },
+      "persona/attribute/promote/1.0",
+      { profileId: "01P", version: 5, promoted: [{ entry: 1, attributeId: "01J", created: true }] },
+    ],
+    [
+      personaProfileCompose,
+      {
+        ...PARTIES,
+        contextId: "ctx",
+        name: "Co-op",
+        claims: [{ type: "name.display", valueType: "string", value: "Ada" }],
+      },
+      "persona/profile/compose/1.0",
+      { profileId: "01P", scope: "local", version: 3 },
+    ],
+    [
+      personaProfileRetire,
+      { ...PARTIES, profileId: "01P" },
+      "persona/profile/retire/1.0",
+      { profileId: "01P", version: 4, retiredAt: "2026-01-01T00:00:00Z" },
+    ],
+    [
+      personaProfileReinstate,
+      { ...PARTIES, profileId: "01P" },
+      "persona/profile/reinstate/1.0",
+      { profileId: "01P", version: 5 },
+    ],
+    [
+      personaProfileUsage,
+      { ...PARTIES, profileId: "01P" },
+      "persona/profile/usage/1.0",
+      { profileId: "01P", usage: [] },
+    ],
+    [
+      personaProfileTimeline,
+      { ...PARTIES, profileId: "01P" },
+      "persona/profile/timeline/1.0",
+      { profileId: "01P", events: [] },
+    ],
     [personaProfileList, { ...PARTIES }, "persona/profile/list/1.0", { profiles: [] }],
     [
       personaProfileGet,
@@ -88,6 +146,19 @@ test("every task names its 1.0 URI, request and response", async () => {
       { ...PARTIES, contextId: "demo", personaDid: "did:key:zP" },
       "persona/binding/set/1.0",
       { contextId: "demo", personaDid: "did:key:zP", version: 1, boundAt: "x" },
+    ],
+    [
+      personaFacetPut,
+      { ...PARTIES, name: "Work", colour: "teal" },
+      "persona/facet/put/1.0",
+      { facetId: "01F", version: 1, created: true, updatedAt: "x" },
+    ],
+    [personaFacetList, { ...PARTIES }, "persona/facet/list/1.0", { facets: [] }],
+    [
+      personaFacetDelete,
+      { ...PARTIES, facetId: "01F" },
+      "persona/facet/delete/1.0",
+      { existed: true, releasedFaces: 0 },
     ],
     [personaCorrelationAnalyze, { ...PARTIES }, "persona/correlation/analyze/1.0", { findings: [] }],
     [
@@ -224,6 +295,31 @@ test("profileId null unbinds; omitting it leaves the binding alone", async () =>
   assert.ok(!("profileId" in untouched.sent[0].envelope.payload));
 });
 
+test("a binding label is sent when given and absent when not", async () => {
+  // The context is given this name and never the holder's own name for the
+  // face. Absent is a real choice — "give the context no name" — so an
+  // undefined label must not arrive as an empty string or a null.
+  const reply = { contextId: "demo", personaDid: "did:key:zP", version: 2, boundAt: "x" };
+  const named = recorder(reply);
+  await personaBindingSet(named, {
+    ...PARTIES,
+    contextId: "demo",
+    personaDid: "did:key:zP",
+    profileId: "01P",
+    label: "Ada at the co-op",
+  });
+  assert.equal(named.sent[0].envelope.payload.label, "Ada at the co-op");
+
+  const unnamed = recorder(reply);
+  await personaBindingSet(unnamed, {
+    ...PARTIES,
+    contextId: "demo",
+    personaDid: "did:key:zP",
+    profileId: "01P",
+  });
+  assert.ok(!("label" in unnamed.sent[0].envelope.payload));
+});
+
 test("deleting a profile does not unbind unless asked", async () => {
   const bare = recorder({ profileId: "01P", existed: true });
   await personaProfileDelete(bare, { ...PARTIES, profileId: "01P" });
@@ -358,4 +454,266 @@ test("an empty list is a real answer and is not null", () => {
   // no blockers — a refusal that contradicts itself, which a pane should be
   // able to notice and say rather than have flattened into "we don't know".
   assert.deepEqual(personasBlockingDelete({ personaDids: [] }), []);
+});
+
+// ── The holder's own decisions travel, and absence is one of them ───────────
+//
+// `sensitivity` and `release` are OPTIONAL on the wire and their absence is
+// load-bearing: it records that the holder decided nothing, so every consumer
+// resolves from the claim-type registry. Sending a resolved value back would
+// freeze the attribute to today's table — a later tightening would protect
+// every new attribute and leave this one exposed — which is why these are
+// spread conditionally rather than always named.
+
+test("a decision the holder made is carried on the put", async () => {
+  const r = recorder({ attributeId: "01J", version: 2, created: false, updatedAt: "x" });
+  await personaAttributePut(r, {
+    ...PARTIES,
+    type: "profile.github",
+    valueType: "string",
+    value: "octocat",
+    provenance: { kind: "selfAsserted" },
+    sensitivity: "normal",
+    release: "stepUp",
+  });
+  const { payload } = r.sent[0].envelope;
+  assert.equal(payload.sensitivity, "normal");
+  assert.equal(payload.release, "stepUp");
+});
+
+test("a decision the holder did not make is absent, not resolved", async () => {
+  const r = recorder({ attributeId: "01J", version: 1, created: true, updatedAt: "x" });
+  await personaAttributePut(r, {
+    ...PARTIES,
+    type: "phone.mobile",
+    valueType: "string",
+    value: "+65 8262 2325",
+    provenance: { kind: "selfAsserted" },
+  });
+  const { payload } = r.sent[0].envelope;
+  assert.ok(!("sensitivity" in payload), "omitted means the registry answers");
+  assert.ok(!("release" in payload), "omitted means the registry answers");
+});
+
+test("a values listing can ask for the sensitive ones, and does not by default", async () => {
+  // The half of sensitivity that is not cosmetic: without this member the agent
+  // returns the metadata of every `sensitivity: high` attribute and the
+  // plaintext of none.
+  const r = recorder({ attributes: [] });
+  await personaAttributeList(r, { ...PARTIES, includeValues: true, includeSensitive: true });
+  assert.equal(r.sent[0].envelope.payload.includeSensitive, true);
+
+  const plain = recorder({ attributes: [] });
+  await personaAttributeList(plain, { ...PARTIES, includeValues: true });
+  assert.ok(!("includeSensitive" in plain.sent[0].envelope.payload));
+});
+
+// ── A listing is read to the end, not to the first page ────────────────────
+//
+// `*List` clients returned the first page and dropped `nextCursor`, which the
+// specification names as the mistake — "a producer MUST NOT infer exhaustion
+// from a short page" — and which nothing downstream could detect: a short array
+// is indistinguishable from a complete one. The console's identity map drew the
+// result as the whole truth.
+
+/** Answers with each reply in turn, recording what it was asked. */
+function pages(...replies) {
+  const sent = [];
+  return {
+    sent,
+    send(envelope) {
+      sent.push({ envelope });
+      return Promise.resolve(replies[sent.length - 1] ?? replies[replies.length - 1]);
+    },
+  };
+}
+
+const poolAttribute = (id) => ({
+  attributeId: id,
+  type: "name.legal",
+  valueType: "string",
+  provenance: { kind: "selfAsserted" },
+  version: 1,
+  updatedAt: "x",
+});
+
+test("the pool is read to the end, and the cursor goes back with the next request", async () => {
+  const r = pages(
+    { attributes: [poolAttribute("a1")], nextCursor: "c1" },
+    { attributes: [poolAttribute("a2")] },
+  );
+  const all = await personaAttributeList(r, { ...PARTIES });
+  assert.deepEqual(all.map((a) => a.attributeId), ["a1", "a2"]);
+  assert.equal(r.sent.length, 2);
+  assert.equal(r.sent[0].envelope.payload.cursor, undefined, "the first request invents no cursor");
+  assert.equal(r.sent[1].envelope.payload.cursor, "c1");
+});
+
+test("paging preserves the rest of the request, so a narrowed listing stays narrowed", async () => {
+  // The second page of a `typePrefix` query that forgot the prefix would return
+  // the whole pool — and `reveal-value.ts` matches by id, so it would quietly
+  // read every value the holder has to answer a question about one.
+  const r = pages(
+    { attributes: [poolAttribute("a1")], nextCursor: "c1" },
+    { attributes: [poolAttribute("a2")] },
+  );
+  await personaAttributeList(r, { ...PARTIES, typePrefix: "phone", includeValues: true, includeSensitive: true });
+  const second = r.sent[1].envelope.payload;
+  assert.equal(second.typePrefix, "phone");
+  assert.equal(second.includeValues, true);
+  assert.equal(second.includeSensitive, true);
+});
+
+test("faces are read to the end too", async () => {
+  const r = pages(
+    { profiles: [{ profileId: "p1", name: "One", entries: [], version: 1, updatedAt: "x" }], nextCursor: "c1" },
+    { profiles: [{ profileId: "p2", name: "Two", entries: [], version: 1, updatedAt: "x" }] },
+  );
+  const all = await personaProfileList(r, { ...PARTIES });
+  assert.deepEqual(all.map((p) => p.profileId), ["p1", "p2"]);
+});
+
+test("every persona in a context is read to the end, and no cursor comes back", async () => {
+  // The returned document carries no `nextCursor` because there is nothing left
+  // to fetch — the two console surfaces that ignored the member are correct by
+  // construction now rather than by luck.
+  const r = pages(
+    { personas: [{ personaDid: "did:key:zA", bound: true }], nextCursor: "c1" },
+    { personas: [{ personaDid: "did:key:zB", bound: false }] },
+  );
+  const res = await listBindings(r, { ...PARTIES, contextId: "openvtc" });
+  assert.deepEqual(res.personas.map((p) => p.personaDid), ["did:key:zA", "did:key:zB"]);
+  assert.equal(res.nextCursor, undefined);
+  assert.equal(r.sent[1].envelope.payload.contextId, "openvtc", "the context survives the second request");
+});
+
+// ── Facets ──────────────────────────────────────────────────────────────────
+
+test("a facet carries no contextId — it arranges records that have no compartment", async () => {
+  const channel = recorder({ facetId: "01F", version: 1, created: true, updatedAt: "x" });
+  await personaFacetPut(channel, { ...PARTIES, name: "Work", colour: "teal" });
+  assert.equal(channel.sent[0].envelope.body?.contextId, undefined);
+  assert.equal(channel.sent[0].envelope.payload?.contextId, undefined);
+});
+
+test("membership is sent only when the caller supplied it", async () => {
+  // Both lists are REPLACED by a put. Sending `[]` for a caller that passed
+  // nothing would empty a facet's membership on an edit that meant to rename
+  // it — the same replace hazard the attribute editor guards one record down.
+  const channel = recorder({ facetId: "01F", version: 1, created: true, updatedAt: "x" });
+  await personaFacetPut(channel, { ...PARTIES, name: "Work", colour: "teal" });
+  const payload = channel.sent[0].envelope.payload ?? channel.sent[0].envelope.body;
+  assert.equal(payload.faceIds, undefined, "an unsupplied membership was sent as empty");
+  assert.equal(payload.attributeIds, undefined);
+  assert.equal(payload.icon, undefined);
+});
+
+test("membership that WAS supplied is carried, including an explicit empty", async () => {
+  // The paired assertion: a suite that only checks omissions would pass for a
+  // client that never sent membership at all.
+  const channel = recorder({ facetId: "01F", version: 2, created: false, updatedAt: "x" });
+  await personaFacetPut(channel, {
+    ...PARTIES,
+    facetId: "01F",
+    name: "Work",
+    colour: "plum",
+    icon: "\u{1F4BC}",
+    faceIds: ["01P"],
+    attributeIds: [],
+    expectedVersion: 1,
+  });
+  const payload = channel.sent[0].envelope.payload ?? channel.sent[0].envelope.body;
+  assert.deepEqual(payload.faceIds, ["01P"]);
+  assert.deepEqual(payload.attributeIds, [], "an explicit empty list was dropped");
+  assert.equal(payload.colour, "plum");
+  assert.equal(payload.expectedVersion, 1);
+});
+
+test("a facet listing follows the cursor to the end", async () => {
+  // `limit` is the page size to ask for, never a cap. A client that stopped at
+  // the first page would draw a picture missing every facet past it, and a
+  // short array is indistinguishable from a complete one.
+  const pages = [
+    { facets: [{ facetId: "a" }], nextCursor: "c1" },
+    { facets: [{ facetId: "b" }], nextCursor: "c2" },
+    { facets: [{ facetId: "c" }] },
+  ];
+  let n = 0;
+  const channel = { send: () => Promise.resolve(pages[n++]) };
+  const all = await personaFacetList(channel, { ...PARTIES, limit: 1 });
+  assert.deepEqual(all.map((f) => f.facetId), ["a", "b", "c"]);
+});
+
+test("a facet listing returns [] rather than undefined", async () => {
+  const channel = recorder({});
+  assert.deepEqual(await personaFacetList(channel, { ...PARTIES }), []);
+});
+
+test("deleting a facet sends only the facet — there is no cascade to send", async () => {
+  // A facet is an arrangement, not a container. There is no cascading form of
+  // this call anywhere on the wire, and a client inventing one would be asking
+  // for a member the agent would refuse.
+  const channel = recorder({ existed: true, releasedFaces: 2 });
+  const res = await personaFacetDelete(channel, { ...PARTIES, facetId: "01F" });
+  const payload = channel.sent[0].envelope.payload ?? channel.sent[0].envelope.body;
+  assert.deepEqual(Object.keys(payload).sort(), ["facetId"]);
+  assert.equal(res.releasedFaces, 2, "the released-face count is what a screen reads");
+});
+
+test("purging every kept version sends no versions member at all", async () => {
+  // Omitted is "all of them"; an empty array would be a schema violation, and
+  // a client that sent one for "all" would be refused for doing the obvious.
+  const all = recorder({ attributeId: "01J", purged: [3, 5] });
+  await personaAttributePurgeVersion(all, { ...PARTIES, attributeId: "01J" });
+  assert.deepEqual(all.sent[0].envelope.payload, { attributeId: "01J" });
+});
+
+test("a put that omits reach sends no reach — the agent keeps the face's", async () => {
+  // Omission is the one that must NOT reset here: a reach is a restriction the
+  // holder set, and an editor that dropped it would widen the face to anywhere.
+  const r = recorder({ profileId: "01P", version: 2, created: false, updatedAt: "2026-01-01T00:00:00Z" });
+  await personaProfilePut(r, { ...PARTIES, profileId: "01P", name: "Work", entries: [] });
+  assert.equal("reach" in r.sent[0].envelope.payload, false);
+  await personaProfilePut(r, {
+    ...PARTIES,
+    profileId: "01P",
+    name: "Work",
+    entries: [],
+    reach: { kind: "only", contextIds: ["ctx"] },
+  });
+  assert.deepEqual(r.sent[1].envelope.payload.reach, { kind: "only", contextIds: ["ctx"] });
+});
+
+test("a binding carries until, and a listing asks for retired faces only when told", async () => {
+  const b = recorder({ contextId: "ctx", personaDid: "did:key:zP", version: 3, boundAt: "2026-01-01T00:00:00Z" });
+  await personaBindingSet(b, {
+    ...PARTIES,
+    contextId: "ctx",
+    personaDid: "did:key:zP",
+    profileId: "01P",
+    until: "2026-10-05T18:00:00Z",
+  });
+  assert.equal(b.sent[0].envelope.payload.until, "2026-10-05T18:00:00Z");
+
+  const l = recorder({ profiles: [] });
+  await personaProfileList(l, { ...PARTIES });
+  await personaProfileList(l, { ...PARTIES, includeRetired: true });
+  assert.equal("includeRetired" in l.sent[0].envelope.payload, false);
+  assert.equal(l.sent[1].envelope.payload.includeRetired, true);
+});
+
+test("an attribute put sends endorsements only when there are some", async () => {
+  const r = recorder({ attributeId: "01J", version: 1, created: true, updatedAt: "2026-01-01T00:00:00Z" });
+  const base = {
+    ...PARTIES,
+    type: "skill.language",
+    valueType: "string",
+    value: "Rust",
+    provenance: { kind: "derived", source: "github", derivedAt: "2026-09-01T00:00:00Z" },
+  };
+  await personaAttributePut(r, { ...base, endorsements: [] });
+  await personaAttributePut(r, { ...base, endorsements: ["cred-1"] });
+  assert.equal("endorsements" in r.sent[0].envelope.payload, false);
+  assert.deepEqual(r.sent[1].envelope.payload.endorsements, ["cred-1"]);
+  assert.equal(r.sent[1].envelope.payload.provenance.kind, "derived");
 });

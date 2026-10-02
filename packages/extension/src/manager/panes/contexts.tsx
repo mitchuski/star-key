@@ -12,7 +12,11 @@ import {
   contextsUpdateDid,
   type ContextRecord,
 } from "@openvtc/pnm-core";
-import { contextDelete, contextPreviewDelete } from "@openvtc/pnm-core/admin";
+import {
+  contextDelete,
+  contextPreviewDelete,
+  type ContextDeletePreview,
+} from "@openvtc/pnm-core/admin";
 import { Button, Did, Empty, Note, Panel } from "../../ui.js";
 import { LoadError } from "../table.js";
 import { c, t, font } from "../../theme.js";
@@ -27,6 +31,7 @@ import { Destructive, ConsentCeremony, runMutation } from "../destructive.js";
 import { hasRole, type Authority, type Parties } from "../use-vta.js";
 import { formatInstant } from "../format.js";
 import type { ContextSelection } from "../context-column.js";
+import { MailDid } from "../mail-did.js";
 
 const fieldStyle: React.CSSProperties = {
   width: "100%",
@@ -48,11 +53,7 @@ function Label({ children }: { children: React.ReactNode }) {
 }
 
 /** What deleting a context would destroy, in the agent's own words. */
-interface DeletePreview {
-  id: string;
-  keys: string[];
-  webvhDids: string[];
-}
+type DeletePreview = ContextDeletePreview;
 
 function CreateContext({
   parties,
@@ -227,7 +228,7 @@ function EditContext({
         <dd style={{ margin: 0, fontFamily: font.mono }}>{record.id}</dd>
         <dt style={{ color: c.muted }}>DID</dt>
         <dd style={{ margin: 0 }}>
-          {record.did ? <Did value={record.did} /> : <span style={{ color: c.faint }}>none bound</span>}
+          {record.did ? <MailDid value={record.did} /> : <span style={{ color: c.faint }}>none bound</span>}
         </dd>
         <dt style={{ color: c.muted }}>Created</dt>
         <dd style={{ margin: 0, color: c.muted }}>{formatInstant(record.createdAt)}</dd>
@@ -266,6 +267,27 @@ function EditContext({
   );
 }
 
+/** A destroyed-things list: a count, a caption, and the items under it. */
+function Destroyed({
+  count,
+  caption,
+  children,
+}: {
+  count: number;
+  caption: string;
+  children: React.ReactNode;
+}) {
+  if (count === 0) return null;
+  return (
+    <div>
+      <div style={{ color: c.muted, marginBottom: 3 }}>
+        {count} {caption}
+      </div>
+      <ul style={{ margin: 0, paddingLeft: 18, fontSize: t.xs }}>{children}</ul>
+    </div>
+  );
+}
+
 function DeleteContext({
   parties,
   record,
@@ -284,54 +306,112 @@ function DeleteContext({
   return (
     <Panel
       title="Delete this context"
-      description="The keys and DIDs a context holds do not come back. Your agent is asked what
-        this would destroy before anything is sent."
+      description="Deleting a context deletes everything below it. The keys and DIDs a context
+        holds do not come back. Your agent is asked what this would destroy before anything is
+        sent."
     >
       <Destructive<DeletePreview>
         label="Delete context"
         disabledReason={denied}
         preview={() => contextPreviewDelete(managerSender, { ...parties, id: record.id })}
-        needsForce={(p) => p.keys.length > 0 || p.webvhDids.length > 0}
-        forceLabel="Delete anyway, destroying the keys and DIDs listed above"
-        renderPreview={(p) => (
-          <>
-            <strong>
-              Deleting {record.name || record.id} is irreversible.
-            </strong>
-            {p.keys.length === 0 && p.webvhDids.length === 0 ? (
-              <span>Your agent reports it holds no keys and no DIDs.</span>
-            ) : (
-              <>
-                {p.keys.length > 0 && (
-                  <div>
-                    <div style={{ color: c.muted, marginBottom: 3 }}>
-                      {p.keys.length} key{p.keys.length === 1 ? "" : "s"} destroyed:
-                    </div>
-                    <ul style={{ margin: 0, paddingLeft: 18, fontFamily: font.mono, fontSize: t.xs }}>
-                      {p.keys.map((k) => (
-                        <li key={k}>{k}</li>
-                      ))}
-                    </ul>
-                  </div>
-                )}
-                {p.webvhDids.length > 0 && (
-                  <div>
-                    <div style={{ color: c.muted, marginBottom: 3 }}>
-                      {p.webvhDids.length} DID{p.webvhDids.length === 1 ? "" : "s"} destroyed:
-                    </div>
-                    <ul style={{ margin: 0, paddingLeft: 18 }}>
-                      {p.webvhDids.map((d) => (
-                        <li key={d}>
-                          <Did value={d} size={t.xs} />
-                        </li>
-                      ))}
-                    </ul>
-                  </div>
-                )}
-              </>
-            )}
-          </>
-        )}
+        // Every list, not two of them. A context whose only contents are a
+        // grant or a template — or whose contents are all in a sub-context —
+        // used to read as empty here, so the panel sent `force: false` and the
+        // agent refused with nothing on screen explaining why.
+        needsForce={(p) =>
+          p.subContexts.length > 0 ||
+          p.keys.length > 0 ||
+          p.webvhDids.length > 0 ||
+          p.aclEntriesRemoved.length > 0 ||
+          p.aclEntriesUpdated.length > 0 ||
+          p.didTemplates.length > 0
+        }
+        forceLabel="Delete anyway, destroying everything listed above"
+        renderPreview={(p) => {
+          const nothing =
+            p.subContexts.length === 0 &&
+            p.keys.length === 0 &&
+            p.webvhDids.length === 0 &&
+            p.aclEntriesRemoved.length === 0 &&
+            p.aclEntriesUpdated.length === 0 &&
+            p.didTemplates.length === 0;
+          const plural = (n: number, word: string) => `${word}${n === 1 ? "" : "s"}`;
+          return (
+            <>
+              <strong>Deleting {record.name || record.id} is irreversible.</strong>
+              {nothing ? (
+                <span>Your agent reports it holds nothing, and has no sub-contexts.</span>
+              ) : (
+                <>
+                  {/* First, because it changes what every list below means:
+                      those are the subtree's contents, not this context's. */}
+                  <Destroyed
+                    count={p.subContexts.length}
+                    caption={`${plural(p.subContexts.length, "sub-context")} deleted with it — everything below is theirs too:`}
+                  >
+                    {p.subContexts.map((id) => (
+                      <li key={id} style={{ fontFamily: font.mono }}>
+                        {id}
+                      </li>
+                    ))}
+                  </Destroyed>
+                  <Destroyed
+                    count={p.keys.length}
+                    caption={`${plural(p.keys.length, "key")} destroyed:`}
+                  >
+                    {p.keys.map((k) => (
+                      <li key={k} style={{ fontFamily: font.mono }}>
+                        {k}
+                      </li>
+                    ))}
+                  </Destroyed>
+                  <Destroyed
+                    count={p.webvhDids.length}
+                    caption={`${plural(p.webvhDids.length, "DID")} destroyed, and withdrawn from its hosting server:`}
+                  >
+                    {p.webvhDids.map((d) => (
+                      <li key={d}>
+                        <Did value={d} size={t.xs} />
+                      </li>
+                    ))}
+                  </Destroyed>
+                  {/* Losing every scope is a different event from losing one,
+                      and the agent distinguishes them — so does this. */}
+                  <Destroyed
+                    count={p.aclEntriesRemoved.length}
+                    caption={`${plural(p.aclEntriesRemoved.length, "subject")} losing access entirely:`}
+                  >
+                    {p.aclEntriesRemoved.map((d) => (
+                      <li key={d}>
+                        <Did value={d} size={t.xs} />
+                      </li>
+                    ))}
+                  </Destroyed>
+                  <Destroyed
+                    count={p.aclEntriesUpdated.length}
+                    caption={`${plural(p.aclEntriesUpdated.length, "subject")} keeping access elsewhere, losing it here:`}
+                  >
+                    {p.aclEntriesUpdated.map((d) => (
+                      <li key={d}>
+                        <Did value={d} size={t.xs} />
+                      </li>
+                    ))}
+                  </Destroyed>
+                  <Destroyed
+                    count={p.didTemplates.length}
+                    caption={`${plural(p.didTemplates.length, "DID template")} removed:`}
+                  >
+                    {p.didTemplates.map((n) => (
+                      <li key={n} style={{ fontFamily: font.mono }}>
+                        {n}
+                      </li>
+                    ))}
+                  </Destroyed>
+                </>
+              )}
+            </>
+          );
+        }}
         commit={async (force) => {
           await contextDelete(managerSender, { ...parties, id: record.id, force });
         }}
@@ -403,7 +483,9 @@ function ContextDid({
         await contextsUpdateDid(managerSender, {
           ...parties,
           id: record.id,
-          did: did.trim(),
+          // "none" is `null`, never `""`: `update-did/1.1` refuses an empty
+          // string as not a DID, and 1.0 had no way to say "none" at all.
+          did: did.trim() || null,
         });
       },
       { onConsent: setPending, onError: setError },
@@ -413,6 +495,7 @@ function ContextDid({
   }, [parties, record.id, did, onChanged]);
 
   const unchanged = did.trim() === (record.did ?? "");
+  const clearing = Boolean(record.did) && did.trim() === "";
 
   return (
     <Panel
@@ -470,7 +553,8 @@ function ContextDid({
           </span>
         )}
         <span style={{ fontSize: t.xs, color: c.faint }}>
-          Choosing <b>none</b> leaves the context with no identity of its own.
+          Choosing <b>none</b> leaves the context with no identity of its own. The DID itself is
+          not deleted — it stays under <b>DIDs</b>, and can be assigned again or deleted there.
         </span>
 
         {error && <Note tone="danger">{error}</Note>}
@@ -483,7 +567,7 @@ function ContextDid({
             {...(denied ? { title: denied } : {})}
             onClick={() => void save()}
           >
-            {busy ? "Saving…" : record.did ? "Reassign DID" : "Assign DID"}
+            {busy ? "Saving…" : clearing ? "Clear DID" : record.did ? "Reassign DID" : "Assign DID"}
           </Button>
         </div>
         {denied && <span style={{ fontSize: t.sm, color: c.muted }}>{denied}</span>}

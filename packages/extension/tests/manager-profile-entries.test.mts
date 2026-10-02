@@ -74,7 +74,7 @@ test("an unchanged edit round-trips the profile exactly", () => {
 test("no attribute is ever named twice", () => {
   // The duplicate bug: a pinned entry has a `ref`, so seeding the ticks from
   // every ref ticks its attribute AND carries the pinned entry through. The
-  // profile then presents one fact through two entries, from an edit in which
+  // profile then presents one attribute through two entries, from an edit in which
   // the operator touched nothing.
   const ticked = ["a-live", "a-pinned", "a-overridden"];
   const out = composeEntries(ALL, ticked);
@@ -124,4 +124,57 @@ test("a profile with nothing to preserve composes exactly the ticks", () => {
 
 test("a repeated tick is written once", () => {
   assert.deepEqual(composeEntries([], ["x", "x"]), [{ ref: "x" }]);
+});
+
+// ── Slots ───────────────────────────────────────────────────────────────────
+
+test("an edit keeps every slot where it was", async () => {
+  // `profile/put` replaces the face: a live entry rebuilt as a bare `{ref}`
+  // would lose its slot on every save, silently.
+  const { composeEntriesWithSlots } = await import("../src/manager/profile-entries.ts");
+  const named = [
+    { ref: "a-name", slot: "displayName" },
+    { ref: "a-mail", slot: "primaryEmail" },
+    { ref: "a-pinned", pinVersion: 3, slot: "primaryPhone" },
+  ];
+  assert.deepEqual(composeEntriesWithSlots(named, ["a-name", "a-mail"]), named);
+});
+
+test("choosing a name moves displayName to exactly one entry", async () => {
+  const { composeEntriesWithSlots, displayNameOf } = await import(
+    "../src/manager/profile-entries.ts"
+  );
+  const before = [{ ref: "legal", slot: "displayName" }, { ref: "known-as" }];
+  const after = composeEntriesWithSlots(before, ["legal", "known-as"], "known-as");
+  assert.deepEqual(after, [{ ref: "legal" }, { ref: "known-as", slot: "displayName" }]);
+  assert.equal(displayNameOf(after), "known-as");
+  // None.
+  const none = composeEntriesWithSlots(before, ["legal", "known-as"], null);
+  assert.equal(displayNameOf(none), null);
+  assert.ok(none.every((e) => !("slot" in e)));
+});
+
+test("a name kept on a pinned entry can be chosen, and its pin is untouched", async () => {
+  const { composeEntriesWithSlots } = await import("../src/manager/profile-entries.ts");
+  const out = composeEntriesWithSlots([{ ref: "a-pinned", pinVersion: 3 }], [], "a-pinned");
+  assert.deepEqual(out, [{ ref: "a-pinned", pinVersion: 3, slot: "displayName" }]);
+});
+
+test("an entry already playing another role is not also made the name", async () => {
+  // One entry, one slot: the agent's schema carries a single `slot` per entry.
+  const { composeEntriesWithSlots, displayNameOf } = await import(
+    "../src/manager/profile-entries.ts"
+  );
+  const out = composeEntriesWithSlots([{ ref: "a-mail", slot: "primaryEmail" }], ["a-mail"], "a-mail");
+  assert.deepEqual(out, [{ ref: "a-mail", slot: "primaryEmail" }]);
+  assert.equal(displayNameOf(out), null);
+});
+
+test("leaving the name alone leaves an inline name alone", async () => {
+  const { composeEntriesWithSlots, displayNameIsInline } = await import(
+    "../src/manager/profile-entries.ts"
+  );
+  const inlineName = { ...INLINE, slot: "displayName" };
+  const out = composeEntriesWithSlots([inlineName, LIVE], ["a-live"]);
+  assert.ok(displayNameIsInline(out), "an untouched edit took the face's own name away");
 });

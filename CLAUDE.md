@@ -32,6 +32,23 @@ Rules that bite hardest here:
   issue rather than absorbing the old shape here. This is also why a request to
   another repo should not ask for a deprecation window on this repo's behalf.
 
+  **The one exception is TSP Rev 2, and the reason it is one is worth reading
+  before citing it for anything else.** The rule above rests on "our peers cut
+  over with us", which is true of the VTA and the mediator and false of the
+  Trust Spanning Protocol: it is a ToIP specification with implementations
+  nobody here controls, and the reference `tsp_sdk` shipped Rev 3 in 0.10.0
+  while others are still on Rev 2. So `@openvtc/vti-tsp-js` **reads** both and
+  **packs** only Rev 3. That asymmetry is what keeps it from being the pattern
+  this rule bans: there is no dual-accept *arm* anywhere on the Rev 3 path, no
+  `if (rev === 2)` branch, and no negotiation. Rev 2 is a frozen decode-only
+  codec in its own directory, reached by dispatching on a version marker the
+  wire actually carries — and it is deleted whole, with its arm of the
+  dispatcher, the day the last Rev 2 peer is gone. A fold you can delete in one
+  `rm` is not a fold. **Nothing else in this repo has that shape**; if you are
+  reaching for this paragraph to justify a second version arm, the honest test
+  is whether a peer you do not control is on the far side, and for the VTA and
+  the mediator the answer is no.
+
 - **R3.7 — match errors on stable machine-readable codes, never on strings,
   and parse error *bodies* before throwing on status.** Any condition this
   wallet must detect needs a stable field agreed with the Rust side —
@@ -40,6 +57,27 @@ Rules that bite hardest here:
   `errorFromBody(doc, status, statusText)`, never by handing the spent
   `Response` back to `errorFromResponse` — that throws into a swallowing
   `catch` and silently degrades to a status-only guess.
+- **Endpoints this wallet did not choose are vetted before they are dialed, and
+  production gets no opt-out.** A mediator's REST, auth and WebSocket URLs come
+  out of its DID document; a VTA's REST base is written from one at onboarding.
+  Each goes through `@openvtc/vti-didcomm-js` 0.8's `netPolicy`
+  (`net-guard.js`): https/wss only, no credentials in the URL, no loopback,
+  private, link-local, carrier-NAT or local-only host, and no redirect
+  followed. `walletNetPolicy` (`extension/src/net-policy.ts`) is the single
+  place that decides, and it keys off the build — `npm run dev` builds with
+  `--mode development`, so `import.meta.env.DEV` is set and the policy carries
+  `allowInsecure` **and** `allowPrivate`; every packaged build gets neither.
+  **Since 0.8 those two flags are independent**: `allowInsecure` admits
+  `http:`/`ws:` and nothing more, so a local mediator or VTA needs both, and a
+  dev setup that sets only the first fails on `localhost` where it used to
+  work. A refusal is `code: "E_BLOCKED_ENDPOINT"` — match it with
+  `isBlockedEndpointError`, which is structural on the code because the library
+  and this package's did:webvh guard are two classes carrying one code (R3.7).
+  `transport-diagnosis.ts` renders it as `mediator/blocked-endpoint`, and the
+  refusal is deliberately not classified from a probe: nothing was contacted.
+  What none of this can do in a browser: an extension has no DNS API, so a
+  public name that *resolves* to a private address still passes. `allowHosts`
+  is the answer to that and needs a pinned list the wallet does not yet hold.
 - **R1.6 + MV3 — persist before ack.** Anything that acknowledges a mediator
   message must durably store it first; assume the worker/offscreen document
   dies on the next line. **Satisfied — and easy to break again**: see "How
@@ -100,6 +138,60 @@ type on a path that skips it), or relaxing the `vti-didcomm-js` floor below
 "have I already prompted for this?", pending answers "is this still
 outstanding?" A message can be both, which is why the drain path bypasses the
 dedup check.
+
+**A second `vti-didcomm-js` floor, for an unrelated reason: `^0.10.0` is a
+correctness constraint too.** Since the Rev 3 cutover the wallet reads
+long-framed TSP replies — spec Rev 3 widened the `-E` count to cover the
+ciphertext, so any TSP message past ~12 KB is framed with the six-byte long
+count code and its qb64 text starts `--E`, not `-E`. Through 0.8.x the inbound
+demux (`_onFrame` in `mediator-transport.js`) classified TSP by
+`text.startsWith("-E")`, so a large reply was handed to the DIDComm unpacker,
+thrown out as a poison frame, and — because the throw returns before the ack —
+**never acked**, so the mediator redelivered it on every reconnect forever while
+the waiter timed out. This is not hypothetical: a `keys/list` with no context
+filter returns a full page of records, crosses the threshold, and was silently
+lost (the VTA logged the reply sent; the wallet saw nothing). 0.10.0 moved the
+test into `isTspFrameText`, which matches both `-E` and `--E`. Below it, every
+TSP reply over ~12 KB vanishes. `tests/did.egress-socket.mjs`'s control was
+rewritten for the same release's *other* change — 0.9+ runs the resolver's own
+`net-guard` on `did:webvh` resolution by default, so a bare `vtiResolve(did, {})`
+is refused before it dials; the control now relaxes the dependency's policy to
+keep proving the fixture is reachable, and the production path (guard first, then
+`vtiResolve(did, {})`) is unchanged.
+
+## Inbound is attributed to the sender the transport proved, never to `from`
+
+A DIDComm message's `from` is plaintext its sender writes. What the envelope
+proves is the authcrypt sender key (`skid`), and `@openvtc/vti-didcomm-js`
+0.12 hands that to us as a `VerifiedSender` — the third argument of the
+`onInbound` handler (`connectMediatorSession` passes it through) — after
+refusing any authcrypt message whose `from` is not the `skid`'s DID. On the TSP
+path `unpackInboundTsp` proves the sender itself. `onInboundMessage` takes that
+DID as `senderDid`, **persists it with the message** (`PendingInbound.senderDid`,
+because a re-driven message has no transport left to ask), and every parser
+that decides whether to believe an unsigned notice keys on it:
+`parseTaskConsentOutcome` believes a reply only from the executor the decision
+was sent to (`AwaitingDecision.executorDid`, else the session's VTA) and, when
+the reply carries a proof, only if it verifies as that executor;
+`parseTaskConsentGranted` only from this session's VTA.
+
+The same holds for replies. `DidcommMessageBridge.sendAndAwaitReply` takes a
+**required** `from` — the peer(s) whose reply it is — and
+`MediatorSessionBridge` hands it to the session's `waitFor` filter, so a frame
+on the thread from anyone else is never returned as the answer. A thread id is
+a message id this wallet sent through the mediator, not a secret. Name the
+addressee: the VTA (plus the forwarding mediator, whose refusal of the hop is
+an answer) in `DidcommVtaTransport`, the mediator in `MediatorClient`, the RP in
+`loginViaDidcomm`.
+
+**The `^0.12.0` floor is a correctness constraint too**: below it `from` is
+unbound and the verified sender is not delivered at all.
+
+**What breaks it:** reading `message.from` to decide anything; dropping
+`senderDid` from the pending record; or widening an outcome's accepted sender
+to "any enrolled executor" — a party that never received the decision would
+then be able to tell a human their approval failed, and make this wallet forget
+the decision it is waiting on.
 
 ## Every outbound Trust-Task document is signed (SPEC §7.2 item 7a)
 
@@ -197,6 +289,15 @@ after they ran a command they were told was right. It also ended a live bug —
 the flow printed `--role super-admin`, which `pnm acl create` does not accept
 (the roles are `admin`, `initiator`, `application`, `reader`; super-admin is the
 *shape* of an admin grant, not a role name).
+
+**The command also names `--capabilities persona-holder`**, always for
+`unrestricted` and opt-in for `context`. Since VTI #1673 no role — super-admin
+included — reaches the holder's attribute pool; only an entry granted the
+capability by name does, and the VTA carries it across the hand-off rollover
+(#1573). It is additive, so it does not narrow the admin role; it is the *only*
+capability the grant may name, since any other name there is a narrowing. Only
+an unscoped operator may confer it, which is why asking for it moves
+`needsSuperAdminOperator` for a context-scoped grant too.
 
 **What is stored is what the agent said, never what was asked.**
 `Connection.homeContext` and `Connection.agentScope` come from
@@ -297,12 +398,15 @@ checkable.** `@openvtc/pnm-core/persona` is the wallet's half: disclosure's
 two-call gate, contacts, read-only bindings, renderers, and context-local
 profiles. `@openvtc/pnm-core/admin`'s `persona.ts` is the holder's half — the
 attribute pool, profiles, `binding/set`, `correlation/analyze`,
-`disclosure/history` — and the agent gates all ten on
-**`require_super_admin`**: `Admin` *and* unrestricted scope. A guard reading
-"is this an administrator" passes for one scoped to a single context, who would
-then be reading identity data belonging to every *other* context. The console's
-`isUnscopedHolder` mirrors that test and exists so a pane can *explain* the
-refusal; it never decides.
+`disclosure/history` — and the agent gates all ten on the
+**`persona-holder` capability, granted by name**. No role carries it: not a
+context admin, and since VTI #1673 not an unrestricted one either. A guard
+reading "is this an administrator" — or "is this an admin with no context
+restriction", which is what the agent used to test — passes exactly the
+credential it refuses. The console's `holdsPersonaHolder` reads
+`auth/whoami`'s effective `capabilities` and exists so a pane can *explain* the
+refusal (with the `pnm acl update <did> --capabilities persona-holder` that
+fixes it); it never decides.
 
 **Only `manager.js` may carry the holder's half.** CI greps `dist/` for those
 ten URIs with `manager.js` excluded, exactly as it does for `admin/*`. The
@@ -323,31 +427,255 @@ address and phone number without showing them any of it.
 the pool, the faces and every context's bindings, builds `identity-graph.ts`'s
 model, and shows either the guided setup (`persona-setup.tsx`, while the holder
 has no face) or the identity map (`persona-map.tsx`). What lights up when
-something is selected — a fact's reach runs *down* to the contexts it goes to,
-a context's runs *up* to the facts it holds — is computed in
-`identity-graph.ts` and tested; the component only draws. The on-screen words
-are a **fact**, a **face**, a **context** and a persona that **wears** a face,
-per `design-docs/persona-vocabulary.md`; the spec's words (`attribute`,
-`profile`, `binding`, `materialise`) stay in code and off the screen. Add copy
-in those words, or change the document first.
+something is selected — an attribute's reach runs *down* to the contexts it goes
+to, a context's runs *up* to the attributes it holds — is computed in
+`identity-graph.ts` and tested; the component only draws. The on-screen words are
+an **attribute**, a **face**, a **context** and a persona that **wears** a face,
+per `design-docs/persona-vocabulary.md`. The word for a value the holder keeps is
+the spec's own: *fact* asserted a truth the model cannot promise — the card said
+it directly above a provenance line reading *you said so* — and `fact` was
+already spent on `vtc-service`'s verified policy inputs, very nearly the opposite
+meaning in the same product (#191). It is banned from screen copy, and
+`manager-holder-gate.test.mts` checks. The remaining spec words (`profile`,
+`binding`, `materialise`) stay in code and off the screen. Add copy in those
+words, or change the document first.
+
+**Every editor opens as a popover, anchored to what was clicked.** This was
+the console's loudest defect and the fix is structural, so it is worth knowing
+before touching a form. Editors used to render at the *end* of the map's JSX —
+after the attributes, the faces, the divider, the contexts and the selection
+strip — which on a populated wallet put the first field around 1700px down a
+2450px scroller whose `scrollTop` never moved, with focus left on the button.
+Pressing *Add an attribute* changed nothing a person could see; the list and
+worlds screens instead *replaced* the list, so the thing being worked on
+vanished. `popover.tsx` is now the one behaviour: positioned `fixed` against
+the anchor (measuring against a scroll container means knowing which one, and
+being wrong glues it 800px away), focus moved into the first field, `Escape`
+closing it and returning focus. An `Editing` state therefore carries the
+element it was opened from — that is not decoration.
+
+`Panel` reads `ChromeProvided` and drops its own border and padding inside one,
+rather than four editors each learning where they are being shown. And
+`[role="dialog"] *` sets `min-width: 0` in `manager-theme.css`, because a grid
+item's default `auto` refuses to shrink below its content and one long help
+paragraph sized the editors past the popover's edge.
+
+**Worlds live on the map, and the Worlds tab is gone.** A grouping you cannot
+see beside the things it groups is a list of names, and arranging faces on one
+screen while looking at them on another is the same act performed twice. Faces
+sit inside world bubbles and move by dragging; `worlds.tsx` is now only the
+editor the popover mounts. The view toggle is **Map / List / Released**, and
+`Released` is a promotion rather than an addition: the disclosure history is the
+biggest privacy answer this product has and it used to be a footer under every
+other view.
+
+`movePlan` (`world-model.ts`) owns a move, and the **order is the reason it is a
+function**: `facet/put` replaces, and the agent refuses to place a face that is
+already placed, so the source is rewritten without it before the destination is
+rewritten with it. Every write carries live membership via `seedMembership` — a
+put echoing a dangling id is refused `unresolvedReference` and leaves the world
+uneditable (plugin #216).
+
+**A card is closed until it is selected.** An attribute card draws its type and
+one of three words — `shown`, `hidden`, `held back` — and never the value;
+selecting it expands it in place. Those three stay three: *hidden* is a value in
+hand behind a mask, *held back* is one the agent never sent, and collapsing them
+is exactly the defect the reveal path exists to end, one layer up. The detail
+strip **no longer renders the value at all**: two `AttributeValue`s for one
+attribute is two *Show* buttons and two reveal states, and the second is always
+the one that stops being maintained.
+
+**The detail strip is pinned to the bottom of the pane.** Same defect, arrived
+at from the other side: the strip is the last element of a document two or three
+screens tall, so selecting anything put its *Edit* and *Delete* below the fold —
+clicking a face looked like it had merely highlighted something. `position:
+sticky` rather than `fixed`, because the strip belongs to the pane and must not
+hang over the rail or the context column. It is capped at `46vh` and scrolls,
+and it carries its own dismiss, since "click the card again" stopped being the
+only way out the moment it became persistent.
+
+**What breaks it:** rendering an editor inline again, or as a mode that replaces
+the list; dropping the anchor from `Editing`; unpinning the strip, or letting it
+grow past its cap; re-adding a Worlds pane; reading
+`.faceIds` off a facet to build a move instead of `movePlan`; drawing a value on
+a closed card; or letting the strip render one again.
+
+**Colour on the map carries three things, in three channels that never
+overlap.** The **border** is selection and reach; the **inset stripe** on an
+attribute card and the dot on a face's chips are its claim-type family; the
+**pills** are status. A world's colour is a **fourth** categorical set and it
+does not touch any of those: it is the *ground* of the bubble the faces sit in,
+plus a 6px dot on an attribute card — surfaces the three channels do not use.
+Putting a world hue on a card border or in a pill is what breaks this.
+
+Reach is drawn in two hues rather than one because
+`reachOf` was always asymmetric and the single accent hid it: down is a copy
+**leaving** the holder (`--m-act-data`, borrowed from the contexts band it ends
+in), up is what a context **holds** of them (the accent). `Flow` is computed in
+`identity-graph.ts` with the rest of the model, so the component still only
+draws. The family hues (`--m-fam-*`, `manager/attribute-family.ts`) are
+**categorical**, the same species as the act colours in `manager-theme.css` and
+bound by that file's rule: `--w-ok` / `--w-warn` / `--w-danger` stay the only
+colours that mean anything. `familyOf` groups **only** roots the **agent's**
+registry declares and this console has placed (`PLACED_ROOTS`) — a family the
+agent serves that this build predates is `unregistered`, which is the honest
+answer for one rather than a gap. It groups only roots the registry declares — `profile.*` and `employer` are `unregistered`, not a
+"profile" family invented here — and no family's words may claim the colour
+protects anything, which `manager-attribute-family.test.mts` asserts directly.
+
+**A context is one of four things, decided once.** `standingOf` /
+`tallyContexts` (`identity-graph.ts`) answer `known` (a persona wears a face),
+`identified` (a persona is present wearing nothing), `unreadable`, `absent`.
+`identified` is a real state, not a rounding error: `persona/binding/list/1.0`
+enumerates the personas *present* in a context and carries `bound` separately,
+so unbinding a face leaves the persona — that context still knows an identifier
+of the holder's and can address it, while holding none of their attributes. The
+header, the band and the fold row all read this one predicate. They used to use
+three different tests, which is how the live console came to say "known in 1 of
+12" above two cards with ten folded away — and the state itself had no words on
+screen at all.
+
+**What breaks it:** counting contexts anywhere but `tallyContexts` (the numbers
+stop closing, and the one that is wrong is the one nobody re-checks); folding
+`identified` in with `absent` (an identifier the holder has out there,
+disappeared); painting reach in one hue again; putting a family hue on a card
+border or in a pill; adding a `--m-fam-*` for something that is *state*; or
+giving `familyOf` a prefix rule the registry has not declared.
 
 **Sensitive values are hidden from the screen, and that is all it is.**
-`manager/claim-sensitivity.ts` carries a **vendored** copy of the claim-type
-registry's masking data — sensitivity and mask style per token, from
-`specs/persona/_shared/0.1/claim-types.json` at `registryVersion` 0.1 — because
-the agent does not serve that table: `persona/claim-types/list` is an open
-question in `CLAIM-TYPES.md` §6, deferred until the first extension type ships.
-An unregistered or `x:` token resolves to the conservative default
-(`high`/`full`) per §4 rule 3, and there is deliberately **no prefix walk**: the
-JSON declares only leaves, so inventing a `payment.*` family rule locally would
-make an unknown member of that family show *more* than the registry asks.
+The claim-type table is **read from the agent**, through
+`persona/claim-types/list` — `@openvtc/pnm-core/persona`'s `listClaimTypes`,
+loaded by `panes/persona.tsx` beside the pool and threaded down as a prop.
+`manager/claim-sensitivity.ts` used to carry a vendored copy; the copy was
+*correct*, which was never the problem. A copy of a table two repositories do
+not own costs a re-sync pull request against each on every change, and can only
+describe the tokens its own build knew about — an agent serving an extension
+type is invisible to a client shipping its own.
 
-**It is not a security control and must not be described as one.** The value was
-fetched before any of it ran, so masking changes what is drawn and never what
-the page holds. It defends against a shoulder, a screenshot and a screen share,
-which is the whole scope. The control that would matter is a read-path one —
-`includeSensitive` on `persona/attribute/list`, so a listing that did not ask is
-answered without the values — and it does not exist yet.
+**Resolution lives in core** (`resolveTreatment`), beside the served table, and
+the strictness orderings come from the agent — so "more protective" means the
+same thing on both sides, and a maintainer adding a stricter mask style is
+honoured without a rebuild. An axis value this build does not recognise is
+treated as **most** protective. `treatmentFor` still applies the holder's
+decision over that answer, unchanged: only the axis they decided moves, and a
+*declared* token's mask never does.
+
+**`null` is a real state and it fails closed.** While the table is in flight
+every value is masked and every attribute groups as `unregistered`, attributed
+to the registry rather than the holder — claiming `source: "holder"` for a
+default would put their name on one. There is deliberately no compiled
+fallback: a stale copy resolving a token the agent has since tightened is the
+failure the registry exists to end.
+
+An unregistered or `x:` token resolves to the conservative default
+(`high`/`full`) per §4 rule 3. The prefix walk **is** rule 3 and it only ever
+*tightens*: an unregistered token takes the more protective of its longest
+registered prefix and that default, per axis — so `payment.giftCard` inherits
+`payment`'s gating and cannot be escaped by inventing a token, while
+`name.somethingNew` does **not** inherit `name`'s `none` and stays masked. (This
+note used to say there was deliberately no walk, which was true of the table
+before the registry gained one in trust-tasks#377.) A local rule that walks in
+the *loosening* direction is still the thing to refuse.
+
+**The mask is not the control. The request is.** Masking a value already
+fetched defends a shoulder, a screenshot and a screen share, and nothing else —
+never say more than that about it. The control that matters is on the read path,
+it now exists, and the console uses it: `includeSensitive` on
+`persona/attribute/list` (trust-tasks 0.17.4). The pane lists with
+`includeValues` and **without** it, so the plaintext of every `sensitivity: high`
+attribute is genuinely not in the page, and *Show* is the request for one —
+`manager/reveal-value.ts`, narrowed by `typePrefix` to that attribute's type and
+matched back by `attributeId`, because there is no `attribute/get` and a type can
+have siblings. *Hide* then **drops** what was fetched rather than covering it.
+
+Before this the console never sent the member, so the agent answered with the
+metadata of every sensitive attribute and the plaintext of none — and the pane
+drew a mask over the placeholder. A card read `••••` beside a *Show* that
+revealed "not requested", under a line promising the agent "has already sent
+this value here". Two states, one shape on screen, and the reassuring one was
+the lie.
+
+**What breaks it:** setting `includeSensitive` on the pane's own listing (three
+lines, every *Show* instant, and every card and passport number the holder owns
+sitting in a React tree because a button *might* be pressed — the decorative
+version with extra steps); masking a withheld placeholder, which claims a value
+is being held back when none arrived; matching a reveal by position rather than
+`attributeId`; or a *Hide* that only covers what a press fetched.
+
+**The holder outranks the registry, and "not decided" is a state.**
+`sensitivity` and `release` are per-attribute members that are present **only**
+where the holder chose one; absent means the claim-type registry answers.
+`treatmentFor` applies the first over the second and reports which spoke, so a
+pane can say *you decided* without ever putting the registry's answer in the
+holder's mouth. The editor offers three options per question, and *let your
+agent decide* writes the member **absent** — never the resolved default, because
+`persona/attribute/put` is a **replace** and freezing today's answer means a
+later tightening of the registry protects every new attribute and leaves this
+one exposed. The same replace semantics are why an editor must send back the
+decisions it loaded: omitting them silently cleared the holder's gate on every
+save, and nothing in the response said so.
+
+**One narrow exception, and it is the reason the feature works at all.** A
+holder's `sensitivity` moves that axis only — a declared token keeps the
+registry's mask (§3.3: the axes are independent, and `phone.mobile` stays
+`•• 25` however the holder marks it). For an **unregistered** token there is no
+such statement to respect: `UNREGISTERED` is one conservative answer covering
+both axes precisely because nobody had reasoned about the token, so the holder
+deciding is the decision it stood in for, and the mask follows them. Without it,
+marking your own `profile.github` as showable still drew four bullets, by a rule
+justified only by nobody having looked.
+
+**Masking follows the mask style, not the sensitivity.** They are independent
+per §3.3; `maskedFact` gated on `high` anyway, so `email.*` (`normal` /
+`emailLocal`) was called hidden by `isSensitive` and drawn in full by the
+renderer — a promised *Show* button that never appeared.
+
+**A decision does not wait for the table.** `treatmentFor` applies the holder's
+`sensitivity` first, before it looks at the registry at all — §4 rule 1 makes
+their answer win, so where they gave one there is nothing to combine and nothing
+to wait for. It used to return the fail-closed floor for a missing registry
+*before* reading the override, which meant an agent that does not implement
+`persona/claim-types/list`, or failed to answer once, silently overruled every
+choice the holder had made about their own values. The mask axis still keeps a
+*declared* token's registry mask; with no table, whether the token is declared is
+unknowable and the holder is the only evidence there is.
+
+**A missing table is not a statement about a token.** `source: "unknown"` and the
+`unknown` family exist so the screen can say *your agent has not said* rather
+than *your agent's table does not declare these* — the second is a claim about
+the tokens that nobody checked, the same error as reporting an unreadable
+context as an empty one. `persona.tsx` surfaces `registry.error` in a note (it
+used to swallow it on the reasoning that "the same agent answers both", which is
+false: they are different tasks and a live wallet listed its pool perfectly while
+serving no table), and `reloadAll` reloads it — left out, one failure kept every
+value masked for the life of the tab.
+
+**An editor may not write a value it never held.** The pane lists without
+`includeSensitive` — the point of #194 — so an existing sensitive attribute
+reaches the editor with `value: undefined`, `rawValue` turns that into `""`, and
+`attribute/put` **replaces**. Opening a withheld attribute to change its label
+or its visibility therefore wrote an empty string over a value the console had
+never seen, silently and unrecoverably: there is no `attribute/get`, no version
+history, nothing to restore from. `AttributeEditor` now fetches the value on
+open (the same one-attribute request *Show* makes) and, separately, refuses to
+save while it is neither loaded nor typed. Two mechanisms on purpose — the fetch
+is the convenience, the refusal is the property.
+
+**The holder's decision has to reach the copy, not just the original.** A claim
+inside a face or a binding carries no `sensitivity`; the decision lives on the
+pool attribute it was materialised from, above the boundary those panels sit
+below. `decidedSensitivity` matches a resolved claim's `attributeId` back to the
+pool, so "what someone would receive" answers the way the card does. An
+**inline** claim has no `attributeId` and no pool ancestor, so the registry
+answers for it — the right answer, not a gap.
+
+**What breaks it:** a control that writes `raw` without going through
+`editValue` (the guard then reads a typed value as one nobody typed); dropping
+either half of the editor's protection; rendering a claim without the pool where
+one is in hand; writing a resolved default into `sensitivity` or `release`;
+an editor that omits them and so clears them; treating absent as `normal`
+(`treatmentFor`'s `source` is the difference); extending the unregistered-mask
+rule to declared tokens; or gating a mask on `sensitivity` again.
 
 **A `release: stepUp` disclosure is refused, and the refusal is returned rather
 than thrown.** `payment.*` and `gov.*` resolve to `release: stepUp` in the
@@ -386,7 +714,7 @@ a second copy. `rp-login/step-up.ts` re-exports every name, and
 `tests/rp-login.step-up.mjs` passes unchanged, which is what says the move was
 non-breaking.
 
-**Reveal lives in `FactValue`'s own state**, per value, and nowhere else. Lifted
+**Reveal lives in `AttributeValue`'s own state**, per value, and nowhere else. Lifted
 to the pane and keyed by fact id it would be a store of "things unhidden" that
 outlives the card the person was looking at and is one refactor from a *Show
 all*. Component state cannot become that: it dies with the element, so leaving
@@ -399,12 +727,38 @@ again, or catching the refusal and rethrowing it; matching the step-up code in
 `unverifiedApproveRequest` instead of the verified `context`; dropping the
 `previewId` cross-check; moving the verify/sign half back up beside the RP
 flow; a surface that formats a value itself instead of rendering
-`FactValue` (the second surface is always the one added later, and a value
+`AttributeValue` (the second surface is always the one added later, and a value
 masked on the card and printed in the strip is masked nowhere); greying a mask
 with `c.faint`, which is this pane's word for "the agent sent no value" and so
-makes a fact the holder has look like one they do not; adding a prefix fallback
-to the vendored table; or letting a UI string imply the console does not hold
+makes a fact the holder has look like one they do not; reintroducing a compiled
+table as a fallback for a registry that has not loaded; or letting a UI string
+imply the console does not hold
 what it hides.
+
+**A listing is read to the end, and that is the client's job.** Every
+`persona/…/list` task is cursor-paginated, and the specification is explicit: a
+producer MUST NOT infer exhaustion from a short page — only an absent
+`nextCursor` means the end. `personaAttributeList`, `personaProfileList` and
+`listBindings` returned the first page and dropped the cursor, which nothing
+downstream could detect, because a short array is indistinguishable from a
+complete one: past the agent's page size (100 by default) the identity map drew
+a face pointing at attributes that were not in its own list, under counts that
+agreed with each other because they counted the same truncated array. All three
+now follow the cursor through `collectPages` (`core/src/util/pages.ts`), and
+`listBindings` returns a document with no `nextCursor` because there is nothing
+left to fetch. `limit` on those calls is the **page size to ask for**, never a
+cap on the result.
+
+**The bound throws rather than truncating.** `MAX_PAGES` guards against a far
+side that will not end — a cursor that repeats, or a pool beyond anything a
+picture can draw — and returning what had been collected would reintroduce the
+defect one layer down and with a longer array. It is set high enough (50 pages,
+25,000 records at the maximum page size) that reaching it means a fault rather
+than a large pool.
+
+**What breaks it:** reading `.attributes` / `.profiles` / `.personas` off a
+single response again; treating `limit` as a cap; or catching the bound's error
+and returning a partial list.
 
 **The console's components are rendered in tests, and this is how.**
 `tests/harness/` holds module hooks and a DOM so `node --test` can mount a
@@ -444,12 +798,177 @@ is one a person would see and a model would not.
 
 **What breaks it:** putting a pool task in `core/src/persona/` or the root
 barrel; importing `@openvtc/pnm-core/admin` from a wallet entry; testing
-`hasRole(authority, "admin")` where a persona task is concerned; relaxing the
+`hasRole(authority, "admin")`, or an empty scope list, where a persona task is
+concerned; relaxing the
 guard to allow more than `manager.js`; or deleting the presence assertion
 because it "duplicates" the exclusion one. `packages/core/tests/admin.persona.mjs`
 pins the client shapes, including the two the wire depends on: a `value` is sent
 as the JSON it is rather than wrapped in an object, and a `profileId` of `null`
 is an unbind rather than an omission.
+
+## Data rooms: custody on screen, and a second family a page may not drive
+
+`@openvtc/pnm-core/rooms` is subpath-only — deliberately **not** in the root
+barrel, the same discipline `admin/*` and the persona pool follow — and
+`manager/panes/rooms.tsx` is the one surface that uses it.
+
+**The rooms family is split across two recipients, and the split is the design.**
+`rooms/keys/*` terminates at the **member's own VTA** (their key holder) and
+`rooms/owner/*` at the **owner's**; everything else — `create`, `records/*`,
+`epoch/*` — is served by the room's **host**, which holds ciphertext it cannot
+read. `RoomsCaller` names the two parties for exactly this reason, and
+`tests/task-surface.mjs`'s `NOT_IN_SDK` records which half is which: a
+host-served verb gaining a `vta-sdk` constant would mean the boundary moved.
+
+**The pane lists key custody, and must never present it as membership.** The two
+sets differ in both directions: a room whose Welcome never arrived is absent
+though a perfectly good membership credential is held, and a VTA not yet told of
+a removal still lists a room it can read and can no longer write to. Authority is
+the host's decision, taken from credentials the room issued.
+
+**Two epochs per room, because neither alone is a diagnosis.** `epoch` behind the
+room's own means a commit was not delivered; `earliestReadableEpoch` equal to
+`epoch` means the epoch key chain has not arrived. Different repairs — and a
+member shown only "you can't read this" reads a pending delivery as lost history.
+`standing()` maps the pair to the three answers and
+`rooms-pane.render.test.mts` asserts each against the words on screen, not
+against the function.
+
+**A page may not drive `rooms/*` either**, and the owner verbs are the sharpest
+case `page-task-policy.ts` has: they mint credentials in the **room's** name, so
+one generic prompt got past an owner is a site issuing itself membership — or
+authority to admin the room — and the room would be right to honour it.
+`keys/open` returns plaintext the room withholds from its own host, and
+`keys/list` is that member's view of what they belong to. The refusal is the
+whole family because the boundary is "a page is not a member", not a judgement
+about particular verbs.
+
+**What breaks it:** exporting `rooms` from the root barrel (its URIs then reach
+the service worker); sending a `keys/*` task to the host or a host verb to the
+VTA; drawing a failed listing as an empty one ("this agent holds keys to no
+rooms" is a claim, and an agent that did not answer has made none); or rendering
+one epoch and calling it the answer.
+
+## The Mediator Lens: the relay, seen from inside
+
+`manager/panes/mediator.tsx` asks the **mediator**, not the agent. An Affinidi
+mediator serves its own operations surface — `messaging/*`: statistics, every
+account's queues, one account's messages, a live traffic monitor — as Trust
+Tasks addressed to **its own DID**, and the wallet already holds an
+authenticated session with it for each agent's inbox. The lens runs those tasks
+over that session, as that agent's holder. No new socket, no second CORS
+allowance, and no key export — the terminal equivalent (`pnm messaging
+console`) has to export the DID's secrets with `keys/export-secret` to do the
+same. `@openvtc/pnm-core/mediator` is the client, subpath-only like `admin` and
+`rooms`.
+
+**The channel is an ordinary `DidcommVtaTransport` whose "VTA" is the
+mediator**, built with no `mediator` option so there is no forward wrap: the
+authcrypt goes to the relay that terminates it. Everything else is inherited —
+the holder signs (SPEC §7.2 item 7a), the reply's proof is verified against the
+mediator's DID, and a refusal comes back typed. A mediator refuses with a DIDComm
+**problem report** threaded by `pthid` rather than a `trust-task-error`;
+`problemReportError` puts its descriptor (`authorization.admin_required`,
+`message.trust_task.proof_required`) in `details.code`, where `relayFailure`
+already reads a Trust-Task code (R3.7).
+
+**Three kinds of frame come back from the mediator on the inbox socket, and
+0.10 of `vti-didcomm-js` got all three wrong** — which is why **`^0.11.0` is the
+third correctness floor on that dependency**, beside `^0.6.2` and `^0.10.0`:
+
+- a **task reply** is *stored* in the caller's receive queue as well as pushed
+  live (the Rust SDK deletes it on receipt). 0.10 never acked a frame from the
+  mediator, so every reply stayed in the queue that carries consent requests,
+  and replayed into `onInboundMessage` on every reconnect. Measured against a
+  real mediator: seven replies left queued after one screen.
+- a **refusal** is a problem report threaded by `pthid`, which 0.10's `waitFor`
+  never matched — an 8-second hang reported as a timeout, instead of the code in
+  14 ms.
+- a **monitor batch** is live-only and unthreaded. 0.10 handed it to
+  `onMessage`, whose handler persists before acking (R1.6) — an IndexedDB write
+  and delete per second for telemetry the mediator never stored.
+
+0.11 acks threaded envelope replies (`isStoredMediatorReply`), matches a problem
+report by `pthid` (`threadOf`), and delivers mediator-originated frames to
+`onMediatorMessage`, which core exposes as `MediatorConnection.onMediatorFrame`.
+**Those frames never reach `onInbound`**, and that is safe for exactly one
+reason: they are never acked, so there is no queued copy for persist-before-ack
+to protect. A frame from any *other* sender still goes the R1.6 path.
+
+**Standing is the mediator's decision, from its own record.** `standingOf` reads
+`accountType` off `account/get`'s reply and decides only what the pane *offers*;
+the mediator authorises every task. Mediator-wide views are offered to `admin`
+and `rootAdmin`; a `standard` account sees its own queues and is told what
+promoting it would take. The account is the per-agent holder `did:key`, so
+admin standing belongs to one (relay, agent) pair — how `settings.inboxes` and
+the warm pool are keyed.
+
+**A grant is `pnm messaging grant <holder> --role admin --mediator <relay>`**,
+printed by `mediatorGrantCommand` (`grant-command.ts`) for a `standard`
+account — the holder, never the agent, and never `rootAdmin`. Before
+affinidi-messaging-mediator 0.29.2 (tdk-rs #888) a socket kept the role it
+authenticated with until its token expired (≤ 15 minutes), so a fresh grant
+was refused on the wallet's existing inbox socket — and, worse, a demotion or
+block did not reach a live socket either. Nothing in the wallet works around
+that; the mediator was fixed.
+
+**Clicking a DID opens that DID's mail**, not the relay. `MailDid`
+(`manager/mail-did.tsx`) is the console's `Did` with an `href` to
+`#mediator?did=…`; the lens resolves the DID's mediator, picks a relay the
+wallet already uses there, and draws that one account — its queues, who is
+waiting on it, what it sent that was not collected, its live traffic — through
+`account/get` / `queue/status` on its **hash**. Account rows in the lens's own
+tables link the same way by hash (`?account=…`, validated as 64 hex). Another
+account's mail needs `admin` at that relay; a standard account is shown the
+grant instead of being sent requests that would be refused. Clearing a queue is
+offered only on the wallet's own account — never behind a DID someone clicked.
+A DID in the DIDs list stays a button (it opens the DID's detail, which links
+here), and DIDs in a destructive preview stay plain text.
+
+**The release comes from `readyz`, which a browser could not read** before
+affinidi-messaging-mediator 0.29.3 (tdk-rs #889: the health routes sat outside
+the CORS layer). An unreadable release is a quiet "release not shown", never a
+warning — the lens does not need it, and a mediator that cannot serve a task
+refuses it with a code.
+
+**The lens only looks through a session the wallet already holds.**
+`mayOperateMediator` (`mediator-standing.ts`) admits an agent's inbox or a relay
+already in the warm pool for that agent, and nothing else — authenticating to a
+mediator can create an account there, so a console that could name any relay
+could establish this holder anywhere. "Where does this DID's mail go?" resolves
+a DID's `DIDCommMessaging` service and says so honestly when the wallet has no
+standing at the answer.
+
+**An allow-list sits on top of the mediator's authorisation**
+(`LENS_TASK_TYPES`, enforced in the offscreen document). Absent on purpose:
+`config/patch` and `config/reload` (they change a running mediator and need
+`rootAdmin`, which this design never grants a browser-held key — the pane shows
+config read-only), and `message/get` (the wallet can decrypt only its own mail,
+which already arrives through the inbox). The monitor is not on it either: its
+lease is owned by the offscreen document per console **Port**
+(`MEDIATOR_MONITOR_PORT`), 60 s, renewed while the port is attached and released
+when it disconnects — the mediator allows three subscriptions per account, and a
+closed tab must not hold one past a lease.
+
+**One version floor, `MEDIATOR_VERSION_FLOOR` = 0.28.36**, read from `readyz`
+— not the TDK console's gate per member. There is no older mediator anyone here
+runs.
+
+**A fourth CI guard, with two permitted files.** The mediator's operations URIs
+are banned from `dist/` except `manager.js` (composes) and the offscreen entry
+chunk (signs, holds the allow-list, owns the lease). The background forwards the
+lens op opaquely and names no task. A presence check asserts both still carry
+what they are the exception for. `page-task-policy.ts` refuses the whole
+`messaging/` prefix — the monitor is a live feed of whom the holder talks to.
+
+**What breaks it:** relaxing the `vti-didcomm-js` floor below 0.11; routing
+mediator frames through `onInbound`; acking every mediator frame (the status
+ping-pong) or none; letting the console name a relay the wallet does not already
+use; adding `config/patch` to the allow-list; a monitor lease not tied to a
+port; or the console composing a task the offscreen document then signs without
+the allow-list check. `tests/mediator-lens.test.mts`,
+`tests/mediator-pane.render.test.mts`, `packages/core/tests/mediator.ops.mjs`
+and `vti-didcomm-js`'s mediator-transport tests pin these.
 
 ## Key material never reaches a browser, and that is enforced
 
@@ -594,6 +1113,35 @@ must keep using a plain `GET` against the *same* endpoint that fails — no
 custom headers, so no preflight, and any status is a pass because reading a
 status at all proves the origin was allowed. Swapping it for a health endpoint
 would test a different policy than the one that breaks.
+
+## A consent window reports its decision before it closes (VTI-40)
+
+Every consent surface — site consent, task consent, the WebAuthn approver and
+persona disclosure — is a `confirm.html` popup, and the background reads the
+window's **removal** as a denial. The result message and `windows.onRemoved` are
+two events Chrome does not order, so a popup that sent its result and closed in
+the same tick could have an **Approve settled as a Deny**, silently (Keyring
+VTI-40). Two halves hold it, layered on purpose:
+
+- **The popup awaits the acknowledgement, then closes** (`consent-result.ts`),
+  and the background answers `sendResponse` only **after** settling
+  (`deliverConsentResult`). A popup following the protocol cannot be removed
+  before its decision lands.
+- **Close-means-deny waits `CLOSE_GRACE_MS`** (`consent-window.ts`), so a result
+  already in flight still wins. A microtask or zero timeout is not enough — the
+  result is a separate task on the worker's queue. The grace can only turn a
+  would-be denial into the decision actually sent; nothing but a result carrying
+  `approved: true` settles as approved.
+
+**Every consent window is opened through `openConsentWindow`**, which also
+settles as a denial when the window could not be opened.
+`tests/consent-window-race.test.mts` fails on a `chrome.windows.create(` or
+`chrome.windows.onRemoved` anywhere in `background.ts`.
+
+**What breaks it:** closing the popup without awaiting the send; acknowledging
+before settling, or not at all; denying on `onRemoved` without the grace; or a
+consent surface that opens its own window — the disclosure prompt did, with no
+`onRemoved` at all, and a closed one hung forever.
 
 ## Repo mechanics worth knowing before you start
 

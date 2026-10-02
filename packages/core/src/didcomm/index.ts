@@ -21,6 +21,7 @@ import {
   unpack as vtiUnpack,
   buildForward as vtiBuildForward,
   resolveX25519KeyAgreement as vtiResolveKeyAgreement,
+  resolveX25519KeyAgreementKey as vtiResolveKeyAgreementKey,
   resolveMediator as vtiResolveMediator,
   resolve as vtiResolve,
   authenticateToMediator as vtiAuthenticateToMediator,
@@ -28,6 +29,27 @@ import {
   x25519,
   jwk as vtiJwk,
 } from "@openvtc/vti-didcomm-js";
+import type { NetPolicy } from "@openvtc/vti-didcomm-js/net-guard";
+
+/**
+ * Egress policy for endpoints this wallet did not choose: the REST, auth and
+ * WebSocket URLs a mediator's DID document advertises, and a VTA's REST base.
+ *
+ * Every field defaults to the strict setting, so a caller that passes nothing
+ * gets https/wss on a public host — which is what makes an omitted policy safe
+ * rather than merely untested. Two opt-outs exist, and since
+ * `@openvtc/vti-didcomm-js` 0.8 they are independent: `allowInsecure` admits
+ * `http:`/`ws:` and nothing else, so a mediator on `http://localhost` needs
+ * `allowPrivate` as well. `allowHosts` narrows to named hosts.
+ *
+ * A refusal is a `BlockedEndpointError` carrying `code: "E_BLOCKED_ENDPOINT"`
+ * — match on that, never on the message ({@link isBlockedEndpointError}).
+ */
+export type { NetPolicy } from "@openvtc/vti-didcomm-js/net-guard";
+
+/** A DID resolver, in the shape the library's `resolve` option takes.
+ *  Injectable so a test can prove a refused endpoint is never dialed. */
+type DidDocumentResolver = (did: string) => Promise<{ didDocument?: unknown }>;
 
 export type DidcommCurve = "X25519" | "P-256" | "secp256k1";
 
@@ -149,7 +171,13 @@ export type UnpackResult =
       kind: "encrypted";
       message: Record<string, unknown>;
       authenticated: boolean;
+      /** The authcrypt sender key id (`skid`). Absent for anoncrypt. */
       sender_kid?: string;
+      /** The DID of `sender_kid` — the sender the envelope authenticated,
+       *  and the identity to authorise on. Absent for anoncrypt. The library
+       *  (vti-didcomm-js >=0.12) refuses an authcrypt message whose `from` is
+       *  not this DID, but `message.from` remains sender-written plaintext. */
+      sender_did?: string;
       recipient_kid: string;
     }
   | {
@@ -325,6 +353,7 @@ export async function unpackMessage(
     recipient_kid: recipientKid,
   };
   if (result.senderKid) out.sender_kid = result.senderKid;
+  if (result.senderDid) out.sender_did = result.senderDid;
   return out;
 }
 
@@ -380,18 +409,24 @@ export interface ResolvedMediatorEndpoint extends ResolvedKeyAgreement {
 
 /**
  * Resolve a mediator DID to its key-agreement material + transport
- * endpoints. Refuses plaintext (`ws://`/`http://`) endpoints unless
- * `allowInsecure` is set (local dev only) — a tampered/stale DID
- * document must not be able to downgrade the transport. Throws if the
- * mediator advertises no WebSocket endpoint, since the bridge needs one
- * for live delivery.
+ * endpoints.
+ *
+ * The endpoints come out of a document this wallet did not write, so each one
+ * is checked before anything is dialed ({@link NetPolicy}): https/wss only, no
+ * credentials in the URL, and no loopback, private, link-local, CGNAT or
+ * local-only host. A tampered or stale document therefore cannot downgrade the
+ * transport *or* point the wallet at a machine on the user's own network.
+ *
+ * Throws if the mediator advertises no WebSocket endpoint, since the bridge
+ * needs one for live delivery.
  */
 export async function resolveMediatorEndpoint(
   mediatorDid: string,
-  options: { allowInsecure?: boolean } = {},
+  options: { netPolicy?: NetPolicy; resolve?: DidDocumentResolver } = {},
 ): Promise<ResolvedMediatorEndpoint> {
   const m = await vtiResolveMediator(mediatorDid, {
-    allowInsecure: options.allowInsecure ?? false,
+    ...(options.netPolicy ? { netPolicy: options.netPolicy } : {}),
+    ...(options.resolve ? { resolve: options.resolve } : {}),
   });
   if (!m.wsEndpoint) {
     throw new Error(
@@ -495,10 +530,11 @@ export async function resolveVtaServices(did: string): Promise<VtaServices> {
 // in vta/ never imports the library directly.
 // ---------------------------------------------------------------------------
 
-// The library's mediator-auth `.d.ts` is abbreviated (its `mediator`
-// return omits `did`/`x25519Pub`; its args omit `allowInsecure`), though
-// the runtime provides both. Re-type accurately here so the rest of the
-// file stays cast-free.
+// The library types `mediator.wsEndpoint` as nullable, because a mediator may
+// advertise none. This facade requires one — live delivery is the wallet's
+// whole inbound path — and `MediatorSession` refuses a missing endpoint on
+// construction anyway, since its egress check runs on that URL. So the cast
+// narrows the type rather than hiding a case.
 interface VtiResolvedMediator {
   did: string;
   restEndpoint: string;
@@ -514,7 +550,8 @@ const authenticateToMediator = vtiAuthenticateToMediator as unknown as (args: {
   clientX25519Public: Uint8Array;
   clientKid?: string;
   fetch?: typeof fetch;
-  allowInsecure?: boolean;
+  netPolicy?: NetPolicy;
+  resolve?: DidDocumentResolver;
 }) => Promise<{ accessToken: string; mediator: VtiResolvedMediator }>;
 
 /** WebSocket constructor compatible with the library session (the
@@ -525,13 +562,31 @@ export type WebSocketCtor = new (
 ) => unknown;
 
 /**
+ * The sender an inbound DIDComm message was authenticated as: the DID and key
+ * id of the authcrypt envelope's sender key (`skid`). This — not the message's
+ * `from`, which the sender writes itself — is who sent it.
+ */
+export interface InboundSender {
+  readonly did: string;
+  readonly kid: string;
+}
+
+/**
  * A live, authenticated mediator session plus the resolved endpoints
  * the DIDComm transport needs. `waitFor` resolves with the decrypted,
  * sender-authenticated reply correlated by `thid`.
  */
 export interface MediatorConnection {
   send(jwe: string): void;
-  waitFor(thid: string, timeoutMs: number): Promise<Record<string, unknown>>;
+  /** Resolve with the reply threaded to `thid`. Given `from`, only a reply
+   *  whose envelope authenticated it as that DID (or one of those DIDs) is
+   *  accepted: a thread id is a message id this wallet sent through the
+   *  mediator, not a secret. */
+  waitFor(
+    thid: string,
+    timeoutMs: number,
+    options?: { from?: string | readonly string[] },
+  ): Promise<Record<string, unknown>>;
   /** Send a raw TSP message (qb2 bytes) over the SAME socket as DIDComm. The
    *  mediator sniffs the 0xF8 magic and routes it to its TSP handler — so TSP
    *  and DIDComm share one socket per holder DID (no second socket, so no
@@ -572,9 +627,16 @@ export interface MediatorConnection {
    *  mediator would redeliver throughout.
    *
    *  Delivery is at-least-once: the same message can arrive again after a
-   *  reconnect, so handlers must de-duplicate. */
+   *  reconnect, so handlers must de-duplicate.
+   *
+   *  `sender` is who the envelope authenticated. Authorise on `sender.did`,
+   *  never on `message.from`. */
   onInbound(
-    handler: (message: Record<string, unknown>, thid: string) => void | Promise<void>,
+    handler: (
+      message: Record<string, unknown>,
+      thid: string,
+      sender: InboundSender,
+    ) => void | Promise<void>,
   ): void;
   /** Register a handler for inbound **TSP** frames no waiter claimed — the
    *  executor-initiated requests (`task-consent`, step-up) that arrive over
@@ -590,6 +652,18 @@ export interface MediatorConnection {
    *  stored — not when the work is finished. A throw withholds the ack and the
    *  mediator redelivers, so handlers must de-duplicate. */
   onInboundTsp(handler: (bytes: Uint8Array) => void | Promise<void>): void;
+  /** Listen for frames the **mediator itself** sent that no waiter claimed —
+   *  traffic-monitor batches, and replies whose waiter already gave up.
+   *  Returns an unsubscribe function. Any number may listen.
+   *
+   *  These never reach {@link onInbound}. That handler persists everything it
+   *  is given before the ack (R1.6), which is right for mail from a peer and
+   *  wrong for telemetry arriving once a second — and the mediator's frames
+   *  need no such protection: a monitor batch is never stored, so there is no
+   *  queued copy for an ack to delete (vti-didcomm-js >=0.11.0). */
+  onMediatorFrame(
+    listener: (message: Record<string, unknown>) => void,
+  ): () => void;
   /** Resolved VTA key-agreement endpoint (inner authcrypt target). */
   vta: ResolvedKeyAgreement;
   /** Resolved mediator key-agreement endpoint (forward-envelope target). */
@@ -621,8 +695,14 @@ export interface ConnectMediatorSessionOptions {
   fetch?: typeof fetch;
   /** WebSocket ctor (defaults to globalThis.WebSocket). */
   webSocketImpl?: WebSocketCtor;
-  /** Allow ws://, http:// endpoints. Local dev only. */
-  allowInsecure?: boolean;
+  /** Egress policy for the endpoints the mediator's DID document advertises —
+   *  REST, auth and WebSocket. Strict by default (https/wss, public hosts); a
+   *  dev build pointed at a mediator on localhost needs **both**
+   *  `allowInsecure` and `allowPrivate`. See {@link NetPolicy}. */
+  netPolicy?: NetPolicy;
+  /** DID resolver override. A test seam, named as in `verifyDid`: it lets a
+   *  test prove that a refused endpoint is never dialed. */
+  resolve?: DidDocumentResolver;
   /** Called once if the socket drops unexpectedly (not via `close()`).
    *  A warm-session holder uses this to evict + reconnect. */
   onClose?: () => void;
@@ -653,16 +733,19 @@ export async function connectMediatorSession(
     clientX25519Private: clientPrivate,
     clientX25519Public: clientPublic,
     clientKid: opts.holder.kid,
-    allowInsecure: opts.allowInsecure ?? false,
+    ...(opts.netPolicy ? { netPolicy: opts.netPolicy } : {}),
+    ...(opts.resolve ? { resolve: opts.resolve } : {}),
     ...(opts.fetch ? { fetch: opts.fetch } : {}),
   });
 
   const vta = await resolveKeyAgreement(opts.vtaDid);
 
   // Seed the VTA's key so its replies unpack by skid; resolve any other
-  // sender on demand.
-  const senderKeys = new Map<string, { publicJwk: PublicJwk }>([
-    [opts.vtaDid, { publicJwk: vta.keyAgreementPublicJwk }],
+  // sender on demand. Each key carries its full id: the library selects the
+  // sender key by the exact `skid` (vti-didcomm-js >=0.12), so the key id it
+  // reports is the one the envelope was authenticated with.
+  const senderKeys = new Map<string, { kid: string; publicJwk: PublicJwk }>([
+    [opts.vtaDid, { kid: vta.keyAgreementKid, publicJwk: vta.keyAgreementPublicJwk }],
   ]);
 
   // FIFO queue of TSP-reply waiters. A TSP frame the mediator multiplexes onto
@@ -676,6 +759,7 @@ export async function connectMediatorSession(
     timer: ReturnType<typeof setTimeout>;
   }> = [];
   let inboundTspHandler: ((bytes: Uint8Array) => void | Promise<void>) | undefined;
+  const mediatorListeners = new Set<(message: Record<string, unknown>) => void>();
   const rejectTspWaiters = (err: Error) => {
     while (tspWaiters.length) {
       const w = tspWaiters.shift()!;
@@ -694,9 +778,11 @@ export async function connectMediatorSession(
       publicKey: clientPublic,
     },
     senderKeys,
-    resolveSender: async (did: string) => {
-      const r = await vtiResolveKeyAgreement(did);
-      return { publicJwk: x25519PublicJwk(r.x25519Pub) };
+    // Called with the frame's `skid`; returns that exact keyAgreement key of
+    // the DID, or throws.
+    resolveSender: async (did: string, skid: string) => {
+      const r = await vtiResolveKeyAgreementKey(did, skid);
+      return { kid: r.kid, publicJwk: x25519PublicJwk(r.x25519Pub) };
     },
     // Awaited by the transport before it acks (vti-didcomm-js >=0.7.0), so
     // everything this does happens while the mediator still holds its copy —
@@ -729,6 +815,23 @@ export async function connectMediatorSession(
       // Awaited so a handler that persists finishes before the ack.
       if (inboundTspHandler) await inboundTspHandler(bytes);
     },
+    // Frames from the mediator's own DID go to their listeners and never to
+    // `onMessage`, whose handler persists before acking. A throwing listener
+    // is isolated so one bad consumer cannot starve the rest.
+    onMediatorMessage: (message: object) => {
+      for (const l of mediatorListeners) {
+        try {
+          l(message as Record<string, unknown>);
+        } catch (err) {
+          console.warn("[mediator] a mediator-frame listener threw:", err);
+        }
+      }
+    },
+    // The same policy the auth handshake ran under. The session checks
+    // `wsEndpoint` when it is constructed and again before every socket open,
+    // so a document whose WebSocket URL names a private host is refused here
+    // instead of being handed this wallet's mediator JWT.
+    ...(opts.netPolicy ? { netPolicy: opts.netPolicy } : {}),
     ...(opts.onClose ? { onClose: opts.onClose } : {}),
     ...(opts.webSocketImpl ? { WebSocketImpl: opts.webSocketImpl } : {}),
   });
@@ -737,8 +840,10 @@ export async function connectMediatorSession(
   const liveSession = session as unknown as { isOpen: boolean };
   return {
     send: (jwe: string) => session.send(jwe),
-    waitFor: (thid: string, timeoutMs: number) =>
-      session.waitFor(thid, timeoutMs) as Promise<Record<string, unknown>>,
+    waitFor: async (thid, timeoutMs, options) => {
+      const { message } = await session.waitFor(thid, timeoutMs, options?.from ? { from: options.from } : {});
+      return message as Record<string, unknown>;
+    },
     sendBinary: (bytes: Uint8Array) => session.sendBinary(bytes),
     awaitTspFrame: (timeoutMs: number, claims: TspFrameClaim) =>
       new Promise<Uint8Array>((resolve, reject) => {
@@ -764,6 +869,12 @@ export async function connectMediatorSession(
     },
     onInboundTsp: (handler) => {
       inboundTspHandler = handler;
+    },
+    onMediatorFrame: (listener) => {
+      mediatorListeners.add(listener);
+      return () => {
+        mediatorListeners.delete(listener);
+      };
     },
     vta,
     mediator: {

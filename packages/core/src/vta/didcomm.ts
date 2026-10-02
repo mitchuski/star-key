@@ -15,7 +15,13 @@ import {
   type RevokePayload,
   type TrustTask,
 } from "./protocol.js";
-import { buildTrustTask, parseTrustTaskReply, signOutboundTask } from "./trust-task.js";
+import {
+  buildTrustTask,
+  coerceTrustTaskCode,
+  parseTrustTaskReply,
+  signOutboundTask,
+  verifyTrustTaskReply,
+} from "./trust-task.js";
 import { asTaskSigner, type ChannelSigner, type TaskSigner } from "./trust-task.js";
 import type { SigningIdentity } from "../siop/self-issued.js";
 import type { NotifyOpts, SendOpts, TrustTaskChannel } from "./channel.js";
@@ -26,6 +32,7 @@ import type {
   EnrollmentSubmitResponse,
   PasskeyList,
 } from "./types.js";
+import { clientBudgetMs } from "./budget.js";
 
 export interface RemoteDidcommEndpoint {
   did: string;
@@ -54,6 +61,40 @@ export interface DidcommVtaTransportOptions {
 }
 
 const DEFAULT_TIMEOUT_MS = 30_000;
+
+/** DIDComm's problem report: how a mediator refuses a request addressed to it. */
+export const PROBLEM_REPORT_TYPE = "https://didcomm.org/report-problem/2.0/problem-report";
+
+/**
+ * Turn a DIDComm problem report into the typed error a Trust-Task refusal
+ * would have been.
+ *
+ * A mediator refuses a Trust Task addressed to *itself* with a problem report
+ * rather than a `trust-task-error` document, threaded to the request by
+ * `pthid`. Its `code` is `<sorter>.<scope>.<descriptor>` — `e.p.permissionDenied`,
+ * `e.p.message.trust_task.proof_required` — and the descriptor is the stable
+ * part (R3.7): it lands in `details.code`, exactly where a Trust-Task refusal's
+ * own code goes, so one reader handles both. The sorter and scope are DIDComm's
+ * framing and are kept verbatim in `details.details.problemCode`.
+ */
+export function problemReportError(message: {
+  body?: unknown;
+}): VtaClientError {
+  const body = (message.body ?? {}) as { code?: unknown; comment?: unknown; args?: unknown };
+  const problemCode = typeof body.code === "string" ? body.code : "";
+  const descriptor = problemCode.split(".").slice(2).join(".") || problemCode;
+  const comment = typeof body.comment === "string" && body.comment ? body.comment : problemCode;
+  return new VtaClientError(coerceTrustTaskCode(descriptor), comment || "refused", {
+    details: {
+      code: descriptor,
+      message: comment,
+      details: {
+        problemCode,
+        ...(Array.isArray(body.args) ? { args: body.args } : {}),
+      },
+    },
+  });
+}
 
 /**
  * VTA transport over DIDComm v2 — the DIDComm {@link TrustTaskChannel}.
@@ -135,9 +176,27 @@ export class DidcommVtaTransport implements VtaTransport, TrustTaskChannel {
 
     // The bridge returns the decrypted, sender-authenticated reply (it
     // owns unpacking; only authenticated authcrypt frames are surfaced).
+    // Only the VTA we addressed — or the mediator we handed the forward to,
+    // refusing that hop — may answer this request.
     const msg = await this.bridge.sendAndAwaitReply(outer, requestId, {
-      timeoutMs: opts.timeoutMs ?? this.timeoutMs,
+      timeoutMs: clientBudgetMs(envelope.type, opts.timeoutMs ?? this.timeoutMs),
+      from: this.mediator ? [this.vta.did, this.mediator.did] : [this.vta.did],
     });
+    // A refusal. The bridge matched it by `pthid` to this request (a problem
+    // report opens its own thread). Two parties may refuse it: the one we
+    // addressed, and the relay we handed the forward to — a mediator that will
+    // not carry a message says so on the hop it refused. Anyone else's report
+    // is not an answer to this call.
+    if (msg.type === PROBLEM_REPORT_TYPE) {
+      const from = typeof msg.from === "string" ? msg.from : undefined;
+      if (!from || (from !== this.vta.did && from !== this.mediator?.did)) {
+        throw new VtaClientError(
+          "e.p.msg.unauthorized",
+          `problem report from ${msg.from ?? "(none)"} != ${this.vta.did}`,
+        );
+      }
+      throw problemReportError(msg);
+    }
     if (msg.type !== TRUST_TASK_ENVELOPE_TYPE) {
       throw new VtaClientError(
         "e.client.parse",
@@ -165,6 +224,13 @@ export class DidcommVtaTransport implements VtaTransport, TrustTaskChannel {
     // The binding envelope has already vouched for the message, so accept any
     // non-error response type unless the caller pinned an expectedResponseType.
     const doc = (msg.body ?? {}) as TrustTask<unknown>;
+    // The authcrypt envelope already proved the sender, and the check above
+    // binds it to this VTA — but the envelope attests to the *transport*, not
+    // to the document. A relay that could pack for us could still hand us a
+    // body we did not get from the agent, and the document's own proof is what
+    // closes that.
+    await verifyTrustTaskReply(doc ?? {}, this.vta.did);
+
     return parseTrustTaskReply<Res>(doc, {
       ...(opts.expectedResponseType !== undefined
         ? { expectedResponseType: opts.expectedResponseType }

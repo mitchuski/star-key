@@ -10,8 +10,11 @@ import assert from "node:assert/strict";
 
 import {
   disclosureStepUpRequiredFrom,
+  disclosureStepUpFrom,
+  disclosureApprovalPayload,
   verifyDisclosureStepUp,
   approveDisclosureStepUp,
+  buildStepUpApproval,
   DISCLOSURE_STEP_UP_REQUIRED_CODE,
   VtaClientError,
   generateSigningIdentity,
@@ -25,6 +28,7 @@ const enrolled = { enrolledExecutorDids: [AGENT.did] };
 
 const PREVIEW = "01J0000000000000000000000A";
 const AUTHZ_EXT = "org.openvtc.authorization-context";
+const CONTEXT_TYPE = "https://openvtc.org/persona/authorization-context/0.1";
 
 /** The agent-signed approve-request the refusal carries. */
 async function approveRequest({ as = AGENT, previewId = PREVIEW, ctx = {} } = {}) {
@@ -38,20 +42,27 @@ async function approveRequest({ as = AGENT, previewId = PREVIEW, ctx = {} } = {}
       subject: "did:key:zHolder",
       sessionId: "sess-42",
       challenge: "a".repeat(32),
-      reason: "Approve disclosing 1 fact to did:key:zVerifier",
+      reason: "Approve disclosing 1 attribute to did:key:zVerifier",
       ext: {
         [AUTHZ_EXT]: {
-          operation: "persona/disclosure/present",
-          previewId,
-          verifierDid: "did:key:zVerifier",
-          claimTypes: ["payment.card"],
-          purpose: "checkout",
+          type: CONTEXT_TYPE,
+          summary: "Approve disclosing 1 attribute to did:key:zVerifier",
+          risk: "high",
+          action: {
+            kind: "disclose",
+            previewId,
+            verifierDid: "did:key:zVerifier",
+            claimTypes: ["payment.card"],
+            purpose: "checkout",
+          },
           ...ctx,
         },
       },
     },
   };
-  await signTrustTask({ envelope: document, signing: as });
+  // `authentication`, as the agent signs it: a request is its issuer's
+  // operational message.
+  await signTrustTask({ envelope: document, signing: as, proofPurpose: "authentication" });
   return document;
 }
 
@@ -129,6 +140,7 @@ test("what the holder is shown comes out of the signature", async () => {
   assert.deepEqual(res.context.claimTypes, ["payment.card"]);
   assert.equal(res.context.verifierDid, "did:key:zVerifier");
   assert.equal(res.context.purpose, "checkout");
+  assert.equal(res.context.summary, "Approve disclosing 1 attribute to did:key:zVerifier");
   assert.equal(res.request.challenge, "a".repeat(32));
 });
 
@@ -152,7 +164,16 @@ test("the signed previewId must be the one the refusal named", async () => {
     refusal({
       previewId: PREVIEW,
       previewRetained: true,
-      approveRequest: await approveRequest({ previewId: "01JSOMETHINGELSE00000000AA" }),
+      approveRequest: await approveRequest({
+        ctx: {
+          action: {
+            kind: "disclose",
+            previewId: "01JSOMETHINGELSE00000000AA",
+            verifierDid: "did:key:zVerifier",
+            claimTypes: ["payment.card"],
+          },
+        },
+      }),
     }),
   );
   const res = await verifyDisclosureStepUp(seen, enrolled);
@@ -168,7 +189,7 @@ test("a tampered context does not survive the proof", async () => {
   const doc = await approveRequest();
   // Add a claim type after signing — the shape of an attacker widening what
   // the holder believes they are approving.
-  doc.payload.ext[AUTHZ_EXT].claimTypes.push("gov.passport");
+  doc.payload.ext[AUTHZ_EXT].action.claimTypes.push("gov.passport");
   const seen = disclosureStepUpRequiredFrom(
     refusal({ previewId: PREVIEW, previewRetained: true, approveRequest: doc }),
   );
@@ -198,4 +219,151 @@ test("the approval is a signed approve-response the agent can verify", async () 
   assert.equal(approval.recipient, AGENT.did, "the approval is not bound to the agent as audience");
   const proof = await verifyTrustTaskProof(approval, { expectedProofPurpose: "assertionMethod" });
   assert.equal(proof.verified, true, proof.reason ?? "");
+});
+
+test("a context for some other operation is not read as a disclosure", async () => {
+  // Every authorization context travels under the same `ext` key — a Cierge
+  // share ask included. Without the `type` check, one of those would be shown
+  // to the holder in a disclosure's words, and its `action` read for claim
+  // types it never had.
+  const doc = await approveRequest({
+    ctx: {
+      type: "https://openvtc.org/cierge/authorization-context/0.1",
+      action: { kind: "share", from: "finance", to: "travel" },
+    },
+  });
+  const seen = disclosureStepUpRequiredFrom(
+    refusal({ previewId: PREVIEW, previewRetained: true, approveRequest: doc }),
+  );
+  const res = await verifyDisclosureStepUp(seen, enrolled);
+  assert.equal(res.ok, false, "a share ask was accepted as a disclosure approval");
+  assert.match(res.reason, /not a disclosure/);
+});
+
+test("an action of another kind under the same context type is refused", async () => {
+  // `type` and `kind` answer different questions — which producer's vocabulary,
+  // and which action within it. A second `kind` added under the persona type is
+  // the case this exists for: without the check it would be read as a
+  // disclosure, its fields mined for claim types it never had, and shown to the
+  // holder in a disclosure's words.
+  const doc = await approveRequest({
+    ctx: {
+      action: { kind: "revoke", previewId: PREVIEW, claimTypes: ["payment.card"] },
+    },
+  });
+  const seen = disclosureStepUpRequiredFrom(
+    refusal({ previewId: PREVIEW, previewRetained: true, approveRequest: doc }),
+  );
+  const res = await verifyDisclosureStepUp(seen, enrolled);
+  assert.equal(res.ok, false, "an action of another kind was approved as a disclosure");
+  assert.match(res.reason, /not a disclosure/);
+});
+
+test("an action with no kind at all is refused", async () => {
+  // The shape a producer that forgot the discriminator emits. Absence is not
+  // permission.
+  const doc = await approveRequest({
+    ctx: { action: { previewId: PREVIEW, claimTypes: ["payment.card"] } },
+  });
+  const seen = disclosureStepUpRequiredFrom(
+    refusal({ previewId: PREVIEW, previewRetained: true, approveRequest: doc }),
+  );
+  const res = await verifyDisclosureStepUp(seen, enrolled);
+  assert.equal(res.ok, false, "an action with no kind was approved as a disclosure");
+});
+
+test("the disclosure approval is minted as 0.3, and rp-login's is not", async () => {
+  // The split this wallet has to hold: it answers TWO relying parties with
+  // different capabilities. The agent accepts 0.3 (VTI #1316); the did-hosting
+  // control plane does not. Getting it wrong is silent in both directions —
+  // too low and a bound approval needlessly elevates a session, too high and
+  // every step-up against that party is refused as an unsupported type.
+  const seen = disclosureStepUpRequiredFrom(
+    refusal({ previewId: PREVIEW, previewRetained: true, approveRequest: await approveRequest() }),
+  );
+  const verified = await verifyDisclosureStepUp(seen, enrolled);
+  assert.ok(verified.ok);
+
+  const holder = generateSigningIdentity();
+  const disclosure = await approveDisclosureStepUp({
+    signing: holder,
+    agentDid: AGENT.did,
+    request: verified.request,
+    approved: true,
+  });
+  assert.equal(
+    disclosure.type,
+    "https://trusttasks.org/spec/auth/step-up/approve-response/0.3",
+    "a bound disclosure approval must be minted 0.3, or the agent answers `elevated` and the \
+     session is raised on the strength of a decision about one card number",
+  );
+
+  // The same builder, answering the did-hosting control plane, mints 0.5.
+  const rp = await buildStepUpApproval({
+    signing: holder,
+    rpDid: "did:web:rp.example",
+    request: verified.request,
+    approved: true,
+    responseVersion: "0.5",
+  });
+  assert.equal(
+    rp.type,
+    "https://trusttasks.org/spec/auth/step-up/approve-response/0.5",
+    "the version must be per relying party, not a property of the builder",
+  );
+
+  // Both verify as the holder's attestation.
+  for (const doc of [disclosure, rp]) {
+    const proof = await verifyTrustTaskProof(doc, { expectedProofPurpose: "assertionMethod" });
+    assert.equal(proof.verified, true, proof.reason ?? "");
+  }
+});
+
+test("a refusal that was not thrown is recognised the same way", () => {
+  // The wallet dispatches this task itself, so the agent's refusal arrives as
+  // `{code, details}` fields rather than inside an exception. One rule, two
+  // entry points — a second implementation would be the same three checks
+  // written twice and would drift on the third change, not the first.
+  const seen = disclosureStepUpFrom(DISCLOSURE_STEP_UP_REQUIRED_CODE, {
+    previewId: PREVIEW,
+    previewRetained: true,
+    approveRequest: { type: "x", payload: {} },
+  });
+  assert.ok(seen);
+  assert.equal(seen.previewId, PREVIEW);
+  assert.equal(seen.previewRetained, true);
+
+  // And the same strictness: without a previewId there is nothing to present
+  // again, without an approve-request nothing to approve.
+  assert.equal(disclosureStepUpFrom(DISCLOSURE_STEP_UP_REQUIRED_CODE, { previewId: PREVIEW }), null);
+  assert.equal(disclosureStepUpFrom("taskFailed", { previewId: PREVIEW, approveRequest: {} }), null);
+  assert.equal(disclosureStepUpFrom(undefined, undefined), null, "a success is not a refusal");
+});
+
+test("the approval echoes only what the verified request said", async () => {
+  const seen = disclosureStepUpRequiredFrom(
+    refusal({ previewId: PREVIEW, previewRetained: true, approveRequest: await approveRequest() }),
+  );
+  const verified = await verifyDisclosureStepUp(seen, enrolled);
+  assert.ok(verified.ok);
+
+  const payload = disclosureApprovalPayload(verified.request, true);
+  assert.equal(payload.subject, "did:key:zHolder");
+  assert.equal(payload.sessionId, "sess-42");
+  assert.equal(payload.challenge, "a".repeat(32));
+  assert.equal(payload.decision, "approved");
+
+  // No proof of its own, deliberately: this goes as an ordinary Trust Task and
+  // the channel signs it as the holder with `assertionMethod`, which IS the
+  // gate. A second proof here would duplicate or overwrite that one.
+  assert.equal("proof" in payload, false);
+  assert.equal("type" in payload, false, "a payload, not a document");
+});
+
+test("a denial is expressible, and says so rather than staying silent", () => {
+  const payload = disclosureApprovalPayload(
+    { subject: "did:key:zHolder", sessionId: "s", challenge: "c".repeat(32) },
+    false,
+  );
+  assert.equal(payload.decision, "denied");
 });
