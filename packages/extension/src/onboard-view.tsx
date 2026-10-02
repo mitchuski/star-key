@@ -724,7 +724,7 @@ export function OnboardView({
                     both — with "create it" ticked, the second becomes the
                     first context. */}
                 <input
-                  placeholder="ctx_… (e.g. work, alpha)"
+                  placeholder="ctx_… (e.g. swordsman, mage)"
                   value={homeContext}
                   onChange={(e) => setHomeContext(e.target.value)}
                   aria-label="Home context"
@@ -824,10 +824,10 @@ export function OnboardView({
       <label style={{ display: "grid", gap: 5 }}>
         <span style={{ fontSize: t.sm, fontWeight: 600 }}>Agent address</span>
         <span style={{ fontSize: t.xs, color: c.muted }}>
-          A name like <code>webvh.storm.ws/@glenn-vta</code>, or the full <code>did:webvh:…</code>
+          A name like <code>webvh.mages.city/@swordsman</code> or <code>webvh.mages.city/@mage</code>, or the full <code>did:webvh:…</code>
         </span>
         <input
-          placeholder="webvh.storm.ws/@your-agent"
+          placeholder="webvh.mages.city/@mage"
           value={vtaDid}
           onChange={(e) => setVtaDid(e.target.value)}
           aria-label="Agent address"
@@ -946,7 +946,7 @@ export function OnboardView({
               same one in the command on the next screen.
             </span>
             <input
-              placeholder="ctx_… (e.g. work, alpha)"
+              placeholder="ctx_… (e.g. swordsman, mage)"
               value={homeContext}
               onChange={(e) => setHomeContext(e.target.value)}
               aria-label="Home context"

@@ -20,6 +20,7 @@ import { getSettings, inboxFor, setInbox as setInboxRecord } from "./config.js";
 import { readActiveHolderDid } from "./active-vta.js";
 import { encryptHolderSecretInPopup } from "./encrypt-holder.js";
 import { OnboardView } from "./onboard-view.js";
+import { SetupStar, type StarStepState } from "./setup-star.js";
 import { useAgentNames } from "./use-agent-names.js";
 import {
   displayHostFor,
@@ -243,6 +244,14 @@ export function SetupPane() {
             : "Four steps. The order matters — each one depends on the last."
         }
       >
+        <SetupStar
+          steps={[
+            connected ? "done" : "now",
+            connected ? "done" : "pending",
+            !connected ? "pending" : encrypted ? "done" : "now",
+            connected ? "done" : "pending",
+          ] satisfies StarStepState[]}
+        />
         <div style={{ display: "grid", marginTop: 4 }}>
           <Step n={1} state={connected ? "done" : "now"} title="Your trust agent">
             {connection ? (
