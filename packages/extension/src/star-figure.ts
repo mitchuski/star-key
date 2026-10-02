@@ -107,7 +107,7 @@ export function createStarFigure(
   const ctx = canvas.getContext("2d");
   if (!ctx) return { setLayers() {}, setSpinning() {}, isSpinning: () => false, destroy() {} };
   const reduce = typeof matchMedia === "function" && matchMedia("(prefers-reduced-motion: reduce)").matches;
-  const HOME = { yaw: 0.62, pitch: 0.42 };
+  const HOME = { yaw: 1.2, pitch: 0.8 }; // same still as public/icon.svg (scripts/star-icon.mjs)
   let yaw = HOME.yaw, pitch = HOME.pitch, spinning = !reduce && opts.spinning !== false;
   let layers: Layers = {};
   let shown: Record<LayerId, number> = { field: 0, sword: 0, mage: 0, routes: 0, core: 0, hold: 0, invite: 0 };
