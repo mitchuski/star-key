@@ -24,8 +24,14 @@ export type Layers = Partial<Record<LayerId, LayerState>>;
 
 export interface StarFigure {
   setLayers(layers: Layers): void;
+  /** Turn or hold still. Dragging works either way. */
+  setSpinning(on: boolean): void;
+  isSpinning(): boolean;
   destroy(): void;
 }
+
+/** One turn about every 25 seconds — slow enough to read, quick enough to see it is solid. */
+const SPIN_RAD_PER_MS = (Math.PI * 2) / 25000;
 
 type V3 = [number, number, number];
 
@@ -94,15 +100,18 @@ const sub = (a: V3, b: V3): V3 => [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
 const cross = (a: V3, b: V3): V3 => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
 const norm = (a: V3): V3 => { const l = Math.hypot(...a) || 1; return [a[0] / l, a[1] / l, a[2] / l]; };
 
-export function createStarFigure(canvas: HTMLCanvasElement, opts: { interactive?: boolean } = {}): StarFigure {
+export function createStarFigure(
+  canvas: HTMLCanvasElement,
+  opts: { interactive?: boolean; spinning?: boolean; onSpinChange?: (on: boolean) => void } = {},
+): StarFigure {
   const ctx = canvas.getContext("2d");
-  if (!ctx) return { setLayers() {}, destroy() {} };
+  if (!ctx) return { setLayers() {}, setSpinning() {}, isSpinning: () => false, destroy() {} };
   const reduce = typeof matchMedia === "function" && matchMedia("(prefers-reduced-motion: reduce)").matches;
   const HOME = { yaw: 0.62, pitch: 0.42 };
-  let yaw = HOME.yaw, pitch = HOME.pitch, spin = reduce ? 0 : 0.0016;
+  let yaw = HOME.yaw, pitch = HOME.pitch, spinning = !reduce && opts.spinning !== false;
   let layers: Layers = {};
   let shown: Record<LayerId, number> = { field: 0, sword: 0, mage: 0, routes: 0, core: 0, hold: 0, invite: 0 };
-  let raf = 0, dragging = false, lx = 0, ly = 0, w = 0, h = 0, dpr = 1, t0 = performance.now();
+  let raf = 0, dragging = false, moved = 0, lx = 0, ly = 0, w = 0, h = 0, dpr = 1, t0 = performance.now();
 
   const fit = () => {
     const r = canvas.getBoundingClientRect();
@@ -159,7 +168,7 @@ export function createStarFigure(canvas: HTMLCanvasElement, opts: { interactive?
 
   function frame(now: number) {
     const dt = Math.min(64, now - t0); t0 = now;
-    if (!dragging) yaw += spin * dt;
+    if (!dragging && spinning) yaw += SPIN_RAD_PER_MS * dt;
     for (const id of Object.keys(shown) as LayerId[]) {
       const target = layers[id]?.level ?? 0;
       shown[id] += (target - shown[id]) * (reduce ? 1 : Math.min(1, dt / 260));
@@ -213,14 +222,17 @@ export function createStarFigure(canvas: HTMLCanvasElement, opts: { interactive?
     raf = requestAnimationFrame(frame);
   }
 
-  const onDown = (e: PointerEvent) => { dragging = true; lx = e.clientX; ly = e.clientY; canvas.setPointerCapture(e.pointerId); };
+  const onDown = (e: PointerEvent) => { dragging = true; moved = 0; lx = e.clientX; ly = e.clientY; canvas.setPointerCapture(e.pointerId); };
   const onMove = (e: PointerEvent) => {
     if (!dragging) return;
+    moved += Math.abs(e.clientX - lx) + Math.abs(e.clientY - ly);
     yaw += (e.clientX - lx) * 0.008;
     pitch = Math.max(-1.2, Math.min(1.2, pitch + (e.clientY - ly) * 0.008));
     lx = e.clientX; ly = e.clientY;
   };
-  const onUp = () => { dragging = false; };
+  const setSpinning = (on: boolean) => { spinning = on; opts.onSpinChange?.(on); };
+  // a click that did not drag toggles the turning
+  const onUp = () => { if (dragging && moved < 4) setSpinning(!spinning); dragging = false; };
   const onDbl = () => { yaw = HOME.yaw; pitch = HOME.pitch; };
   if (opts.interactive !== false) {
     canvas.style.cursor = "grab"; canvas.style.touchAction = "none";
@@ -234,6 +246,8 @@ export function createStarFigure(canvas: HTMLCanvasElement, opts: { interactive?
 
   return {
     setLayers(next) { layers = next; },
+    setSpinning,
+    isSpinning: () => spinning,
     destroy() {
       cancelAnimationFrame(raf); ro?.disconnect();
       canvas.removeEventListener("pointerdown", onDown);

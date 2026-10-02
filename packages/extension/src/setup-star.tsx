@@ -10,12 +10,13 @@
 //   all four                  → the core lights
 //
 // A step that is `now` is drawn faint and dashed — the shape it is about to
-// add. Drag to turn it; double-click to reset. `prefers-reduced-motion` stops
+// add. Drag to turn it, click (or the pause link) to hold it still,
+// double-click to reset. `prefers-reduced-motion` stops
 // the turning. Purely presentational: it reads the states the spine already
 // shows and decides nothing; the geometry is illustrative, not a verified
 // rendering of any key.
 
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { createStarFigure, type LayerId, type Layers, type StarFigure } from "./star-figure.js";
 import { c, t } from "./theme.js";
 
@@ -27,6 +28,7 @@ const LABELS = ["the field", "⚔️ the Swordsman", "🧙 the Mage", "the route
 export function SetupStar({ steps }: { steps: StarStepState[] }) {
   const canvas = useRef<HTMLCanvasElement | null>(null);
   const fig = useRef<StarFigure | null>(null);
+  const [spinning, setSpinning] = useState(true);
   const done = steps.filter((s) => s === "done").length;
   const whole = steps.length > 0 && done === steps.length;
   const nowIdx = steps.indexOf("now");
@@ -34,7 +36,8 @@ export function SetupStar({ steps }: { steps: StarStepState[] }) {
 
   useEffect(() => {
     if (!canvas.current) return;
-    fig.current = createStarFigure(canvas.current);
+    fig.current = createStarFigure(canvas.current, { onSpinChange: setSpinning });
+    setSpinning(fig.current.isSpinning());
     return () => fig.current?.destroy();
   }, []);
 
@@ -55,7 +58,7 @@ export function SetupStar({ steps }: { steps: StarStepState[] }) {
       <canvas
         ref={canvas}
         role="img"
-        aria-label={`Star setup: ${done} of ${steps.length} steps formed. Drag to turn.`}
+        aria-label={`Star setup: ${done} of ${steps.length} steps formed. Drag to turn; click to pause.`}
         style={{ width: 200, height: 200, display: "block" }}
       />
       <figcaption style={{ fontSize: t.xs, color: c.muted, textAlign: "center", maxWidth: "30ch" }}>
@@ -64,6 +67,15 @@ export function SetupStar({ steps }: { steps: StarStepState[] }) {
           : nowIdx >= 0
             ? `Next: ${LABELS[nowIdx]} · ${done} of ${steps.length} formed`
             : `${done} of ${steps.length} formed`}
+        {" · "}
+        <button
+          type="button"
+          onClick={() => fig.current?.setSpinning(!spinning)}
+          aria-pressed={!spinning}
+          style={{ background: "none", border: 0, padding: 0, font: "inherit", color: c.accent, cursor: "pointer" }}
+        >
+          {spinning ? "pause" : "turn"}
+        </button>
       </figcaption>
     </figure>
   );
