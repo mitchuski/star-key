@@ -14,11 +14,25 @@
 // Layers are switched on by the caller, each with a level in [0,1] and an
 // optional "next" flag (drawn faint and dashed — the shape about to be added).
 // Nothing here knows what a step means; it only draws.
+//
+// The "constellation" layer lights a walk of lattice vertices (a solve's
+// encoding on the six axes) and a dashed edge to its complement, the witness.
+// The "places" layer seats glyphs at vertices: a City's doors on the lattice,
+// hoverable and clickable (a click on a place teleports instead of toggling spin).
 
-export type LayerId = "field" | "sword" | "mage" | "routes" | "core" | "hold" | "invite";
+export type LayerId = "field" | "sword" | "mage" | "routes" | "core" | "hold" | "invite" | "constellation" | "places";
+
+/** A place on the lattice: a glyph at a vertex that can be hovered and teleported to. */
+export interface Place { vertex: number; glyph: string; label?: string; href?: string; id?: string }
 export interface LayerState {
   level: number; // 0 hidden … 1 drawn
   next?: boolean; // drawn as a preview
+  /** constellation only: lattice vertices (0..63) joined in order — a walk up the six axes */
+  vertices?: number[];
+  /** constellation only: the complement vertex (63 − last), drawn as a dashed witness edge */
+  witness?: number;
+  /** places only: glyphs seated at vertices; hover and click report through opts.onPlaceHover / onPlaceClick */
+  places?: Place[];
 }
 export type Layers = Partial<Record<LayerId, LayerState>>;
 
@@ -102,7 +116,7 @@ const norm = (a: V3): V3 => { const l = Math.hypot(...a) || 1; return [a[0] / l,
 
 export function createStarFigure(
   canvas: HTMLCanvasElement,
-  opts: { interactive?: boolean; spinning?: boolean; onSpinChange?: (on: boolean) => void } = {},
+  opts: { interactive?: boolean; spinning?: boolean; onSpinChange?: (on: boolean) => void; onPlaceHover?: (place: Place | null) => void; onPlaceClick?: (place: Place) => void } = {},
 ): StarFigure {
   const ctx = canvas.getContext("2d");
   if (!ctx) return { setLayers() {}, setSpinning() {}, isSpinning: () => false, destroy() {} };
@@ -110,7 +124,9 @@ export function createStarFigure(
   const HOME = { yaw: 1.2, pitch: 0.8 }; // same still as public/icon.svg (scripts/star-icon.mjs)
   let yaw = HOME.yaw, pitch = HOME.pitch, spinning = !reduce && opts.spinning !== false;
   let layers: Layers = {};
-  let shown: Record<LayerId, number> = { field: 0, sword: 0, mage: 0, routes: 0, core: 0, hold: 0, invite: 0 };
+  let shown: Record<LayerId, number> = { field: 0, sword: 0, mage: 0, routes: 0, core: 0, hold: 0, invite: 0, constellation: 0, places: 0 };
+  let hits: { x: number; y: number; r: number; place: Place }[] = [];
+  let hovered: Place | null = null;
   let raf = 0, dragging = false, moved = 0, lx = 0, ly = 0, w = 0, h = 0, dpr = 1, t0 = performance.now();
 
   const fit = () => {
@@ -202,6 +218,24 @@ export function createStarFigure(
         ctx!.beginPath(); ctx!.arc(q.x, q.y, 1.6 + q.z * 0.6, 0, Math.PI * 2); ctx!.fill();
       });
     }
+    if (L("constellation") > 0.01) {
+      const c = layers.constellation, vs = (c?.vertices ?? []).filter((v) => v >= 0 && v < 64), lvl = L("constellation");
+      ctx!.lineWidth = 1.4; ctx!.setLineDash(N("constellation") ? [3, 4] : []);
+      for (let i = 1; i < vs.length; i++) {
+        const a = proj(LATTICE[vs[i - 1]!]!), b = proj(LATTICE[vs[i]!]!);
+        ctx!.strokeStyle = rgba(PALE, 0.85 * lvl * (0.6 + 0.4 * ((a.z + b.z) / 2 + 1)));
+        ctx!.beginPath(); ctx!.moveTo(a.x, a.y); ctx!.lineTo(b.x, b.y); ctx!.stroke();
+      }
+      ctx!.setLineDash([]);
+      vs.forEach((v, i) => glow(proj(LATTICE[v]!), i === vs.length - 1 ? MAGE : PALE, i === vs.length - 1 ? 9 : 5.5, (i === vs.length - 1 ? 0.95 : 0.7) * lvl));
+      if (c?.witness !== undefined && c.witness >= 0 && c.witness < 64 && vs.length) {
+        const a = proj(LATTICE[vs[vs.length - 1]!]!), b = proj(LATTICE[c.witness]!);
+        ctx!.setLineDash([2, 5]); ctx!.lineWidth = 1; ctx!.strokeStyle = rgba(SWORD, 0.55 * lvl);
+        ctx!.beginPath(); ctx!.moveTo(a.x, a.y); ctx!.lineTo(b.x, b.y); ctx!.stroke(); ctx!.setLineDash([]);
+        ctx!.strokeStyle = rgba(SWORD, 0.8 * lvl); ctx!.lineWidth = 1;
+        ctx!.beginPath(); ctx!.arc(b.x, b.y, 4.5, 0, Math.PI * 2); ctx!.stroke();
+      }
+    }
     // the two solids, back one first so they interpenetrate convincingly
     const order: [LayerId, V3[], readonly number[]][] = [["sword", SWORD_V, SWORD], ["mage", MAGE_V, MAGE]];
     order.sort((a, b) => rot(a[1][0]!)[2] - rot(b[1][0]!)[2]);
@@ -210,6 +244,21 @@ export function createStarFigure(
       const c = proj([0, 0, 0]), pulse = reduce ? 1 : 0.85 + 0.15 * Math.sin(now / 700);
       glow(c, MAGE, 34 * pulse, 0.5 * L("core"));
       glow(c, SWORD, 18 * pulse, 0.7 * L("core"));
+    }
+    if (L("places") > 0.01) {
+      const lvl = L("places"), ps = (layers.places?.places ?? []).filter((p) => p.vertex >= 0 && p.vertex < 64);
+      hits = [];
+      ps.map((p) => ({ p, q: proj(LATTICE[p.vertex]!) })).sort((a, b) => a.q.z - b.q.z).forEach(({ p, q }) => {
+        const depth = 0.55 + 0.45 * ((q.z + 1) / 2), isHov = hovered === p;
+        const r = (isHov ? 22 : 16) * depth;
+        glow(q, isHov ? MAGE : PALE, r * 1.6, (isHov ? 0.9 : 0.5) * lvl * depth);
+        ctx!.font = `${Math.round(r * 1.15)}px "Segoe UI Emoji","Apple Color Emoji","Noto Color Emoji",sans-serif`;
+        ctx!.textAlign = "center"; ctx!.textBaseline = "middle";
+        ctx!.globalAlpha = Math.min(1, lvl * (0.6 + 0.4 * depth));
+        ctx!.fillText(p.glyph, q.x, q.y);
+        ctx!.globalAlpha = 1;
+        hits.push({ x: q.x, y: q.y, r: r + 6, place: p });
+      });
     }
     if (L("invite") > 0.01) {
       const a = proj([0, 0, 0]), b = proj(INVITE_AT);
@@ -223,8 +272,18 @@ export function createStarFigure(
   }
 
   const onDown = (e: PointerEvent) => { dragging = true; moved = 0; lx = e.clientX; ly = e.clientY; canvas.setPointerCapture(e.pointerId); };
+  const placeAt = (x: number, y: number): Place | null => {
+    let best: Place | null = null, bd = Infinity;
+    for (const h of hits) { const d = Math.hypot(h.x - x, h.y - y); if (d <= h.r && d < bd) { bd = d; best = h.place; } }
+    return best;
+  };
   const onMove = (e: PointerEvent) => {
-    if (!dragging) return;
+    if (!dragging) {
+      if (!hits.length) return;
+      const r = canvas.getBoundingClientRect(), p = placeAt(e.clientX - r.left, e.clientY - r.top);
+      if (p !== hovered) { hovered = p; canvas.style.cursor = p ? "pointer" : "grab"; opts.onPlaceHover?.(p); }
+      return;
+    }
     moved += Math.abs(e.clientX - lx) + Math.abs(e.clientY - ly);
     yaw += (e.clientX - lx) * 0.008;
     pitch = Math.max(-1.2, Math.min(1.2, pitch + (e.clientY - ly) * 0.008));
@@ -232,7 +291,11 @@ export function createStarFigure(
   };
   const setSpinning = (on: boolean) => { spinning = on; opts.onSpinChange?.(on); };
   // a click that did not drag toggles the turning
-  const onUp = () => { if (dragging && moved < 4) setSpinning(!spinning); dragging = false; };
+  const onUp = () => {
+    if (dragging && moved < 4) { if (hovered) opts.onPlaceClick?.(hovered); else setSpinning(!spinning); }
+    dragging = false;
+  };
+  const onLeave = () => { if (hovered) { hovered = null; canvas.style.cursor = "grab"; opts.onPlaceHover?.(null); } };
   const onDbl = () => { yaw = HOME.yaw; pitch = HOME.pitch; };
   if (opts.interactive !== false) {
     canvas.style.cursor = "grab"; canvas.style.touchAction = "none";
@@ -241,6 +304,7 @@ export function createStarFigure(
     canvas.addEventListener("pointerup", onUp);
     canvas.addEventListener("pointercancel", onUp);
     canvas.addEventListener("dblclick", onDbl);
+    canvas.addEventListener("pointerleave", onLeave);
   }
   raf = requestAnimationFrame(frame);
 
@@ -255,6 +319,7 @@ export function createStarFigure(
       canvas.removeEventListener("pointerup", onUp);
       canvas.removeEventListener("pointercancel", onUp);
       canvas.removeEventListener("dblclick", onDbl);
+      canvas.removeEventListener("pointerleave", onLeave);
     },
   };
 }

@@ -63,3 +63,8 @@ Start with one claim and one verifier. Selective disclosure, aggregation and suc
 Eight synthetic fingerprint/overlap assertions and nine existing canon/journey test entries passed in the observer loop. This checks narrow canonical-content compatibility, not rendered sigil equivalence or credential verification. A reduced projection needs its own content identity; preserve source lineage only when permitted. A signature on a full key does not automatically authenticate a changed reading. Source-element overlap uses vertex, slug and sorted links; evaluating independent evidence additionally needs immutable source versions and provenance dependency groups.
 
 The next research protocol is recorded in agentprivacy-docs/research/star-key-next-research-loop.md. Candidates remain unnumbered. Public chronicle reflections are staged pending the unsigned master's review, not installed in this fork.
+
+## Real signed-record implementation roadmap
+
+See [STAR_SIGNED_RECORDS_INTEGRATION.md](STAR_SIGNED_RECORDS_INTEGRATION.md) for the staged path from the Soulbis sample catalogue to real envelope import, measurement, verification and scoped presentation. Documentation proposal only; no signing or credential behaviour changed.
+

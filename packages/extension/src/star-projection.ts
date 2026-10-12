@@ -25,3 +25,29 @@ export function inspectCityKey(value: unknown): StarProjection {
 export function compressReading(reading: StarProjection, includeVertices: boolean): string {
   return JSON.stringify({ ...reading, lit: includeVertices ? [...reading.lit] : [] });
 }
+
+// What the imported carrier holds that this reading does NOT carry. Counts and presence only,
+// never values. A reader holding the retained key, or the City's logs, can reconstruct lineage
+// that this projection omits (the κ chain, the walks). Provenance needs a declared reader and an
+// explicit access basis (V7 research intake · OPH, 2026-09-11); decide whether lineage references
+// are disclosable before export.
+export interface RetainedSummary {
+  descriptions: number; lit: number; focus: number; walks: number; packets: number; receipts: number; credentials: number;
+  identity: boolean; did: boolean; kappa: boolean; prior: boolean; trace: boolean; figures: boolean; geometry: boolean;
+  /** names of any further top-level fields, never their values */
+  other: string[];
+}
+const RETAINED_KNOWN = new Set(['name', 'version', 'palette', 'lit', 'descriptions', 'focus', 'walks', 'packets', 'identity', 'did', 'kappa', 'prior', 'trace', 'figures', 'geometry', 'receipts', 'credentials']);
+export function retainedSummary(value: unknown): RetainedSummary {
+  const key = (value && typeof value === 'object' && !Array.isArray(value)) ? value as Record<string, unknown> : {};
+  const count = (v: unknown) => Array.isArray(v) ? v.length : (v && typeof v === 'object') ? Object.keys(v as object).length : 0;
+  const has = (v: unknown) => v !== undefined && v !== null && v !== '';
+  const packets = key.packets as Record<string, unknown> | undefined;
+  return {
+    descriptions: count(key.descriptions), lit: count(key.lit), focus: count(key.focus), walks: count(key.walks),
+    packets: typeof packets?.count === 'number' ? packets.count : count(packets),
+    receipts: count(key.receipts), credentials: count(key.credentials),
+    identity: has(key.identity), did: has(key.did), kappa: has(key.kappa), prior: has(key.prior), trace: has(key.trace), figures: has(key.figures), geometry: has(key.geometry),
+    other: Object.keys(key).filter(k => !RETAINED_KNOWN.has(k)).sort(),
+  };
+}

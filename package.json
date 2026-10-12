@@ -19,7 +19,8 @@
     "dev:demo-rp": "npm run start --workspace @openvtc/pnm-demo-rp",
     "lint": "npm run lint --workspaces --if-present",
     "test": "npm run test --workspaces --if-present",
-    "build:star-preview": "npm exec --workspace @openvtc/pnm-extension -- vite build --config vite.config.star-preview.ts --mode web-experiment && node scripts/copy-star-art.mjs"
+    "build:star-preview": "npm exec --workspace @openvtc/pnm-extension -- vite build --config vite.config.star-preview.ts --mode web-experiment && node scripts/copy-star-art.mjs",
+    "test:star-registry": "node --experimental-strip-types --test scripts/star-registry.test.mjs"
   },
   "engines": {
     "node": ">=24"

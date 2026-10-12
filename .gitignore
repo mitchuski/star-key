@@ -31,3 +31,6 @@ packages/core/*-test.mjs
 
 # Generated public reader bundle
 packages/extension/dist-star-preview/
+
+# Local registry run evidence (never tokens)
+.registry-runs/
