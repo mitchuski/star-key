@@ -22,12 +22,26 @@ function StarMark({ active }: { active: boolean }) {
   return <canvas ref={canvas} role="img" aria-label={active ? 'Star · VTA selected locally' : 'Star · no VTA selected'} style={{ width: 72, height: 72, display: 'block' }} />;
 }
 
+// Join a community from its DID (join-view.tsx): its own small window, so the
+// camera prompt and a file picker do not close it the way they close the
+// popup. The popup closes itself; the join carries on there.
+function openJoin() {
+  void chrome.windows.create({
+    url: chrome.runtime.getURL('confirm.html?kind=join'),
+    type: 'popup',
+    width: 520,
+    height: 600,
+  });
+  window.close();
+}
+
 export function StarBrand({ active = false }: { active?: boolean }) {
   return <header className="star-brand">
     <div className={active ? 'star-mini is-active' : 'star-mini'}><StarMark active={active} /></div>
     <div><div className="star-wordmark">star key</div><p>{active ? 'VTA selected · your chosen perspective' : 'Your boundaries. Your chosen perspective.'}</p></div>
     <a href="star.html" target="_blank" rel="noreferrer" aria-label="Inspect and prepare a selected City Key reading" title="Inspect a reading before sharing">📤</a>
     <a href="hold.html" target="_blank" rel="noreferrer" aria-label="What the Star holds — verify a Hold locally" title="What the Star holds">🪬</a>
+    <button onClick={openJoin} aria-label="Join a community — paste its DID or scan its code" title="Join a community">🤝</button>
     <button onClick={() => window.close()} aria-label="Close Star" title="Close Star">✕</button>
   </header>;
 }

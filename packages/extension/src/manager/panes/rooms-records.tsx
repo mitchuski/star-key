@@ -22,17 +22,27 @@
 // So `Verdict` below says *what was observed*, never how alarmed to be, and
 // always says that reading still works and writing will not.
 
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   roomsKeysBrowse,
   roomsKeysRead,
   type HeldRoom,
 } from "@openvtc/pnm-core/rooms";
-import { Button, Note } from "../../ui.js";
+import { Button, Note, Pill } from "../../ui.js";
+import { displayAgentName } from "../../agent-name.js";
+import { useAgentNames } from "../../use-agent-names.js";
+import { shortDid } from "../room-words.js";
+import { formatBytes } from "../room-files.js";
+import { createLimiter } from "../limit.js";
+import { didHost } from "../../did-display.js";
 import { c, t, font } from "../../theme.js";
 import { managerSender } from "../sender.js";
-import { Loading, LoadError, Table, type Column } from "../table.js";
+import { Loading, LoadError } from "../table.js";
 import type { Parties } from "../use-vta.js";
+import type { RoomFilesPrepared } from "../../bridge-protocol.js";
+import { prepareRoomFiles, roomFileClaimOf } from "../room-files.js";
+import { GetRoomFile, PutRoomFile, RoomFilesUnavailable } from "./rooms-files.js";
+import { holds, NoteEditor, RecordActions } from "./rooms-record-actions.js";
 
 const fieldStyle: React.CSSProperties = {
   boxSizing: "border-box",
@@ -42,6 +52,18 @@ const fieldStyle: React.CSSProperties = {
   border: `1px solid ${c.line}`,
   borderRadius: "var(--w-r-sm)",
   fontSize: t.sm,
+};
+
+const bodyStyle: React.CSSProperties = {
+  margin: "6px 0 0",
+  padding: 10,
+  background: c.ground,
+  border: `1px solid ${c.line}`,
+  borderRadius: "var(--w-r-sm)",
+  fontFamily: font.mono,
+  fontSize: t.xs,
+  whiteSpace: "pre-wrap",
+  wordBreak: "break-word",
 };
 
 /** The shape both tasks return under `verification`, as this pane reads it. */
@@ -59,6 +81,9 @@ interface RecordRow {
   updatedAt?: string;
   epoch?: number;
   author?: string;
+  /** Present only on an `open` room; sealed with the body otherwise. */
+  title?: string;
+  description?: string;
 }
 
 /**
@@ -177,189 +202,498 @@ function decodeBody(plaintext: string): string {
   }
 }
 
-function OpenedRecord({
+/** Whether a verdict reports a host caught out — said in full, never folded away. */
+function adverse(v: Verification): boolean {
+  return v.priorRoots === "conflict" || v.count === "short" || v.trace === "failed";
+}
+
+/**
+ * A verdict, sized to what it found. Anything adverse is the full `Verdict`,
+ * in the open: the spec requires an adverse finding be surfaced, and a member
+ * shown a folded warning dismisses it. A clean one is a single line, with the
+ * same words one click away — it is the common case and it repeated under
+ * every record.
+ */
+function VerdictLine({
+  verification,
+  complete,
+  returned,
+  scope,
+}: {
+  verification: Verification;
+  complete?: boolean | undefined;
+  returned?: number | undefined;
+  scope: "listing" | "record";
+}) {
+  if (adverse(verification)) return <Verdict verification={verification} complete={complete} returned={returned} />;
+  const { head, count, trace } = verification;
+  const checked = scope === "record" ? trace === "verified" : !!head && count === "agrees";
+  const words =
+    scope === "record"
+      ? trace === "verified"
+        ? "In the set this host committed to"
+        : "Not traced against the host's commitment"
+      : !head
+        ? "No count to check: this host keeps no record tree"
+        : count === "agrees"
+          ? `Holds exactly the ${head.recordCount} ${head.recordCount === 1 ? "record" : "records"} this host committed to`
+          : `This host committed to ${head.recordCount} ${head.recordCount === 1 ? "record" : "records"}`;
+  return (
+    <details style={{ fontSize: t.xs, color: checked ? c.ok : c.muted }}>
+      <summary style={{ cursor: "pointer" }}>
+        {checked ? "✓ " : ""}
+        {words}
+      </summary>
+      <div style={{ marginTop: 6 }}>
+        <Verdict verification={verification} complete={complete} returned={returned} />
+      </div>
+    </details>
+  );
+}
+
+/** What an opened record says, as far as this pane reads it. */
+interface Opened {
+  text: string;
+  title?: string;
+  body?: string;
+  author?: string;
+  verification: Verification | null;
+}
+
+/** A note's title, body and author, where its body is the JSON a note is written as. */
+function readNote(text: string): Pick<Opened, "title" | "body" | "author"> {
+  try {
+    const doc = JSON.parse(text) as Record<string, unknown>;
+    if (typeof doc !== "object" || doc === null) return {};
+    return {
+      ...(typeof doc.title === "string" && doc.title ? { title: doc.title } : {}),
+      ...(typeof doc.body === "string" ? { body: doc.body } : {}),
+      ...(typeof doc.author === "string" ? { author: doc.author } : {}),
+    };
+  } catch {
+    return {};
+  }
+}
+
+function when(iso: string | undefined): string {
+  if (!iso) return "";
+  const d = new Date(iso);
+  return Number.isNaN(d.getTime()) ? "" : d.toLocaleDateString(undefined, { day: "numeric", month: "short", year: "numeric" });
+}
+
+/**
+ * One record: a title and a preview once opened, everything else on a click.
+ *
+ * Keys are opaque by rule on the sealed tiers and the title is sealed with the
+ * body, so a record says nothing until it is opened. The newest few are opened
+ * as the list arrives (`autoOpen`); the rest on a click.
+ */
+function RecordItem({
   parties,
   room,
   host,
-  recordKey,
+  row,
+  prepared,
+  autoOpen,
+  authorName,
+  onChanged,
 }: {
   parties: Parties;
   room: HeldRoom;
   host: string;
-  recordKey: string;
+  row: RecordRow;
+  prepared: RoomFilesPrepared | null;
+  autoOpen: boolean;
+  authorName: (did: string) => string;
+  /** The record was edited or its standing changed: list again. */
+  onChanged: () => void;
 }) {
-  const [body, setBody] = useState<string | null>(null);
-  const [verification, setVerification] = useState<Verification | null>(null);
+  const [editing, setEditing] = useState(false);
+  const [opened, setOpened] = useState<Opened | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [expanded, setExpanded] = useState(false);
 
-  const open = useCallback(async () => {
+  // A row can be scrolled away or the room left before its read lands.
+  const live = useRef(true);
+  useEffect(() => {
+    live.current = true;
+    return () => {
+      live.current = false;
+    };
+  }, []);
+
+  /** Read the record — through the background queue when nobody asked for it. */
+  const open = useCallback(async (queued = false) => {
     setBusy(true);
     setError(null);
     try {
-      const res = await roomsKeysRead(managerSender, {
-        ...parties,
-        roomId: room.roomId,
-        host,
-        key: recordKey,
-      });
-      setVerification(res.verification as unknown as Verification);
-      if (res.plaintext) setBody(decodeBody(res.plaintext));
-      else if (res.cleartext) setBody(JSON.stringify(res.cleartext, null, 2));
+      const read = () =>
+        roomsKeysRead(managerSender, {
+          ...parties,
+          roomId: room.roomId,
+          host,
+          key: row.key,
+          ...(room.member !== undefined ? { member: room.member } : {}),
+        });
+      const res = await (queued ? READS.run(read) : read());
+      if (!live.current) return;
       // A retracted record has no body, and that is an answer rather than a
       // failure — the tombstone is what the room retains of it.
-      else setBody(res.status === "retracted" ? "(retracted — the body is gone)" : "(no body)");
+      const text = res.plaintext
+        ? decodeBody(res.plaintext)
+        : res.cleartext
+          ? JSON.stringify(res.cleartext, null, 2)
+          : res.status === "retracted"
+            ? "(retracted — the body is gone)"
+            : "(no body)";
+      setOpened({ text, ...readNote(text), verification: (res.verification as unknown as Verification) ?? null });
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      if (live.current) setError(e instanceof Error ? e.message : String(e));
     }
-    setBusy(false);
-  }, [parties, room, host, recordKey]);
+    if (live.current) setBusy(false);
+  }, [parties, room, host, row.key]);
+
+  const started = useRef(false);
+  useEffect(() => {
+    if (!autoOpen || started.current) return;
+    started.current = true;
+    void open(true);
+  }, [autoOpen, open]);
+
+  const claim = opened ? roomFileClaimOf(opened.text) : null;
+  const retracted = row.status === "retracted";
+  const title =
+    opened?.title ?? claim?.title ?? claim?.name ?? row.title ??
+    (retracted ? "Retracted record" : opened ? "Untitled record" : busy ? "Opening…" : "Not opened yet");
+  const preview = claim
+    ? `${claim.name} · ${formatBytes(claim.size)}${claim.mediaType ? ` · ${claim.mediaType}` : ""}`
+    : (opened?.body ?? row.description);
+  const author = row.author ?? opened?.author;
+  // No version here: it is the room's write counter, not this record's revision.
+  const meta = [author ? authorName(author) : "", when(row.updatedAt)].filter(Boolean).join(" · ");
+  const caught = opened?.verification ? adverse(opened.verification) : false;
+
+  const toggle = () => {
+    setExpanded((x) => !x);
+    if (!opened && !busy) void open();
+  };
 
   return (
-    <div style={{ display: "grid", gap: 8, marginTop: 8 }}>
-      {body === null && !error && (
-        <div>
-          <Button disabled={busy} onClick={() => void open()}>
-            {busy ? "Opening…" : "Open this record"}
-          </Button>
-          <p style={{ margin: "6px 0 0", fontSize: t.xs, color: c.faint }}>
-            Your agent fetches it, checks what the host said about it, and decrypts it. The
-            key does not leave the agent and the ciphertext does not reach this console.
-          </p>
+    <li style={{ borderTop: `1px solid ${c.lineSoft}`, listStyle: "none" }}>
+      <button
+        onClick={toggle}
+        aria-expanded={expanded}
+        style={{
+          all: "unset",
+          boxSizing: "border-box",
+          cursor: "pointer",
+          width: "100%",
+          display: "flex",
+          gap: 12,
+          alignItems: "flex-start",
+          padding: "11px 14px",
+        }}
+      >
+        <span aria-hidden="true" style={{ color: c.faint, paddingTop: 1 }}>
+          {claim ? "▣" : retracted ? "▢" : "▤"}
+        </span>
+        <span style={{ display: "grid", gap: 3, flex: "1 1 auto", minWidth: 0 }}>
+          <span style={{ fontSize: t.base, fontWeight: 600, color: opened || row.title ? c.text : c.muted, wordBreak: "break-word" }}>
+            {title}
+          </span>
+          {preview && !expanded && !claim && (
+            <span
+              style={{
+                fontSize: t.sm,
+                color: c.muted,
+                whiteSpace: "pre-wrap",
+                display: "-webkit-box",
+                WebkitLineClamp: 2,
+                WebkitBoxOrient: "vertical",
+                overflow: "hidden",
+              }}
+            >
+              {preview}
+            </span>
+          )}
+        </span>
+        <span style={{ display: "flex", gap: 8, alignItems: "center", flex: "0 0 auto", fontSize: t.xs, color: c.faint }}>
+          {caught && <Pill tone="danger">check failed</Pill>}
+          {row.status && row.status !== "active" && (
+            <Pill tone="warn">{row.status === "deprecated" ? "archived" : row.status}</Pill>
+          )}
+          <span>{meta}</span>
+        </span>
+      </button>
+      {error && (
+        <div style={{ padding: "0 14px 10px", display: "grid", gap: 6 }}>
+          <Note tone="danger">{error}</Note>
         </div>
       )}
-      {body !== null && (
-        <pre
-          style={{
-            margin: 0,
-            padding: 10,
-            background: c.ground,
-            border: `1px solid ${c.line}`,
-            borderRadius: "var(--w-r-sm)",
-            fontFamily: font.mono,
-            fontSize: t.xs,
-            whiteSpace: "pre-wrap",
-            wordBreak: "break-word",
-          }}
-        >
-          {body}
-        </pre>
+      {/* A file is shown whether or not the row is expanded: its thumbnail and
+          download are the point of it, and the rest is behind the expand. */}
+      {opened && claim && (
+        <div style={{ padding: "0 14px 12px 38px" }}>
+          <GetRoomFile room={room} host={host} prepared={prepared} recordKey={row.key} claim={claim} showTitle={false} autoPreview={autoOpen} />
+        </div>
       )}
-      {verification && <Verdict verification={verification} />}
-      {error && <Note tone="danger">{error}</Note>}
-    </div>
+      {expanded && (
+        <div style={{ display: "grid", gap: 10, padding: "0 14px 14px 38px" }}>
+          {busy && !opened && <Loading what="the record" />}
+          {opened && !claim && (
+            <div style={{ fontSize: t.base, color: c.text, whiteSpace: "pre-wrap", wordBreak: "break-word", lineHeight: 1.55 }}>
+              {opened.body ?? (opened.title ? "" : opened.text)}
+            </div>
+          )}
+          {opened && (opened.body !== undefined || claim) && (
+            <details>
+              <summary style={{ fontSize: t.xs, color: c.muted, cursor: "pointer" }}>The signed record</summary>
+              <pre style={bodyStyle}>{opened.text}</pre>
+            </details>
+          )}
+          {opened?.verification && <VerdictLine verification={opened.verification} scope="record" />}
+          {editing && opened ? (
+            <NoteEditor
+              key={`${row.key}@${row.version}`}
+              room={room}
+              host={host}
+              existing={{
+                key: row.key,
+                version: row.version,
+                ...(opened.title !== undefined ? { title: opened.title } : {}),
+                ...(opened.body !== undefined ? { body: opened.body } : {}),
+              }}
+              onDone={() => {
+                setEditing(false);
+                onChanged();
+              }}
+              onCancel={() => setEditing(false)}
+            />
+          ) : (
+            <RecordActions
+              room={room}
+              host={host}
+              recordKey={row.key}
+              version={row.version}
+              status={row.status}
+              // A note this place wrote: replacing someone else's is not an edit.
+              editable={!!opened && !claim && opened.body !== undefined && !!author && author === room.member}
+              onEdit={() => setEditing(true)}
+              onChanged={onChanged}
+            />
+          )}
+          <code style={{ fontFamily: font.mono, fontSize: t.xs, color: c.faint, wordBreak: "break-all" }}>{row.key}</code>
+        </div>
+      )}
+      {/* Caught, it is said where the record is, whether or not it is expanded. */}
+      {caught && !expanded && opened?.verification && (
+        <div style={{ padding: "0 14px 12px 38px" }}>
+          <Verdict verification={opened.verification} />
+        </div>
+      )}
+    </li>
   );
 }
+
+/** How many of the newest records are opened as the list arrives. */
+export const AUTO_OPEN = 5;
+
+/** The records opened unasked, a few at a time and newest first (`limit.ts`). */
+const READS = createLimiter(2);
 
 /**
  * Browse a room's records at a host, and open the ones that matter.
  *
- * The host is asked for rather than remembered, for the same reason
- * `FetchHistory` asks: nothing maps a room to its host, a room is portable, and
- * a room may have more than one — a mirror serving reads while its primary takes
- * writes.
+ * Nothing authoritative maps a room to its host — a room is portable, and may
+ * have more than one, a mirror serving reads while its primary takes writes —
+ * so `host` is only where this wallet last found it (`room-hosts.ts`). Given
+ * one, the listing starts there and offers *Change*; without one, it asks.
+ * `onListed` hears each host that answered, so the pane can remember it.
  */
-export function RoomRecords({ parties, room }: { parties: Parties; room: HeldRoom }) {
-  const [hostDid, setHostDid] = useState("");
+export function RoomRecords({
+  parties,
+  room,
+  host: knownHost,
+  onListed,
+}: {
+  parties: Parties;
+  room: HeldRoom;
+  host?: string | undefined;
+  onListed?: ((host: string) => void) | undefined;
+}) {
+  const [hostDid, setHostDid] = useState(knownHost ?? "");
+  const [askHost, setAskHost] = useState(!knownHost);
   const [rows, setRows] = useState<RecordRow[] | null>(null);
   const [verification, setVerification] = useState<Verification | null>(null);
   const [complete, setComplete] = useState<boolean | undefined>(undefined);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  // The host is learnt here, at listing, so that a click on put or get can ask
+  // for its origin as its first act (`rooms-files.tsx`).
+  const [listedHost, setListedHost] = useState("");
+  const [prepared, setPrepared] = useState<RoomFilesPrepared | null>(null);
+  const [filesError, setFilesError] = useState<string | null>(null);
 
-  const browse = useCallback(async () => {
-    const host = hostDid.trim();
+  const started = useRef(false);
+  const browse = useCallback(async (asked: string) => {
+    const host = asked.trim();
     if (!host) return;
+    started.current = true;
     setBusy(true);
     setError(null);
     setRows(null);
+    setListedHost(host);
+    setPrepared(null);
+    setFilesError(null);
+    void prepareRoomFiles(host).then(setPrepared, (e: unknown) =>
+      setFilesError(e instanceof Error ? e.message : String(e)),
+    );
     try {
       const res = await roomsKeysBrowse(managerSender, {
         ...parties,
         roomId: room.roomId,
         host,
+        ...(room.member !== undefined ? { member: room.member } : {}),
       });
       setRows((res.records ?? []) as unknown as RecordRow[]);
       setVerification(res.verification as unknown as Verification);
       setComplete(res.complete);
+      setAskHost(false);
+      onListed?.(host);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
+      // A host that did not answer is one to correct, so the field comes back.
+      setAskHost(true);
     }
     setBusy(false);
-  }, [parties, room, hostDid]);
+  }, [parties, room, onListed]);
 
-  const columns: Column<RecordRow>[] = [
-    {
-      key: "key",
-      header: "Key",
-      render: (r) => (
-        <code style={{ fontFamily: font.mono, fontSize: t.xs, wordBreak: "break-all" }}>
-          {r.key}
-        </code>
-      ),
-    },
-    {
-      key: "version",
-      header: "Version",
-      width: "6rem",
-      render: (r) => <span style={{ fontFamily: font.mono }}>{r.version}</span>,
-    },
-    {
-      key: "status",
-      header: "Standing",
-      width: "8rem",
-      render: (r) => (
-        <span style={{ color: r.status === "retracted" ? c.warn : c.muted }}>
-          {r.status ?? "active"}
-        </span>
-      ),
-    },
-  ];
+  const [uploading, setUploading] = useState(false);
+  const [writing, setWriting] = useState(false);
+  // Newest first: a version is assigned by every write, so it orders them.
+  const newestFirst = [...(rows ?? [])].sort((x, y) => y.version - x.version);
+  const openFirst = new Set(newestFirst.filter((r) => r.status !== "retracted").slice(0, AUTO_OPEN).map((r) => r.key));
+  const names = useAgentNames(newestFirst.map((r) => r.author));
+  const authorName = (did: string) => {
+    const n = names[did];
+    return n ? displayAgentName(n) : shortDid(did);
+  };
+
+  // Where the room was last found: list it straight away, once — and not again
+  // when the host this listing just found comes back down as the known one.
+  useEffect(() => {
+    if (started.current || !knownHost) return;
+    started.current = true;
+    void browse(knownHost);
+  }, [knownHost, browse]);
+
 
   return (
     <div style={{ display: "grid", gap: 8, marginTop: 10 }}>
-      <div style={{ display: "flex", gap: 8, alignItems: "flex-end", flexWrap: "wrap" }}>
-        <label style={{ display: "grid", gap: 4, flex: "1 1 22rem" }}>
-          <span style={{ fontSize: t.xs, color: c.muted }}>
-            HOST DID <span style={{ color: c.faint }}>— who serves this room</span>
-          </span>
-          <input
-            style={fieldStyle}
-            value={hostDid}
-            onChange={(e) => setHostDid(e.target.value)}
-          />
-        </label>
-        <Button disabled={busy || !hostDid.trim()} onClick={() => void browse()}>
-          {busy ? "Listing…" : "List the records"}
-        </Button>
-      </div>
+      {askHost ? (
+        <div style={{ display: "flex", gap: 8, alignItems: "flex-end", flexWrap: "wrap" }}>
+          <label style={{ display: "grid", gap: 4, flex: "1 1 22rem" }}>
+            <span style={{ fontSize: t.xs, color: c.muted }}>
+              HOST DID <span style={{ color: c.faint }}>— who serves this room</span>
+            </span>
+            <input
+              style={fieldStyle}
+              value={hostDid}
+              onChange={(e) => setHostDid(e.target.value)}
+            />
+          </label>
+          <Button disabled={busy || !hostDid.trim()} onClick={() => void browse(hostDid)}>
+            {busy ? "Listing…" : "List the records"}
+          </Button>
+        </div>
+      ) : (
+        <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap", fontSize: t.sm, color: c.muted }}>
+          <span>Served by</span>
+          <strong style={{ color: c.text, fontWeight: 600 }} title={listedHost || hostDid}>
+            {didHost(listedHost || hostDid) ?? listedHost ?? hostDid}
+          </strong>
+          <Button kind="quiet" onClick={() => setAskHost(true)}>
+            Change
+          </Button>
+          <Button kind="quiet" disabled={busy} onClick={() => void browse(listedHost || hostDid)}>
+            {busy ? "Listing…" : "Refresh"}
+          </Button>
+        </div>
+      )}
 
       {error && <LoadError what="this room's records" error={error} />}
       {busy && rows === null && !error && <Loading what="records" />}
 
       {rows !== null && (
         <>
-          <Table
-            columns={columns}
-            rows={rows}
-            rowKey={(r) => r.key}
-            expanded={(r) => (
-              <OpenedRecord
-                parties={parties}
-                room={room}
-                host={hostDid.trim()}
-                recordKey={r.key}
-              />
-            )}
-            empty="This host served no records for this room — which is also what a host
-              withholding all of them looks like, unless it committed to a count."
-          />
           {verification && (
-            <Verdict
-              verification={verification}
-              complete={complete}
-              returned={rows.length}
+            <VerdictLine verification={verification} complete={complete} returned={rows.length} scope="listing" />
+          )}
+          {rows.length === 0 ? (
+            <div style={{ fontSize: t.sm, color: c.faint, lineHeight: 1.55 }}>
+              This host served no records for this room — which is also what a host withholding all of them
+              looks like, unless it committed to a count.
+            </div>
+          ) : (
+            <ul
+              style={{
+                margin: 0,
+                padding: 0,
+                background: c.surface,
+                border: `1px solid ${c.line}`,
+                borderRadius: "var(--w-r-md)",
+                overflow: "hidden",
+              }}
+            >
+              {newestFirst.map((r) => (
+                <RecordItem
+                  // Keyed by version too: an edited record is a new one to open.
+                  key={`${r.key}@${r.version}`}
+                  parties={parties}
+                  room={room}
+                  host={listedHost}
+                  row={r}
+                  prepared={prepared}
+                  autoOpen={openFirst.has(r.key)}
+                  authorName={authorName}
+                  onChanged={() => void browse(listedHost)}
+                />
+              ))}
+            </ul>
+          )}
+          {filesError && <RoomFilesUnavailable error={filesError} />}
+          {writing && (
+            <NoteEditor
+              key={`new@${room.roomId}|${room.member ?? ""}`}
+              room={room}
+              host={listedHost}
+              onDone={() => {
+                setWriting(false);
+                void browse(listedHost);
+              }}
+              onCancel={() => setWriting(false)}
             />
+          )}
+          {prepared && uploading && (
+            <PutRoomFile room={room} host={listedHost} prepared={prepared} onPut={() => void browse(listedHost)} />
+          )}
+          {!writing && !uploading && (
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+              <Button disabled={holds(room, "write") === false} onClick={() => setWriting(true)}>
+                Write a note
+              </Button>
+              {prepared && (
+                <Button disabled={holds(room, "write") === false} onClick={() => setUploading(true)}>
+                  Upload a file
+                </Button>
+              )}
+              {holds(room, "write") === false && (
+                <span style={{ fontSize: t.xs, color: c.faint }}>
+                  This identity's credentials for the room do not include write.
+                </span>
+              )}
+            </div>
           )}
         </>
       )}

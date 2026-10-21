@@ -171,8 +171,9 @@ DID as `senderDid`, **persists it with the message** (`PendingInbound.senderDid`
 because a re-driven message has no transport left to ask), and every parser
 that decides whether to believe an unsigned notice keys on it:
 `parseTaskConsentOutcome` believes a reply only from the executor the decision
-was sent to (`AwaitingDecision.executorDid`, else the session's VTA) and, when
-the reply carries a proof, only if it verifies as that executor;
+was sent to (`AwaitingDecision.executorDid`, else the session's VTA), drops an
+unsigned success `#response`, and believes a proof only if it verifies as that
+executor under `authentication` (an error document may be unsigned);
 `parseTaskConsentGranted` only from this session's VTA.
 
 The same holds for replies. `DidcommMessageBridge.sendAndAwaitReply` takes a
@@ -223,12 +224,63 @@ a proof where one is merely RECOMMENDED is legal and strictly more
 attributable, and a 141-entry table of which tasks need one goes stale
 invisibly.
 
-**What is deliberately NOT signed:** the `/auth/` handshake
-(`vta/auth.ts`). That route is bespoke — it authenticates by the authcrypt
-sender and never reaches the dispatch spine — and `provision/integration`,
+**The purpose is chosen by type, in the same place.** `signOutboundTask`
+passes `proofPurposeForDocumentType(envelope.type)` (`trust-tasks/purpose.ts`)
+to the signer: `authentication` for an operational document, `assertionMethod`
+for the attestation types in `ATTESTATION_SLUGS`. That is the VTA's own rule,
+and the VTA, the VTC and the did-hosting RP check it on what they receive (VTI
+#1740, affinidi-webvh-service #213). Do not add a second table: a channel, a
+signer and the page-facing `signTrustTask` all read the one rule.
+
+**RP sign-in over DIDComm is `loginViaTrustTask` over a
+`DidcommVtaTransport`** (`loginViaDidcomm`). Keep it that way rather than
+growing a second login. The bare `auth/authenticate` it used to send survives
+only for a caller that passes no `signing`, and is deprecated.
+
+**Each DIDComm and TSP document is sent by its signer.** The VTA, the VTC and
+the RPs act on a document from those transports only when its proof verifies
+as its `issuer` and that issuer is the transport sender (VTI #1739,
+affinidi-webvh-service #213). `signOutboundTask` takes the channel's sender DID
+(`DidcommVtaTransport` and `TspChannel` pass the holder's) and refuses a signer
+that is not it; REST passes none, because the consumer binds the issuer to the
+bearer. Before signing it also names the signer as `issuer` when none is set,
+fills a missing `id` or `issuedAt`, and refuses a document with no
+`recipient`. Two consequences:
+
+- The same-browser approver relay authcrypts its `task-consent/decision` **as
+  the approver** (`buildTaskConsentDecision`'s `sender`); the worker's session
+  only carries the forward.
+- A per-site persona cannot sign in over DIDComm or TSP: its keys, keyAgreement
+  included, live at the VTA. `doDidcommLogin` refuses one up front
+  (`didcomm-login.ts`), and persona sign-in is the REST path.
+
+**What the executors push and reply is verified under `authentication`.**
+`verifyTrustTaskProof` with `expectedProofPurpose` also requires the
+verification method to be listed under that relationship in the signer's DID
+document, because the resolver finds a key under any of them. Replies
+(`verifyTrustTaskReply`), `task-consent/request`, step-up `approve-request` and
+`task-consent/decision#response` all require `authentication`, which is what
+the VTA, the VTC and the did-hosting RP sign them for. The one opt-out is the
+Mediator Lens (`replyProofPurpose: "any"`): a mediator is none of those, and
+signs its `messaging/*` replies for a purpose of its own.
+
+**What is deliberately NOT signed by a channel:** `provision/integration`,
 which signs its own document with an `authentication`-purpose proof in
-`provision/request.ts` and sends outside the channels. Neither is an oversight;
-routing either through a channel would overwrite or duplicate a proof.
+`provision/request.ts` and sends outside the channels. Routing it through one
+would overwrite or duplicate that proof.
+
+**The REST bearer is two signed Trust Tasks, not a bespoke route.**
+`getVtaBearer` (`vta/auth.ts`) posts `auth/challenge/0.1` (with
+`payload.subject`, which the VTA's handler requires) and then
+`auth/authenticate/0.2` to `/trust-tasks` with no bearer; the VTA dispatches
+that family by `type` ahead of the session check, and the authenticate proof
+*is* the sign-in. It signs through `signOutboundTask` like every channel and
+verifies the VTA's signed, threaded replies with `decodeTrustTaskHttpReply`
+(`vta/http-reply.ts`, split out so `auth.ts` need not import the channel that
+imports it). This replaced `POST /auth/challenge` + an authcrypted
+`POST /auth/`, which vti #1858 deleted: a wallet still on them got a 405 from
+every VTA on that release, and REST, the fallback when a mediator stops
+answering, could not sign in at all.
 
 `tests/vta.outbound-signing.mjs` pins it, running the real verifier over the
 document as the counterparty receives it — a signature copied from another
@@ -849,6 +901,267 @@ VTA; drawing a failed listing as an empty one ("this agent holds keys to no
 rooms" is a claim, and an agent that did not answer has made none); or rendering
 one epoch and calling it the answer.
 
+**Files, and the console's writes, are the rooms flows the wallet runs against
+the host itself.** Records are read *through the agent* (`rooms/keys/{browse,read}`): the console's bridge
+carries only `type` and `payload` to the wallet's own VTA, so the agent makes the
+host call. Files cannot go that way — their bytes must not pass through the VTA
+— so the offscreen document calls the host directly (`RoomHostChannel`: HTTPS to
+the host's `TrustTaskHTTPS` endpoint, no bearer, the reply believed only once it
+is signed by the host, threaded to the request and addressed to its issuer).
+The flow is `@openvtc/pnm-core/rooms/files`'s `putRoomFile` / `getRoomFile`,
+step for step the CLI's `pnm rooms file put` / `get`, so a file either writes
+opens in the other. The host's origin needs a just-in-time host permission,
+requested in the console's click (`prepareRoomFiles` → `requestOriginPermission`).
+Key handling is in "Key material never reaches a browser" below.
+
+**Writing and curating records from the console take the same road.** A new
+note, an edit (`replaces`: the version read, so the host refuses an edit over
+someone else's) and a retraction (`rooms/records/curate/0.1`, `retracted`) are
+`note` and
+`curate` opens on the room-files port, run by the offscreen document as the
+member (`writeSealedAsMember` / `putCleartextAsMember` / `curateRecordAsMember`)
+— sealed or in the clear as `rooms/info` says, never assumed. The console
+(`rooms-record-actions.tsx`) says *Retract*, never *Delete*: the body is dropped
+and a tombstone with the member's reason stays, and anyone who read it may still
+have it; a reason is required. Editing needs `write`, retracting `curate`, which
+`write` does not imply; an action the place's agent says it lacks
+(`HeldRoom.actions`) is shown as such, not offered.
+
+**Archive and restore are offered; pin is not.** Every curation moves the
+record to a new version (vti-rooms `curate_record`), and a sealed body is bound
+to the version it was sealed at (`RecordLocation`) — so the host keeps that
+version beside the record (`SealedRecord.version`, trust-tasks-tf #816) and the
+VTA opens it there (VTI #2185). Before that, archiving a record in a sealed
+room left it unreadable to every member, which is why these were withdrawn
+once. Archiving keeps the body, so it takes one click and no reason; a
+retraction drops it, so it is confirmed and asks why. Pinning stays off because
+the listing does not say which records are pinned.
+
+**The member is the persona, never the wallet** (VTI `data-rooms-files.md`
+§8.5). A room admitted the member's persona — a DID their VTA holds — and the
+wallet holds none of its keys. So every request the host receives is built here
+**unsigned** and completed by the VTA as the persona (`rooms/keys/act`,
+`@openvtc/pnm-core/rooms`'s `actAndSend`), then sent unchanged
+(`RoomHostChannel.sendCompleted`); a record body is signed by the VTA as the
+persona and sealed in one call (`rooms/keys/seal/0.2`, `signAsPrincipal`). The
+one exception is a proxied upload's chunks, commit and abort, signed by a
+`did:key` minted in the offscreen document for that upload alone
+(`rooms/blobs/upload/*/0.2`'s `uploadKey`) and dropped after. The wallet's own
+DID is only ever the caller of the VTA tasks; a host never sees it. Transfers
+from the browser are **proxied**: begin omits `directParts` and get asks
+`direct: false`, because a direct target is on the storage provider's origin,
+which the extension holds no permission for.
+
+**What breaks it:** signing a host-bound room request with the wallet's key
+(the host would record the wallet's `did:key` as a member and author);
+`rooms/keys/present` for the wallet's own DID on a member's path (it is for
+delegation, not for being the member); sending a completed document on any
+channel but HTTPS (DIDComm and TSP consumers require the sender to be the
+signer, and the socket is the wallet's); or accepting a completed document
+without checking it is the request that was built (`roomsKeysAct` does).
+
+## A portal page uses rooms through the wallet's own methods (P7b)
+
+`window.vtaWallet.rooms.{list, choose, forget, info, browse, read, putNote,
+getFile, putFile}` is how a community's member portal shows a member their rooms
+(VTI `data-rooms-files.md` §8.5). It does **not** loosen "a page is not a
+member": `requestTask` and `signTrustTask` still refuse the whole `rooms/`
+family. The methods fix the verb, run the flow in the extension, and return
+views the wallet built (`PageRoomView`, `PageRecordView`, … in
+`bridge-protocol.ts`) — never a task reply, a presentation, a signed document
+or a key. The gates are `room-page-background.ts` (`RoomPageGates`), the rules
+`room-page-policy.ts`, the work `room-page-offscreen.ts`.
+
+**Four gates, in order, before the offscreen document does anything.** (1) The
+call is well formed. (2) The page is the community's portal: every call names
+`hostDid`, and the page's **browser-attested** origin must equal the origin of
+that DID document's first usable `SignInPortal`, resolved and verified as the
+trigger-link sign-in does (domain-linked contacts also need their DID
+Configuration); host requests go to the same document's `TrustTaskHTTPS`. (3)
+The member shared the room with that origin. (4) A write is confirmed.
+
+**Rooms are shared by the member, one by one, because nothing else can say
+which rooms a community hosts.** A room's DID names no host (deliberately: a
+room may be registered with several), and `rooms/keys/list` returns identifiers
+only. So `choose` opens `confirm.html?kind=room` listing the rooms the VTA
+holds; the member ticks those that belong; each is confirmed with the host as
+the member (`rooms/info`) before it is shared; the selection is the whole of
+what is shared afterwards. A share is a grant `(origin, hostDid, vtaDid,
+roomId)` in `chrome.storage.local` under `room-grants:`, for 30 days, listed and
+revocable in the console's **Communities** tab, beside the room it shares
+(`rooms-shares.tsx` reads, `rooms-communities.tsx` draws). A page asking
+about a room it was not given gets one sentence whatever the reason.
+
+**A share names the member it acts as, and every request for the page names
+it.** One VTA can hold two members of one room — the community's own place in
+a room the community owns, beside an administrator's own membership, or two
+personas of one person. `rooms/keys/list` then lists the room once per member,
+saying whose each entry is in `ext["org.openvtc.rooms"].held` (index for index),
+and the VTA **refuses to choose** between them: `rooms/keys/act` takes the member
+as the document's `issuer`, the custody tasks (`browse`, `read`, `open`,
+`file-key`, `backfill`, `chain`) as `ext["org.openvtc.rooms"].member`
+(`@openvtc/pnm-core/rooms`'s `memberExt`; `PersonaRoom.member` threads it). So
+the share prompt offers one row per (room, member), and only as an identity the
+member uses at that community — the principals of their `didSelfIssued` vault
+entries naming its DID (`membersAt`, the sign-in flow's own listing) — never as
+the community's DID itself. A page's `choose({ member })` only picks among those.
+Where two remain, the member picks; one member per room; the button counts the
+ticks. The grant stores the member (`RoomGrant.member`), and a grant without one
+is not in force: the page asks again rather than the wallet guessing. The
+console's rooms pane draws one **card** per room and says when it is held more
+than once; its detail acts as one place at a time, chosen in an *Acting as*
+switch, with everything under it keyed by `heldRoomKey` and naming that place's
+member (`rooms-detail.tsx`).
+
+**Where a room was last found is a hint the console keeps, not a host the agent
+keeps.** The agent deliberately holds no host for a room, so the pane used to
+ask for one on every visit. `room-hosts.ts` remembers, under
+`room-hosts:<vtaDid>` in `chrome.storage.local`, a host this console created
+the room at or that answered a listing for it, and reads a community's offer
+(`room-names:`) as the same kind of hint. The pane groups cards by it and lists
+records from it straight away, always with *Change*. A wrong hint costs one
+refused listing and grants nothing: every request still goes through the agent.
+What breaks it: treating the hint as authoritative (hiding *Change*, or
+refusing a room whose hint is stale), or writing one for a host that did not
+answer.
+
+**A community's own rooms are shown by name.** A room the community owns has
+a label its administrators gave it, and the community's offer to the member
+carries it (`vtc/rooms/memberships/list/0.1`, built unsigned and completed by
+the VTA as the member with `rooms/keys/act/0.5`, sent to the community's
+`TrustTaskHTTPS` unchanged — `@openvtc/pnm-core/rooms`'s
+`communityRoomMemberships`).
+`list` and `choose` read it for the members the shares (or the share prompt)
+act as, at most once a minute per member, and only at the community whose
+portal the page is. The record lists a room for as long as the community keeps
+it, accepted or not; a name is still **remembered** under `room-names:<vtaDid>|<hostDid>` in
+`chrome.storage.local`; a fresh reading replaces it, so a rename shows once the
+room is offered again. Any failure means no name, never an error: the page
+shows the room's DID. `RoomPageGates.displayNames` is the one place a name
+is looked up, and it lays the room's own **profile** over the offer label.
+
+**A room's own profile wins** (trust-tasks-tf #807). A room's name, description,
+tags and emoji are sealed inside the room, at a location only a key holder can
+compute, so the wallet asks the member's VTA (`rooms/keys/profile/read/0.1`,
+`@openvtc/pnm-core/rooms`'s `roomsKeysProfileRead`), which reads, opens and
+judges it as the member. Read it through `roomProfileView` and nothing else: it
+keeps the text inert (control and bidi characters stripped, bounded) and turns
+the VTA's `rejected` list into the one fact a member is owed — somebody without
+the standing to (`noAuthority`, `timing`, `revoked`) tried to rename the room —
+said in words beside `stale`. A profile is **held in memory for the view**
+(`RoomPageGates.profiles`, at most one reading a minute per room and member)
+and never written to `chrome.storage`; it is the room's content, unlike an
+offer label. Display order everywhere: the member's own label (#806) > the
+profile name > the community's offer label > the DID. The console reads
+profiles for rooms whose community it knows (`rememberedRoomHosts`) and, for any
+row, once its host is named under the row (`RoomProfileAt`). A VTA without the
+task leaves everything as it was.
+
+**A private room is never shared with a portal.** Its host is not to learn
+which member acts, and the portal is the host's own page and knows who is
+signed in.
+
+**Reads ride the share; every write is confirmed**, in a window naming the
+room, the persona that will sign and what will be written (title and excerpt,
+or file name and size), with no "remember". A file's bytes reach the page only
+after the whole file verified against its author's digest: the background holds
+the offscreen document's provisional pieces and releases them on `got`, and
+drops them on anything else.
+
+**What breaks it:** taking `hostDid`'s portal from anything but its verified
+DID document, or comparing origins loosely; letting a page name a room's host
+for a room it was not shared; passing a VTA or host reply to the page as is
+(views are built member by member); a share prompt that the page can
+pre-approve, or a write with a "remember" box; posting a provisional download
+byte; offering a room as the community's own DID, or as any identity the
+member does not use at that community; sending a room request for a page or a
+console row without naming its member (the VTA refuses, and it must); keying a
+row or a tick by room alone; or adding a `rooms/*` URI to `provider.js`,
+`content.js` or `background.js` — CI fails the build on the last.
+
+## A community's offers of its rooms: accepted from the wallet, as the member
+
+A community that owns a room offers its members admission
+(`vtc/rooms/community/members/add`). The wallet lists and accepts those offers
+the way `pnm rooms offers list|accept` does (VTI
+`vta-cli-common::commands::rooms`), so a member never needs the CLI: from the
+console's Data rooms page (**Communities**: `rooms-offers.tsx`'s
+`useRoomOffers` reads and accepts, `rooms-communities.tsx` draws each community
+as one lane — offered → held → shared with its portal, joined by
+`community-lanes.ts`, with a gap drawn as its state, e.g. accepted but the keys
+not arrived) and
+from the community's own portal (`window.vtaWallet.rooms.{offers,acceptOffer}`).
+
+**Who is asked, and as whom, comes from the wallet's own sign-in record.** Each
+`didSelfIssued` vault entry names an identity (`principalDid`) and the
+community it signs in to (`targets[].did`); `offerSources`
+(`room-offers-policy.ts`) turns those into (community, member) pairs, and only
+those are asked — **never the community's own DID**, which an administrator's
+agent also holds. The offscreen document re-reads the pairs beside the keys
+rather than trusting the caller. The community's endpoint is its DID document's
+`TrustTaskHTTPS` (`roomHostEndpoint`), never guessed, and nothing is read from a
+community the member has not let the wallet reach (the console's *Allow* button
+asks in the click). One community's offers to one identity are read at most
+once a minute (`OFFERS_LIST_INTERVAL_MS`); the console polls every five minutes
+while open.
+
+**What the console and the portal list is the community's record, not the
+wallet's.** The member reaches these rooms from the portal, `pnm` and OpenVTC
+too, so each row is a room from `vtc/rooms/memberships/list` (offered, admitted
+or removed, for as long as the community keeps it) read beside the VTA's custody
+(`roomsKeysList`, for that member), and its `state` is the standing every
+surface derives from those two (`roomStanding`): `offered`, `joined`,
+`unfinished` (accepted somewhere and not held — accepting again finishes it),
+`needsReadmission` (too late to finish: an administrator re-admits) or
+`removed`. The wallet keeps no record of an accept of its own, so a room
+accepted in OpenVTC shows joined here, and one interrupted here is finished
+there (`vtc/rooms/memberships/list/0.1`, *One record, every surface*).
+
+**Every request is the member's, completed by the VTA.** The lists and the
+acceptance are built unsigned and completed as the member with
+`rooms/keys/act/0.5` (the version that admits the community's types; a VTA
+without it gets "must be updated"), then sent to the community unchanged over
+HTTPS; `roomsKeysAct` refuses an answer made as anyone else. On a sealed tier
+the **VTA gives the KeyPackage** (`rooms/keys/key-package/0.2`) — act completes
+an acceptance only with one it minted — and joins from the Welcome
+(`rooms/keys/welcome`). The offer's membership and authority credentials go
+into the VTA's vault first (`vault/credentials/receive`). All of it is
+`@openvtc/pnm-core/rooms`'s `acceptCommunityRoomOffer`, run in the offscreen
+document (`room-offers-offscreen.ts`); the background (`room-offers-background.ts`)
+names no rooms task.
+
+**A lost answer is retried with the same KeyPackage — from any surface.** The
+community answers a repeat carrying the same KeyPackage with the same Welcome,
+and one carrying a different KeyPackage with `alreadyAccepted` — after which
+only an administrator can help. The VTA, not the wallet, keeps the KeyPackage:
+`key-package/0.2` returns the one it holds for the room, member and invitation
+(`alreadyMinted`), so every attempt — here after a timeout, or in `pnm` or
+OpenVTC — sends that one, and an `alreadyJoined` from `rooms/keys/welcome` is
+joined. A row standing `unfinished` shows *Finish accepting*.
+
+**Accepting is the member's decision, in the wallet's window.** Console or
+portal, `RoomOffers.accept` raises `confirm.html?kind=room` with an `offer`
+view (`room-offer-consent.tsx`) naming the community, the room (its label,
+marked as the community's), the identity it joins as and what accepting does.
+There is no "remember". The portal sees views only (`PageOfferView`: never an
+offer's credentials, a KeyPackage or a Welcome), only for the community whose
+`SignInPortal` it is, and only for identities the wallet uses there; a page
+cannot have the wallet sign or request a `vtc/rooms/offers/*` task
+(`page-task-policy.ts`). Errors carry the core's stable code
+(`RoomOfferError.code`), and a capability refusal prints the
+`pnm acl update <wallet DID> --capabilities-all` that restores it.
+
+**The badge counts offers below approvals.** An approval holds up an operation,
+so it keeps the badge (red); with none waiting the badge shows the last
+listing's open offers for the active agent (blue).
+
+**What breaks it:** minting a KeyPackage anywhere but the member's VTA, or
+asking for one with `key-package/0.1` (which replaces the one held); keeping a
+record of the member's rooms or of an accept in progress in the wallet, which
+another surface cannot see; asking as the community's DID, or as an identity the sign-in record does
+not name; passing an offer's credentials to the console or a page; accepting
+without the window; or importing `@openvtc/pnm-core/rooms` into the background.
+
 ## The Mediator Lens: the relay, seen from inside
 
 `manager/panes/mediator.tsx` asks the **mediator**, not the agent. An Affinidi
@@ -1011,6 +1324,56 @@ to a surface that cannot contain it".
 to allow `manager.js` "for symmetry" with the admin one; or reading this as
 advice rather than a refusal.
 
+### One piece of material does reach the browser: a room file's key, offscreen only
+
+`rooms/keys/file-key/0.1` returns the key to **one** room file. It is material
+by the test above — the holder cannot revoke it, and a leaked one opens that
+file's ciphertext for as long as the ciphertext exists — but unlike a seed a
+browser genuinely needs it: a member opening a file has to decrypt it
+somewhere, and the bytes must not pass through the VTA. So this one is let in,
+and kept to exactly one context:
+
+- **Only the offscreen document asks for it.** `room-files-offscreen.ts` is the
+  only importer of `@openvtc/pnm-core/rooms/files` (the subpath exists so the
+  URI has somewhere to live that the console does not import), and only
+  `offscreen.ts` imports that module. The key is fetched, handed to
+  `@openvtc/vti-rooms-wasm`'s `FileSealer` / `FileOpener`, and dropped — never
+  stored, logged, returned or posted.
+- **The console sends intents and bytes, and gets progress and verified
+  plaintext** over `ROOM_FILES_PORT`. Never a key, a presentation or a host's
+  reply. `manager/room-files.ts` holds a download's pieces out of a pane's
+  reach and turns them into a `Blob` only once the offscreen document reports
+  the file verified against its author's digest; on anything else they are
+  dropped.
+- **Nothing but the two ends may touch that port.** `chrome.runtime.connect`
+  from the console reaches every extension context, the service worker
+  included, and **`port.disconnect()` from any one receiver closes the whole
+  channel** — the console hears it at once, the offscreen document is never
+  told and carries on for nobody. The worker used to "let it go at once", and
+  every console download failed 1–2 ms in with "the wallet's background
+  document closed before the transfer finished". A receiver that merely goes
+  away only drops itself, so the worker ignores the port; the console's stall
+  timeout (`TRANSFER_STALL_MS`) covers an offscreen document dying mid-way,
+  which the worker's held end would otherwise hide. `room-files.test.mts`
+  fails if `background.ts` singles the port out again.
+- **A CI guard bans the URI from every bundle but the offscreen entry chunk** —
+  `manager.js` included, which makes it the one material guard whose permitted
+  file is not the console — and asserts it is still present there.
+
+Why offscreen and not the console: the console is an extension page a person
+uses, and the offscreen document is the one context the extension owns that is
+not a page. Bounding the key to it bounds a compromise of any page — the
+console's included — to the plaintext that page was shown while it lasted
+(`data-rooms-files.md` §4.1). The page-facing half (P7b: a portal page asking
+for a file, per-room consent, streaming to it) waits for the member portal
+(P8); until then `page-task-policy.ts`'s "a page is not a member" stands.
+
+**What breaks it:** importing `@openvtc/pnm-core/rooms/files` from a console
+pane "just for a type" (the import brings the URI, and the guard trips — import
+types from `@openvtc/pnm-core/rooms` instead); returning the key, or anything
+derived from it, over the port; letting a pane read pieces before `got`; or
+widening the guard's exception to `manager.js`.
+
 ## Advertisement is not availability
 
 A VTA's DID document says what it *offers*. `buildVtaSession` skips a channel
@@ -1142,6 +1505,108 @@ settles as a denial when the window could not be opened.
 before settling, or not at all; denying on `onRemoved` without the grace; or a
 consent surface that opens its own window — the disclosure prompt did, with no
 `onRemoved` at all, and a closed one hung forever.
+
+## Step-up approvers: one key per community, sealed, never named by a page
+
+`window.vtaWallet.{approverIdentity, approveStepUp, attestApprover,
+approveDecision}` serve a VTC's `approverSigned` step-up
+(`auth/step-up/approver/attest/0.1`, carried in
+`auth/step-up/approve-response/0.6`) and its `approverSigned` decision evidence
+(carried in `task-consent/decision/0.2`). The store is
+`core/src/store/step-up-approver.ts`; the checks and the statement are
+`core/src/trust-tasks/approver-attest.ts`; the page rules are
+`extension/src/approver-policy.ts`.
+
+**One approver per audience, minted and sealed rather than derived.** Each VTC
+gets a fresh CSPRNG Ed25519 `did:key`, so no two communities can correlate the
+user by it. Its seed is sealed (X25519 → HKDF → AES-GCM, audience and DID bound
+into info and AAD) to a wallet sealing key whose secret half is wrapped under
+the approver KEK (`ApproverPrfSecretWrap`). That is what lets
+`approverIdentity` mint a new community's DID with **no gesture** while the
+seed is never at rest unsealed; every *use* needs the biometric that unwraps the
+sealing secret. HKDF from one root was rejected: the DID could not be named
+without the gesture, unwrapping the root would yield every community's key, and
+forgetting a community would not forget its key. The sealing key itself is
+created by the first gesture available — an enrolment, or the one-off setup
+prompt `approverIdentity` raises in a wallet that has none. The VTA DTTE
+approver (`approver-identity.ts`, one per VTA) is a separate key and store and
+is untouched.
+
+**Every call is held to the origin's pinned RP** (`pageApproverAudienceRefusal`):
+an `audience` other than the pinned `rpDid` is refused, or a page could read
+every community's approver DID. **The approver key is chosen by the wallet from
+the audience**; no parameter names one. `approveStepUp` refuses before any
+prompt unless that approver is in `request.approvers` and `request.boundTo`
+equals the VTC digest recomputed from the `operation` the prompt then shows
+(`vtcStepUpBoundTo`, pinned to `vti_common`'s vectors); the offscreen document
+re-runs the same checks beside the key. The reason is the page's text and is
+labelled unverified; the operation is the checked part.
+
+**The approve-response is the one approval a page may have signed**, and only
+the one carrying, unchanged, a statement `approveStepUp` issued to that origin
+within five minutes, for the same RP, subject and challenge, signed `asDid` the
+subject — once (`approverResponseRefusal`, consumed before signing). It takes
+no second prompt; every other `auth/step-up/approve-*` stays refused by
+`pageSignRefusal`. The holder signs a page's document for the purpose its type
+decides (`proofPurposeForDocumentType`, mirroring the VTA's
+`ATTESTATION_SLUGS`): an approve-response is `assertionMethod`.
+
+**A decision statement (`purpose: decision`) comes only from
+`approveDecision`.** A VTC (#1920) accepts `approverSigned` evidence on a
+`task-consent/decision/0.2`: an attest/0.1 statement whose `subject` is the
+administrator who signs the decision, `audience`/`recipient` the VTC,
+`challenge` the decision's `challenge` and `boundTo` its `payloadDigest`. The
+console calls
+
+```ts
+const { statement, approverDid } = await window.vtaWallet.approveDecision({
+  audience: vtcDid,                   // must be the origin's pinned RP
+  subject: adminDid,                  // the decision's signer (asDid below)
+  action: { type: a.typeUri, payload: a.payload, actionId: a.actionId, summary: a.summary },
+  decision: { challenge: a.challenge, payloadDigest, decision: "approve" | "deny", reason? },
+});
+// then, unchanged:
+await window.vtaWallet.signTrustTask({ asDid: adminDid, envelope: {
+  type: "https://trusttasks.org/spec/task-consent/decision/0.2", recipient: vtcDid,
+  payload: { challenge, payloadDigest, decision, reason?, actionId?,
+             evidence: { kind: "approverSigned", statement } } } });
+```
+
+`payloadDigest` is the task-consent **wire** digest
+(`vti_common::task_consent::wire_digest`: domain `vta/task-consent/v1\0`, *not*
+the step-up tag, salted with the challenge the VTC issued *this* administrator
+for the action — the listing's own `payloadDigest` is an unsalted display
+digest and is not it). The wallet recomputes it from `action.{type,payload}`
+(`taskConsentWireDigest`, pinned to `vti_common`'s vectors) in the background
+and again in the offscreen beside the key, and refuses on a mismatch
+(`step-up-approver/bound-to-mismatch`) before any prompt. It never mints for a
+decision: no approver for the audience is `step-up-approver/not-enrolled`. The
+prompt shows the action (type, payload, action id), APPROVE or DENY, the
+console's note (`reason`), and the VTC's summary labelled unverified; the
+gesture's binding includes approve/deny. `attestApprover` refuses `decision`
+and `stepUp` (`attestApproverPurposeRefusal`), in the background and the
+offscreen.
+
+The decision around the statement is the second exemption from a second
+prompt, shaped exactly like the approve-response one: `signTrustTask` routes
+any `decision/0.2` whose evidence claims `approverSigned` to
+`decisionResponseRefusal`, never to the generic prompt. It is signed once,
+spent before signing, when it carries the statement `approveDecision` issued to
+this origin within five minutes, unchanged, addressed to the same RP, with the
+same challenge, `payloadDigest`, decision, `reason` and `actionId`, no other
+member, signed `asDid` the statement's subject. Otherwise it is refused. A
+statement issued for a step-up cannot ride a decision, nor the reverse
+(`IssuedApproverStatement.purpose`).
+
+**What breaks it:** letting a page pass an approver DID or key; deriving the
+per-audience keys from one root; skipping the `boundTo` recompute or doing it
+only in the background; recomputing a decision's digest under the step-up tag,
+or unsalted; accepting an `audience` other than the pin; storing a
+sealing key without the approver wrap (`unwrapSecret` accepts passthrough
+silently — `loadStepUpApprover` refuses it); letting `attestApprover` sign a
+`decision`; or widening either exemption past "the statement just issued, with
+what the human saw". `core/tests/store.step-up-approver.mjs`
+and `extension/tests/approver-policy.test.mts` pin these.
 
 ## Repo mechanics worth knowing before you start
 

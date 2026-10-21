@@ -113,9 +113,17 @@
       "types": "./dist/rooms/index.d.ts",
       "import": "./dist/rooms/index.js"
     },
+    "./rooms/files": {
+      "types": "./dist/rooms/files.d.ts",
+      "import": "./dist/rooms/files.js"
+    },
     "./mediator": {
       "types": "./dist/mediator/index.d.ts",
       "import": "./dist/mediator/index.js"
+    },
+    "./links": {
+      "types": "./dist/links/index.d.ts",
+      "import": "./dist/links/index.js"
     }
   },
   "sideEffects": false,
@@ -134,7 +142,7 @@
   "dependencies": {
     "@cfworker/json-schema": "^4.1.1",
     "@noble/curves": "^2.4.0",
-    "@openvtc/trust-tasks": "^0.21.13",
+    "@openvtc/trust-tasks": "^0.26.19",
     "@openvtc/vti-didcomm-js": "^0.12.0",
     "@openvtc/vti-tsp-js": "^0.3.0",
     "@scure/base": "^2.2.0",
@@ -143,6 +151,7 @@
   "devDependencies": {
     "@hpke/chacha20poly1305": "^1.8.0",
     "@hpke/core": "^1.9.0",
+    "@openvtc/vti-rooms-wasm": "^0.1.0",
     "typescript": "^7.0.2"
   }
 }

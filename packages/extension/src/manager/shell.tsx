@@ -19,12 +19,14 @@ import { Icon, type IconName } from "./icons.js";
 import { Note } from "../ui.js";
 import { ContextTree, type ContextSelection } from "./context-column.js";
 import { WhoamiBanner } from "./whoami-banner.js";
+import { FallbackBanner } from "./fallback-banner.js";
 import { ContextsPane } from "./panes/contexts.js";
 import { KeysPane } from "./panes/keys.js";
 import { DidsPane } from "./panes/dids.js";
 import { DidTemplatesPane } from "./panes/did-templates.js";
 import { AccessPane } from "./panes/access.js";
 import { SessionsPane } from "./panes/sessions.js";
+import { AgreementsPane } from "./panes/agreements.js";
 import { ApprovalsPane } from "./panes/approvals.js";
 import { PolicyPane } from "./panes/policy.js";
 import { ServicesPane } from "./panes/services.js";
@@ -51,6 +53,7 @@ export type SectionId =
   | "memory"
   | "app-state"
   | "rooms"
+  | "agreements"
   | "services"
   | "mediator"
   | "maintenance"
@@ -136,6 +139,9 @@ const ACTS: Act[] = [
       // from the room rather than being derived under one of this VTA's
       // hierarchies. A context column here would filter nothing.
       { id: "rooms", label: "Rooms", icon: "rooms", contextScoped: false },
+      // Agreements (MyTerms first) are the wallet's own, keyed by the agent a request
+      // was signed at; a context column would filter nothing.
+      { id: "agreements", label: "Agreements", icon: "terms", contextScoped: false },
     ],
   },
   {
@@ -550,6 +556,8 @@ export function ManagerShell() {
         );
       case "rooms":
         return <RoomsPane parties={parties} contexts={contexts.records} />;
+      case "agreements":
+        return <AgreementsPane parties={parties} />;
       case "services":
         return <ServicesPane parties={parties} authority={vta.authority} />;
       case "mediator":
@@ -675,6 +683,7 @@ export function ManagerShell() {
       </div>
 
       <main style={{ gridArea: "pane", overflowY: "auto", padding: "20px 24px", minWidth: 0 }}>
+        <FallbackBanner agentDid={vta.parties.service.did} />
         {contexts.error && (
           <div style={{ marginBottom: 16 }}>
             <Note tone="danger">

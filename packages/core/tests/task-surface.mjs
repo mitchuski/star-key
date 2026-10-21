@@ -45,10 +45,50 @@ const MEDIATOR_SERVED =
 
 const NOT_IN_SDK = [
   {
+    prefix: "https://trusttasks.org/spec/vtc/directory/",
+    why:
+      "A member's own directory card (vtc/directory-card.ts): card/show, fields/list and " +
+      "card/publish go to the community's VTC, signed as the member through " +
+      "vault/sign-trust-task. The VTC, not the VTA, is the counterparty, so vta-sdk carries " +
+      "no constant for them.",
+  },
+  {
     prefix: "https://trusttasks.org/spec/trust-task-error/",
     why:
       "The error envelope the *service* emits (vta-service/src/trust_tasks/wire_v0_2.rs). " +
       "This library parses it, never sends it, so it is not part of the SDK's client surface.",
+  },
+  {
+    prefix: "https://trusttasks.org/spec/auth/oob/",
+    why:
+      "Wallet sign-in (vtc/oob-sign-in.ts): claim, prove, respond and cancel go to the " +
+      "community's VTC, and identify/grant are documents the member's VTA signs through " +
+      "vault/sign-trust-task, never tasks sent to the agent. The VTC, not the VTA, is the " +
+      "counterparty, so vta-sdk carries no constant for them.",
+  },
+  {
+    prefix: "https://trusttasks.org/spec/vtc/join-requests/manifest/0.3",
+    why:
+      "Joining a community from a trigger link (vtc/join.ts): posted to the VTC's own " +
+      "Trust-Task endpoint as a throwaway key, never sent to the agent. vta-sdk 0.65 " +
+      "declares it (JOIN_REQUEST_MANIFEST_TYPE); this snapshot (0.56.1) predates it. " +
+      "Drop this entry when the snapshot is resynced — the still-needed check will say so.",
+  },
+  {
+    prefix: "https://trusttasks.org/spec/vtc/join-requests/submit/0.3",
+    why:
+      "Joining a community from a trigger link (vtc/join.ts): the member's VTA signs it " +
+      "through vault/sign-trust-task and the wallet posts it to the VTC, so the agent is " +
+      "not the counterparty. vta-sdk 0.65 declares it (JOIN_REQUEST_SUBMIT_TYPE); this " +
+      "snapshot (0.56.1) predates it. Drop this entry when the snapshot is resynced.",
+  },
+  {
+    prefix: "https://trusttasks.org/spec/task-consent/decision/0.2",
+    why:
+      "Never sent as a task by this library. vault/sign-oob.ts builds one only as the " +
+      "device's UV approval of a sign-in grant, carried inside vault/sign-trust-task's " +
+      "payload.ext['org.openvtc.uv-consent'] (VTA feat/oob-sign-in-vta), which the VTA " +
+      "reads as a document, not a dispatched task.",
   },
   {
     prefix: "https://trusttasks.org/spec/push/register/",
@@ -75,11 +115,38 @@ const NOT_IN_SDK = [
       "takes 0.3, which vta-sdk carries and the persona path sends.",
   },
   {
+    prefix: "https://trusttasks.org/spec/auth/step-up/approve-response/0.6",
+    why:
+      "The version a VTC takes `approverSigned` evidence in. The console builds it and has " +
+      "the wallet sign it as the subject; the VTA is not the counterparty " +
+      "(trust-tasks/approver-attest.ts names it only to recognise it).",
+  },
+  {
+    prefix: "https://trusttasks.org/spec/auth/step-up/approver/attest/",
+    why:
+      "A step-up approver's statement, issued by the wallet's per-audience approver and " +
+      "verified by the VTC it is addressed to. Never sent on its own, and never to the VTA.",
+  },
+  {
     prefix: "https://trusttasks.org/spec/auth/authenticate/0.2",
     why:
       "The version the did-hosting control plane serves for `login()`, where the " +
       "wallet binds a session key (rp-login/trust-task.ts). The relying party is " +
       "the counterparty, not the VTA.",
+  },
+  {
+    prefix: "https://trusttasks.org/spec/auth/authenticate/0.1",
+    why:
+      "The deprecated bare-authenticate message to a did-hosting relying party " +
+      "(rp-login/didcomm.ts), kept for a caller with no signing key. The RP serves " +
+      "it; the VTA serves 0.2 and 0.3 (vta/auth-tasks.ts sends 0.2).",
+  },
+  {
+    prefix: "https://trusttasks.org/spec/auth/refresh/0.1",
+    why:
+      "The refresh that ends a did-hosting relying party's step-up " +
+      "(rp-login/step-up.ts), posted to that RP's Trust Task endpoint. The VTA " +
+      "serves 0.2, which vta/auth-tasks.ts sends.",
   },
   {
     prefix: "https://trusttasks.org/spec/task-consent/granted/",
@@ -106,6 +173,19 @@ const NOT_IN_SDK = [
       "Host-served: list/get/put move sealed bytes to and from the host. Sealing " +
       "and opening happen at the member's VTA under `rooms/keys/*`, which is the " +
       "half that does have SDK constants.",
+  },
+  {
+    prefix: "https://trusttasks.org/spec/rooms/blobs/",
+    why:
+      "Host-served: a file's ciphertext moves to and from the room's host in " +
+      "chunks (vti-rooms::blob_tasks). Only ciphertext crosses; the key is " +
+      "`rooms/keys/file-key`, at the member's own VTA.",
+  },
+  {
+    prefix: "https://trusttasks.org/spec/rooms/info/",
+    why:
+      "Host-served: the room's tier, epoch, limits and usage, answered by its " +
+      "host to a `read` presentation.",
   },
   {
     prefix: "https://trusttasks.org/spec/rooms/epoch/",
@@ -422,7 +502,41 @@ test("coverage against the agent's surface is recorded, not discovered", () => {
   // 240 → 246 with the snapshot resynced from vta-sdk 0.47.0 — exactly these
   // six. The resync also taught the scanner that a constant taken from a
   // generated `error_codes::NAME.code` is an error code, not a task.
-  const expected = 212;
+  //
+  // 212 → 213 is `rooms/keys/file-key/0.1`, one file's key from the member's
+  // own VTA (verifiable-trust-infrastructure `data-rooms-files.md` §4). It is
+  // in its own subpath, `rooms/files`, which only the offscreen document
+  // imports, and CI bans its URI from every other bundle: what it returns is
+  // key material. The host-served half of room files (`rooms/blobs/*`,
+  // `rooms/info`) is in NOT_IN_SDK, beside the other host verbs.
+  //
+  // 213 → 216 is acting as the member (`data-rooms-files.md` §8.5):
+  // `rooms/keys/act/0.1` is new, and the snapshot, resynced from vta-sdk 0.69.0,
+  // now lists `rooms/info` and `rooms/records/get` — host verbs the SDK names
+  // since its own client builds them for `act` — so they count here too.
+  //
+  // 216 → 220: `vtc/rooms/offers/list/0.1`, read as the member through
+  // `rooms/keys/act/0.3` for the names of a community's own rooms (the
+  // portal's room list). The snapshot, resynced from vta-sdk 0.70.0, also now
+  // lists `rooms/blobs/chunk` and `rooms/blobs/upload/{commit,abort}` — host
+  // verbs the SDK's own client builds for `act` — so they count here too.
+  //
+  // 220 → 223: accepting one of those offers from the wallet
+  // (`rooms/offer-accept.ts`) — `vtc/rooms/offers/accept/0.1` as the member,
+  // with `rooms/keys/key-package/0.1` and `rooms/keys/welcome/0.1` at the
+  // member's own VTA, the CLI's `pnm rooms offers accept` step for step.
+  // 223 → 224: `rooms/keys/profile/read/0.1`, the room's own name read through
+  // the member's VTA (trust-tasks-tf #807). `write` stays the CLI's for now.
+  // 224 → 225: `rooms/keys/label/0.1`, the member's own name for a room (the
+  // console's Data rooms rows). `rooms/keys/list` moved 0.1 → 0.2 in place, so it
+  // is still one family.
+  // 225 → 226: `vtc/rooms/memberships/list/0.1`, the community's record of the
+  // member's rooms, which every surface reads so each shows the same ones. Its
+  // reads and acceptances move to `rooms/keys/act/0.5` and the KeyPackage to
+  // `rooms/keys/key-package/0.2` in place — still one family each.
+  // 226 → 227: `keys/sign-document/0.1`, the member's agent signing their
+  // external directory card as their DID (vtc/directory-card.ts).
+  const expected = 227;
   assert.equal(
     implemented.size,
     expected,

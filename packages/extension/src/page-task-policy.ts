@@ -43,6 +43,12 @@
 //
 // The refusal is the family, not those three, because the boundary is "a page
 // is not a member" rather than a judgement about particular verbs.
+//
+// That boundary stands. What a community's own portal gets instead (P7b) is
+// `window.vtaWallet.rooms` (`room-page-background.ts`): the wallet fixes the
+// verb and runs the flow, the page must be the portal its community's DID
+// document names, it sees only rooms the member shared with it, and every write
+// is confirmed. It never receives a task's reply as such.
 
 /**
  * The task families a page may never drive directly, with what to say instead.
@@ -67,8 +73,30 @@ const REFUSED: { prefix: string; why: string }[] = [
       "holds none of them. Reading a record returns plaintext the room withholds " +
       "even from its host; listing keys discloses what the holder is a member of; " +
       "and the owner verbs mint credentials in the room's name, which is authority " +
-      "to admit or promote. A member drives their rooms from their own wallet, " +
-      "where the screen can say which room, which epoch, and what is being given.",
+      "to admit or promote. A community's own member portal uses the rooms a member " +
+      "shares with it through window.vtaWallet.rooms, whose verbs are fixed, whose " +
+      "flows run in the wallet, and whose every write the member confirms.",
+  },
+  // A community's offers of its rooms. Accepting one admits the member to a
+  // room's encrypted group with a key package their agent mints, so a page
+  // that got one signed through the generic prompt would have joined them to a
+  // room on a "Sign <type>" line that says none of that. The portal asks
+  // through `window.vtaWallet.rooms.acceptOffer`, whose window does.
+  {
+    prefix: "https://trusttasks.org/spec/vtc/rooms/offers/",
+    why:
+      "Accepting a community's offer of a room joins the member to it, and a generic prompt cannot say so. " +
+      "A community's own member portal lists offers with window.vtaWallet.rooms.offers and asks to accept one " +
+      "with window.vtaWallet.rooms.acceptOffer, which the member decides in the wallet's own window.",
+  },
+  // A community's record of the member's rooms. It says which of the community's
+  // rooms this member is in, and the portal already reads it, as the member's
+  // other surfaces do, through `window.vtaWallet.rooms.offers`.
+  {
+    prefix: "https://trusttasks.org/spec/vtc/rooms/memberships/",
+    why:
+      "The community's record of which of its rooms the member is in is read by the wallet, as the member. " +
+      "A community's own member portal lists it with window.vtaWallet.rooms.offers.",
   },
   // A mediator's own operations surface (`@openvtc/pnm-core/mediator`). A page
   // routing one of these to an agent would be misaddressed anyway — they are
@@ -83,6 +111,30 @@ const REFUSED: { prefix: string; why: string }[] = [
       "accounts and a live feed of whom the holder exchanges messages with. A page " +
       "has no use for any of it that the holder should be asked to approve; the " +
       "holder inspects their own relay from the wallet's console.",
+  },
+  // A member's directory card (`directory-page.ts`). Publishing it puts what
+  // they show anyone beyond the community, signed by them: a page asks for
+  // that through `window.vtaWallet.directory.publishCard`, which shows every
+  // value first.
+  {
+    prefix: "https://trusttasks.org/spec/vtc/directory/",
+    why:
+      "The directory family reads and publishes the member's own card. Ask for " +
+      "publication with window.vtaWallet.directory.publishCard, which shows the " +
+      "member every value and that anyone will be able to read it before anything " +
+      "is signed.",
+  },
+  // A Data Integrity proof made as one of the holder's DIDs over a document the
+  // caller chose: a credential, a published card. A generic task prompt cannot
+  // show what the holder would be asserting.
+  {
+    prefix: "https://trusttasks.org/spec/keys/sign-document/",
+    why:
+      "keys/sign-document makes a proof, as one of the holder's DIDs, over a " +
+      "document the caller wrote, which every verifier will read as the holder's " +
+      "own assertion. A page cannot ask for one: the wallet signs a document only " +
+      "within a flow that shows the holder what it says, such as " +
+      "window.vtaWallet.directory.publishCard.",
   },
 ];
 

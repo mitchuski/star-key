@@ -37,7 +37,19 @@ import {
   RESPONSE_TYPE_URI as KEYS_LIST_RESPONSE,
   type RoomsKeysListPayload,
   type RoomsKeysListResponsePayload,
+  type PersonalLabel,
+} from "@openvtc/trust-tasks/rooms/keys/list/0.2/payload";
+import {
+  TYPE_URI as KEYS_LIST_V01,
+  RESPONSE_TYPE_URI as KEYS_LIST_V01_RESPONSE,
+  type RoomsKeysListResponsePayload as RoomsKeysListV01ResponsePayload,
 } from "@openvtc/trust-tasks/rooms/keys/list/0.1/payload";
+import {
+  TYPE_URI as KEYS_LABEL,
+  RESPONSE_TYPE_URI as KEYS_LABEL_RESPONSE,
+  type RoomsKeysLabelPayload,
+  type RoomsKeysLabelResponsePayload,
+} from "@openvtc/trust-tasks/rooms/keys/label/0.1/payload";
 import {
   TYPE_URI as KEYS_OPEN,
   RESPONSE_TYPE_URI as KEYS_OPEN_RESPONSE,
@@ -76,11 +88,61 @@ async function call<Res>(
   });
 }
 
-/** One room this VTA can open. */
-export type HeldRoom = RoomsKeysListResponsePayload["rooms"][number];
+import { ROOMS_MEMBER_EXT, memberExt } from "./member.js";
+export { ROOMS_MEMBER_EXT, memberExt };
+
+export type { PersonalLabel };
 
 /**
- * The rooms this VTA holds keys for — **custody, not membership**.
+ * One room this VTA can open, **for one member**.
+ *
+ * `member` is the persona DID the entry is held as (`rooms/keys/list/0.2`).
+ * `context` is the trust context its key lives in, and `actions` what the
+ * room's grant to it confers — read from the listing's
+ * `ext["org.openvtc.rooms"].held`, index for index with `rooms`. An `admin`
+ * grant is the room's administering place (a community's own, for a room it
+ * owns), anything else a member's. Both are descriptions, never authority: the
+ * host decides what a member may do.
+ *
+ * `personal` is the member's own private label for the room, present only when
+ * the list was asked for with `includePersonal` and the member has one.
+ */
+export type HeldRoom = RoomsKeysListResponsePayload["rooms"][number] & {
+  context?: string;
+  actions?: string[];
+};
+
+/** The trust context and grant of each `rooms/keys/list` entry, read from `ext`. */
+function heldBy(ext: unknown, i: number): { context?: string; actions?: string[]; member?: string } {
+  const held = (ext as Record<string, { held?: unknown } | undefined> | undefined)?.[ROOMS_MEMBER_EXT]?.held;
+  const h = Array.isArray(held) ? (held[i] as Record<string, unknown> | undefined) : undefined;
+  if (!h || typeof h !== "object") return {};
+  const out: { context?: string; actions?: string[]; member?: string } = {};
+  if (typeof h.member === "string") out.member = h.member;
+  if (typeof h.context === "string") out.context = h.context;
+  if (Array.isArray(h.actions)) out.actions = h.actions.filter((a): a is string => typeof a === "string");
+  return out;
+}
+
+/** A row key for a held room: the room and the member it is held as. */
+export function heldRoomKey(r: Pick<HeldRoom, "roomId" | "member">): string {
+  return `${r.roomId}|${r.member}`;
+}
+
+export interface RoomsListOptions {
+  /**
+   * Ask for each entry's personal label (`rooms/keys/label`). **Only for the
+   * member's own surfaces.** A label is what the member calls a room for
+   * themselves, and a list that will be handed on — to a member portal, or any
+   * page — is asked for without it, so the wallet never holds a label it is not
+   * going to show (`rooms/keys/list/0.2` consumer item 3). Default `false`.
+   */
+  includePersonal?: boolean;
+}
+
+/**
+ * The rooms this VTA holds keys for — **custody, not membership** — one entry
+ * per room and member (`rooms/keys/list/0.2`).
  *
  * A room whose Welcome never arrived is absent even where a good membership
  * credential is held, and a VTA not yet told of a removal still lists a room it
@@ -96,23 +158,162 @@ export type HeldRoom = RoomsKeysListResponsePayload["rooms"][number];
 export async function roomsKeysList(
   sender: TrustTaskSender,
   parties: RoomsCaller,
+  options: RoomsListOptions = {},
 ): Promise<HeldRoom[]> {
-  const res = await call<RoomsKeysListResponsePayload>(
+  const payload: RoomsKeysListPayload = options.includePersonal === true ? { includePersonal: true } : {};
+  let res: RoomsKeysListResponsePayload;
+  try {
+    res = await call<RoomsKeysListResponsePayload>(
+      sender,
+      parties,
+      KEYS_LIST,
+      KEYS_LIST_RESPONSE,
+      "rooms/keys/list/0.2",
+      payload,
+    );
+  } catch (e) {
+    if (!servesOnlyAnOlderList(e)) throw e;
+    return roomsKeysListV01(sender, parties);
+  }
+  return (res.rooms ?? []).map((r, i) => {
+    const { member: _fromExt, ...held } = heldBy(res.ext, i);
+    const room: HeldRoom = { ...r, ...held };
+    // Never carry a label the caller did not ask for, whatever came back.
+    if (options.includePersonal !== true) delete room.personal;
+    return room;
+  });
+}
+
+/**
+ * Whether the member's VTA refused `rooms/keys/list/0.2` for its version, which a
+ * VTA one release behind does: it serves 0.1. Members update their VTAs on their
+ * own schedule, so the wallet does not stop listing rooms until they do.
+ */
+function servesOnlyAnOlderList(e: unknown): boolean {
+  const details = (e as { details?: unknown } | null)?.details;
+  const code = details && typeof details === "object" ? (details as { code?: unknown }).code : undefined;
+  if (typeof code !== "string") return false;
+  const local = code.slice(code.lastIndexOf(":") + 1);
+  return local === "unsupportedVersion" || local === "unsupportedType";
+}
+
+/**
+ * `rooms/keys/list/0.1`, for a VTA that does not serve 0.2. It names each
+ * entry's member in `ext["org.openvtc.rooms"].held` rather than on the entry, and
+ * has no personal labels, so none are returned whatever was asked.
+ */
+async function roomsKeysListV01(sender: TrustTaskSender, parties: RoomsCaller): Promise<HeldRoom[]> {
+  const res = await call<RoomsKeysListV01ResponsePayload>(
     sender,
     parties,
-    KEYS_LIST,
-    KEYS_LIST_RESPONSE,
+    KEYS_LIST_V01,
+    KEYS_LIST_V01_RESPONSE,
     "rooms/keys/list/0.1",
-    {} satisfies RoomsKeysListPayload,
+    {},
   );
-  return res.rooms ?? [];
+  return (res.rooms ?? []).map((r, i) => {
+    const held = heldBy(res.ext, i);
+    return { ...r, ...held } as HeldRoom;
+  });
+}
+
+/** What {@link roomsKeysLabel} changes; a detail left out stays as it is. */
+export interface RoomLabelEdit {
+  /** The member's name for the room: one line, up to 128 characters. */
+  label?: string;
+  /** Up to 1000 characters; line breaks allowed. */
+  description?: string;
+  /** Up to 4000 characters; line breaks allowed. */
+  notes?: string;
+  /** One to sixteen tags of up to 32 characters, replacing the whole set. */
+  tags?: string[];
+  removeLabel?: boolean;
+  removeDescription?: boolean;
+  removeNotes?: boolean;
+  removeTags?: boolean;
+}
+
+export interface RoomsLabelParams extends RoomsCaller, RoomLabelEdit {
+  roomId: string;
+  /** The member the label is for — the row's `member`; never inferred. */
+  member: string;
+}
+
+/**
+ * The `rooms/keys/label/0.1` payload for an edit: each detail given replaces
+ * the stored one, each removal removes one, and the rest stay. Refuses an edit
+ * that changes nothing or both gives and removes one detail, before anything is
+ * sent.
+ */
+export function roomLabelPayload(roomId: string, member: string, edit: RoomLabelEdit): RoomsKeysLabelPayload {
+  const out: RoomsKeysLabelPayload = { roomId, member };
+  let changes = 0;
+  const pair = <K extends "label" | "description" | "notes">(key: K, remove: boolean | undefined) => {
+    const v = edit[key];
+    if (v !== undefined && remove === true) throw new Error(`rooms/keys/label: \`${key}\` is both given and removed`);
+    if (v !== undefined) {
+      out[key] = v;
+      changes++;
+    } else if (remove === true) {
+      changes++;
+    }
+  };
+  pair("label", edit.removeLabel);
+  if (edit.removeLabel === true && edit.label === undefined) out.removeLabel = true;
+  pair("description", edit.removeDescription);
+  if (edit.removeDescription === true && edit.description === undefined) out.removeDescription = true;
+  pair("notes", edit.removeNotes);
+  if (edit.removeNotes === true && edit.notes === undefined) out.removeNotes = true;
+  if (edit.tags !== undefined && edit.removeTags === true) throw new Error("rooms/keys/label: `tags` is both given and removed");
+  if (edit.tags !== undefined) {
+    if (edit.tags.length === 0) throw new Error("rooms/keys/label: give at least one tag, or remove them all");
+    if (edit.tags.length > 16) throw new Error("rooms/keys/label: at most 16 tags");
+    // One to sixteen, checked just above — the tuple type the schema generates.
+    out.tags = edit.tags as NonNullable<RoomsKeysLabelPayload["tags"]>;
+    changes++;
+  } else if (edit.removeTags === true) {
+    out.removeTags = true;
+    changes++;
+  }
+  if (changes === 0) throw new Error("rooms/keys/label: the edit changes nothing");
+  return out;
+}
+
+/**
+ * Set, change or remove the member's own private name, description, notes and
+ * tags for a room they hold (`rooms/keys/label/0.1`). Kept by their VTA beside
+ * the room's keys and sent nowhere else. Idempotent: a repeat answers
+ * `changed: false`. Returns the label as it now stands (`personal` absent once
+ * the last detail is removed).
+ *
+ * A label is the member's alone: never put one in anything sent to a room, its
+ * host or a community, and never hand one to a page the member has not chosen
+ * to show it to.
+ */
+export async function roomsKeysLabel(
+  sender: TrustTaskSender,
+  params: RoomsLabelParams,
+): Promise<RoomsKeysLabelResponsePayload> {
+  const { holder, service, roomId, member, ...edit } = params;
+  return call<RoomsKeysLabelResponsePayload>(
+    sender,
+    { holder, service },
+    KEYS_LABEL,
+    KEYS_LABEL_RESPONSE,
+    "rooms/keys/label/0.1",
+    roomLabelPayload(roomId, member, edit),
+  );
 }
 
 export interface RoomsOpenParams extends RoomsCaller {
   roomId: string;
+  /** The member to open as, where the VTA holds more than one of the room ({@link memberExt}). */
+  member?: string;
   key: string;
+  /** Where the body was sealed: {@link sealedAt}, not necessarily the record's version. */
   version: number;
-  sealed: { ciphertext: string; nonce: string; epoch: number };
+  /** The host's sealed object; its `version`, if any, is not forwarded. */
+  sealed: { ciphertext: string; nonce: string; epoch: number; version?: number };
 }
 
 /**
@@ -127,16 +328,65 @@ export async function roomsKeysOpen(
   sender: TrustTaskSender,
   params: RoomsOpenParams,
 ): Promise<string> {
-  const { holder, service, ...rest } = params;
+  return (await roomsKeysOpenAt(sender, params)).plaintext;
+}
+
+/**
+ * The version a sealed body was sealed at, for a record now at `recordVersion`:
+ * the host's `sealed.version` where it served one, else the record's own.
+ *
+ * A curation moves a record to a new version and keeps its body, and the body
+ * stays bound — by the AEAD and by its author's signed location — to the
+ * version it was written at (rooms `_shared/0.1` `SealedRecord.version`). A
+ * `sealed.version` above the record's is refused: a body cannot have been
+ * sealed for a version the room had not reached.
+ */
+export function sealedAt(sealed: { version?: number }, recordVersion: number): number {
+  const v = sealed.version;
+  if (v === undefined) return recordVersion;
+  if (!Number.isSafeInteger(v) || v < 1 || v > recordVersion) {
+    throw new Error(
+      `the host says this body was sealed at version ${String(v)}, which is not a version at or before the record's ${recordVersion}`,
+    );
+  }
+  return v;
+}
+
+/**
+ * {@link roomsKeysOpen}, and the version the body opened at — the location a
+ * reader verifies the author's signature against.
+ *
+ * `params.version` is where the caller believes the body was sealed
+ * ({@link sealedAt}). A record curated by a host that predates
+ * `sealed.version` opens there for nobody, so the VTA searches earlier
+ * versions and names the one that opened in `ext["org.openvtc.rooms"].sealedAt`.
+ * Only the three members `rooms/keys/open` takes are sent of `sealed`.
+ */
+export async function roomsKeysOpenAt(
+  sender: TrustTaskSender,
+  params: RoomsOpenParams,
+): Promise<{ plaintext: string; sealedAt: number }> {
+  const { holder, service, member, sealed, ...rest } = params;
   const res = await call<RoomsKeysOpenResponsePayload>(
     sender,
     { holder, service },
     KEYS_OPEN,
     KEYS_OPEN_RESPONSE,
     "rooms/keys/open/0.1",
-    rest as unknown as RoomsKeysOpenPayload,
+    {
+      ...rest,
+      sealed: { ciphertext: sealed.ciphertext, nonce: sealed.nonce, epoch: sealed.epoch },
+      ...memberExt(member),
+    } as unknown as RoomsKeysOpenPayload,
   );
-  return res.plaintext;
+  const named = (res.ext as Record<string, { sealedAt?: unknown } | undefined> | undefined)?.[ROOMS_MEMBER_EXT]?.sealedAt;
+  if (named === undefined) return { plaintext: res.plaintext, sealedAt: params.version };
+  if (typeof named !== "number" || !Number.isSafeInteger(named) || named < 1 || named > params.version) {
+    throw new Error(
+      `${service.did} opened the record at version ${String(named)}, which is not at or before the ${params.version} it was asked for`,
+    );
+  }
+  return { plaintext: res.plaintext, sealedAt: named };
 }
 
 export interface RoomsSealParams extends RoomsCaller {
@@ -150,6 +400,8 @@ export interface RoomsSealParams extends RoomsCaller {
   version: number;
   /** The record body, base64url. */
   plaintext: string;
+  /** The member whose group seals it, where the VTA holds more than one of the room. */
+  member?: string;
 }
 
 /** Seal a record body for storage. Does not write — see the module note. */
@@ -157,14 +409,14 @@ export async function roomsKeysSeal(
   sender: TrustTaskSender,
   params: RoomsSealParams,
 ): Promise<RoomsKeysSealResponsePayload["sealed"]> {
-  const { holder, service, ...rest } = params;
+  const { holder, service, member, ...rest } = params;
   const res = await call<RoomsKeysSealResponsePayload>(
     sender,
     { holder, service },
     KEYS_SEAL,
     KEYS_SEAL_RESPONSE,
     "rooms/keys/seal/0.1",
-    rest as unknown as RoomsKeysSealPayload,
+    { ...rest, ...memberExt(member) } as unknown as RoomsKeysSealPayload,
   );
   return res.sealed;
 }
@@ -305,13 +557,14 @@ import {
  */
 export async function roomsKeysBackfill(
   sender: TrustTaskSender,
-  params: RoomsCaller & { roomId: string; host: string; fromEpoch?: number; limit?: number },
+  params: RoomsCaller & { roomId: string; host: string; fromEpoch?: number; limit?: number; member?: string },
 ): Promise<RoomsKeysBackfillResponsePayload> {
   const payload: RoomsKeysBackfillPayload = {
     roomId: params.roomId,
     host: params.host,
     ...(params.fromEpoch !== undefined ? { fromEpoch: params.fromEpoch } : {}),
     ...(params.limit !== undefined ? { limit: params.limit } : {}),
+    ...memberExt(params.member),
   };
   return call<RoomsKeysBackfillResponsePayload>(
     sender,
@@ -360,12 +613,13 @@ import {
  */
 export async function roomsKeysRead(
   sender: TrustTaskSender,
-  params: RoomsCaller & { roomId: string; host: string; key: string },
+  params: RoomsCaller & { roomId: string; host: string; key: string; member?: string },
 ): Promise<RoomsKeysReadResponsePayload> {
   const payload: RoomsKeysReadPayload = {
     roomId: params.roomId,
     host: params.host,
     key: params.key,
+    ...memberExt(params.member),
   };
   return call<RoomsKeysReadResponsePayload>(
     sender,
@@ -406,6 +660,8 @@ export async function roomsKeysBrowse(
     prefix?: string;
     sinceVersion?: number;
     limit?: number;
+    /** The member to read as, where the VTA holds more than one of the room. */
+    member?: string;
   },
 ): Promise<RoomsKeysBrowseResponsePayload> {
   const payload: RoomsKeysBrowsePayload = {
@@ -414,6 +670,7 @@ export async function roomsKeysBrowse(
     ...(params.prefix !== undefined ? { prefix: params.prefix } : {}),
     ...(params.sinceVersion !== undefined ? { sinceVersion: params.sinceVersion } : {}),
     ...(params.limit !== undefined ? { limit: params.limit } : {}),
+    ...memberExt(params.member),
   };
   return call<RoomsKeysBrowseResponsePayload>(
     sender,
@@ -427,9 +684,10 @@ export async function roomsKeysBrowse(
 
 export async function roomsKeysChain(
   sender: TrustTaskSender,
-  params: RoomsCaller & { roomId: string; links: EpochLink[] },
+  params: RoomsCaller & { roomId: string; links: EpochLink[]; member?: string },
 ): Promise<RoomsKeysChainResponsePayload> {
   const payload: RoomsKeysChainPayload = {
+    ...memberExt(params.member),
     roomId: params.roomId,
     // `links` is `[EpochLink, ...EpochLink[]]` — the schema's `minItems: 1`. A
     // caller with nothing to deliver must not send an empty delivery, so the
@@ -819,3 +1077,16 @@ export async function roomsOwnerIssueAuthority(
     rest as unknown as RoomsOwnerIssueAuthorityPayload,
   );
 }
+
+// Acting as the member — the persona, never this wallet (`rooms/keys/act`).
+export * from "./act.js";
+
+// A community's offers of its own rooms, read as the member — for their names.
+export * from "./offers.js";
+
+// Accepting one of those offers: credentials into the VTA, a KeyPackage it
+// mints, the acceptance as the member, and the Welcome back to the VTA.
+export * from "./offer-accept.js";
+
+// The room's own profile — what it calls itself, read through the member's VTA.
+export * from "./profile.js";

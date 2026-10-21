@@ -15,10 +15,30 @@ import {
   pageTaskRefusal,
 } from "./page-task-policy.js";
 import {
+  APPROVE_RESPONSE_0_6,
+  ISSUED_STATEMENT_TTL_MS,
+  approverResponseRefusal,
+  approverResponseStatementId,
+  attestApproverPurposeRefusal,
+  decisionResponseRefusal,
+  decisionStatementId,
+  decisionSummaryText,
+  isApproverSignedDecision,
+  pageApproverAudienceRefusal,
+  type ApproverConsentRequest,
+  type IssuedApproverStatement,
+  APPROVER_CONSENT_PREFIX,
+} from "./approver-policy.js";
+import {
   disclosureStepUpFrom,
   type DisclosureStepUpRequired,
 } from "@openvtc/pnm-core/persona";
-import { IndexedDBKVStore, isDidKey, listPendingInbound } from "@openvtc/pnm-core";
+import {
+  IndexedDBKVStore,
+  isDidKey,
+  listPendingInbound,
+  STEP_UP_APPROVER_SETUP_REQUIRED,
+} from "@openvtc/pnm-core";
 import {
   parseActiveVtaDid,
   parseAllVtaDids,
@@ -28,6 +48,25 @@ import {
   readAllVtaDids,
 } from "./active-vta.js";
 import { checkOriginPin, pinOrigin, readOriginPin, type OriginPinStatus } from "./origin-pin.js";
+import { RoomPageGates, type PortLike } from "./room-page-background.js";
+import {
+  DIRECTORY_CONSENT_PREFIX,
+  DirectoryPageGates,
+  type DirectoryPublishConsentView,
+} from "./directory-page.js";
+import { MembershipPageGates } from "./membership-page.js";
+import { readAgreements } from "./agreements-store.js";
+import { RoomOffers, RoomOffersRefusal } from "./room-offers-background.js";
+import type { RoomOfferConsentView } from "./room-offers-policy.js";
+import {
+  grantsKey,
+  mergeRoomNames,
+  roomNamesKey,
+  ROOM_CONSENT_PREFIX,
+  type RoomGrant,
+  type RoomShareConsentView,
+  type RoomWriteConsentView,
+} from "./room-page-policy.js";
 import { isOriginTrusted, trustOrigin } from "./trusted-sites.js";
 import { promptMayRemember, trustMaySkipPrompt } from "./login-consent.js";
 import {
@@ -37,7 +76,7 @@ import {
   rememberHolderIdentity,
 } from "./site-identity.js";
 import {
-  buildProfileEntry,
+  bindProfile,
   decideSiteIdentity,
   matchProfileEntry,
   PROFILE_SECRET_KIND,
@@ -100,6 +139,8 @@ import {
   RUNTIME_TRANSPORT_HEALTH,
   RUNTIME_RUN_DIAGNOSTICS,
   RUNTIME_EMIT_WALLET_EVENT,
+  RUNTIME_NOTIFY,
+  type RuntimeNotifyRequest,
   type WalletEventKind,
   RUNTIME_CREATE_CONTEXT,
   RUNTIME_DERIVE_SIGNING_KEY_ID,
@@ -123,11 +164,46 @@ import {
   type RuntimeDiscloseRequest,
   type RuntimeDiscloseResponse,
   RUNTIME_MANAGER_TASK,
+  RUNTIME_ROOM_FILES_PREPARE,
+  RUNTIME_ROOMS_PAGE,
+  RUNTIME_ROOM_OFFERS,
+  OFFSCREEN_ROOM_OFFERS,
+  type OffscreenRoomOffersResponse,
+  type RuntimeRoomOffersRequest,
+  type RuntimeRoomOffersResponse,
+  ROOM_FILES_PAGE_PORT,
+  OFFSCREEN_ROOMS_PAGE,
+  type OffscreenRoomsPageResponse,
+  type RuntimeRoomsPageRequest,
+  RUNTIME_DIRECTORY_PAGE,
+  RUNTIME_MEMBERSHIP_PAGE,
+  OFFSCREEN_DIRECTORY_PAGE,
+  type OffscreenDirectoryPageResponse,
+  type RuntimeDirectoryPageRequest,
+  type RuntimeMembershipPageRequest,
+  OFFSCREEN_ROOM_HOST_ENDPOINT,
+  ROOM_FILES_PORT,
+  type RuntimeRoomFilesPrepareRequest,
+  type RuntimeRoomFilesPrepareResponse,
+  type OffscreenRoomHostEndpointResponse,
   RUNTIME_MEDIATOR,
   OFFSCREEN_MEDIATOR,
   type RuntimeMediatorRequest,
   type RuntimeMediatorResponse,
   RUNTIME_SIGN_TRUST_TASK,
+  RUNTIME_APPROVER_IDENTITY,
+  RUNTIME_APPROVE_STEP_UP,
+  RUNTIME_ATTEST_APPROVER,
+  RUNTIME_APPROVE_DECISION,
+  OFFSCREEN_STEP_UP_APPROVER,
+  type StepUpApproverOp,
+  type OffscreenStepUpApproverResponse,
+  type RuntimeApproverIdentityRequest,
+  type RuntimeApproverIdentityResponse,
+  type RuntimeApproveStepUpRequest,
+  type RuntimeAttestApproverRequest,
+  type RuntimeApproveDecisionRequest,
+  type RuntimeApproverStatementResponse,
   RUNTIME_TASK_CONSENT,
   CONSENT_KEEPALIVE_PORT,
   RUNTIME_STEP_UP_CONSENT,
@@ -230,6 +306,31 @@ import {
 import { vetEgressUrl } from "./proxy-url.js";
 import { ConsentReplayLedger, replayKey } from "./consent-replay.js";
 import { deliverConsentResult, openConsentWindow, type ConsentDecision } from "./consent-window.js";
+import { parseTriggerLink } from "@openvtc/pnm-core/links";
+import { isTriggerLinkShaped } from "./trigger-link-click.js";
+import {
+  RUNTIME_TRIGGER_LINK,
+  RUNTIME_TRIGGER_LINK_NUMBER,
+  RUNTIME_SIGN_IN_STEP,
+  OFFSCREEN_SIGN_IN_STEP,
+  RUNTIME_UV_SETTINGS,
+  OFFSCREEN_UV_SETTINGS,
+  type RuntimeUvSettingsRequest,
+  type RuntimeUvSettingsResponse,
+  type OffscreenUvSettingsRequest,
+  OFFSCREEN_SIGN_IN_PAGE_NUMBER,
+  type OffscreenSignInPageNumberRequest,
+  type RuntimeTriggerLinkNumberRequest,
+  type RuntimeTriggerLinkRequest,
+  type RuntimeSignInStepRequest,
+  type RuntimeSignInStepResponse,
+  type OffscreenSignInStepRequest,
+  RUNTIME_JOIN_COMMUNITY,
+  type RuntimeJoinCommunityRequest,
+  type RuntimeJoinCommunityResponse,
+} from "./bridge-protocol.js";
+import { failureLogFields } from "./sign-in-failure.js";
+import { communityDidFromText } from "./community-did.js";
 
 /** Consent-gated requests awaiting their one exempt replay. In-memory by
  *  design: a service-worker restart loses it, and losing it costs one extra
@@ -690,10 +791,18 @@ async function refreshPendingBadge(): Promise<void> {
   try {
     const pending = await listPendingInbound(new IndexedDBKVStore());
     const waiting = pending.filter((p: { isApprover: boolean }) => p.isApprover).length;
-    await chrome.action.setBadgeText({ text: waiting > 0 ? String(waiting) : "" });
     if (waiting > 0) {
+      await chrome.action.setBadgeText({ text: String(waiting) });
       await chrome.action.setBadgeBackgroundColor({ color: "#8B1A1A" });
+      return;
     }
+    // Below an approval, never beside it: a room offer waits for the member,
+    // where an approval holds up an operation. Its own colour, so the two are
+    // not read as one count. Written by the last offers listing for the
+    // active agent (`ROOM_OFFERS_OPEN_KEY`).
+    const offers = await openRoomOffersForActive();
+    await chrome.action.setBadgeText({ text: offers > 0 ? String(offers) : "" });
+    if (offers > 0) await chrome.action.setBadgeBackgroundColor({ color: "#1F5FAD" });
   } catch (err) {
     // Never let a cosmetic surface break a wake path.
     console.warn("[pnm consent] could not refresh the pending badge:", err);
@@ -704,6 +813,245 @@ async function refreshPendingBadge(): Promise<void> {
 // doorbell. Idempotent and cheap, so running it often costs nothing and means
 // no single missed call leaves the badge lying.
 void refreshPendingBadge();
+
+// A room-file transfer runs between the console and the offscreen document.
+// This worker is not part of it, but every extension context receives the
+// port, this one included — and it must leave it alone. **`port.disconnect()`
+// from any one receiver closes the whole channel**: the console's end hears
+// it at once while the offscreen document, never told, carries on with a
+// transfer nobody is reading. This worker used to "let it go at once", and
+// every console download failed 1–2 ms after it began, with no message heard
+// ("the wallet's background document closed before the transfer finished").
+//
+// A receiver that merely goes away — this worker idling out, a document
+// unloading — only drops itself, so ignoring the port is safe. What holding it
+// costs is the case the old line was guarding: an offscreen document that dies
+// mid-transfer is not heard of while this worker still holds its end. The
+// console's stall timeout covers that (`TRANSFER_STALL_MS`, room-files.ts).
+//
+// So there is deliberately no `onConnect` listener for ROOM_FILES_PORT here.
+
+// ── Data rooms for a page (P7b) ─────────────────────────────────────────────
+//
+// `window.vtaWallet.rooms.*`. The gates — the page is the community's portal by
+// its DID document, the member shared the room with it, and a write is
+// confirmed — are `room-page-background.ts`; this wires them to the browser.
+// VTI `data-rooms-files.md` §8.5.
+
+/** Raise a room prompt (share, write or accept an offer) and wait. Closed or unopened is a denial. */
+async function requestRoomConsent(
+  view: RoomShareConsentView | RoomWriteConsentView | RoomOfferConsentView,
+): Promise<{ approved: boolean; selectedRooms?: string[] }> {
+  const consentId = crypto.randomUUID();
+  await chrome.storage.session.set({ [`${ROOM_CONSENT_PREFIX}${consentId}`]: view });
+  const url = `${chrome.runtime.getURL("confirm.html")}?cid=${consentId}&kind=room`;
+  const bounds = await consentWindowBounds(view.kind === "share" ? 640 : 560);
+  return new Promise((resolve) => {
+    let settled = false;
+    const settle = (approved: boolean, selectedRooms?: string[]) => {
+      if (settled) return;
+      settled = true;
+      pendingConsents.delete(consentId);
+      void chrome.storage.session.remove(`${ROOM_CONSENT_PREFIX}${consentId}`);
+      resolve(approved ? { approved: true, ...(selectedRooms ? { selectedRooms } : {}) } : { approved: false });
+    };
+    pendingConsents.set(consentId, (approved, _remember, _prf, _did, selectedRooms) => settle(approved, selectedRooms));
+    openConsentWindow({ url, bounds, deny: () => settle(false), tag: "[pnm rooms]", what: "room window" });
+  });
+}
+
+// ── A community's offers of its rooms ───────────────────────────────────────
+//
+// The console's Offers section and a community's own portal both come here
+// (`room-offers-background.ts`); every accept is confirmed in the wallet's own
+// window first, and the work runs in the offscreen document.
+
+/** `chrome.storage.local`: how many offers wait, for which agent — the badge's count. */
+const ROOM_OFFERS_OPEN_KEY = "room-offers-open";
+
+async function openRoomOffersForActive(): Promise<number> {
+  const stored = (await chrome.storage.local.get(ROOM_OFFERS_OPEN_KEY))[ROOM_OFFERS_OPEN_KEY] as
+    | { vtaDid?: unknown; count?: unknown }
+    | undefined;
+  if (!stored || typeof stored.count !== "number" || stored.count <= 0) return 0;
+  const active = await readActiveConnection();
+  return active.ok && active.conn.vtaDid === stored.vtaDid ? stored.count : 0;
+}
+
+async function activeOffersVta(): Promise<
+  { ok: true; vta: { vtaDid: string; restBaseUrl?: string } } | { ok: false; error: string }
+> {
+  const active = await readActiveConnection();
+  if (!active.ok) return { ok: false, error: active.error };
+  return {
+    ok: true,
+    vta: { vtaDid: active.conn.vtaDid, ...(active.conn.restBaseUrl ? { restBaseUrl: active.conn.restBaseUrl } : {}) },
+  };
+}
+
+const roomOffers = new RoomOffers({
+  active: activeOffersVta,
+  async offscreen(vta, params) {
+    await ensureOffscreenDocument();
+    const reply = (await chrome.runtime.sendMessage({
+      target: OFFSCREEN_TARGET,
+      type: OFFSCREEN_ROOM_OFFERS,
+      vtaDid: vta.vtaDid,
+      ...(vta.restBaseUrl ? { restBaseUrl: vta.restBaseUrl } : {}),
+      params,
+    })) as OffscreenRoomOffersResponse | undefined;
+    return reply ?? { ok: false, error: "the offscreen document did not answer" };
+  },
+  canReach: (url) => hasOriginPermission(url),
+  prompt: requestRoomConsent,
+  async rememberNames(vtaDid, communityDid, names) {
+    const key = roomNamesKey(vtaDid, communityDid);
+    const remembered = (await chrome.storage.local.get(key))[key];
+    await chrome.storage.local.set({ [key]: mergeRoomNames(remembered, names, Date.now()) });
+  },
+  async setOpenCount(vtaDid, count) {
+    await chrome.storage.local.set({ [ROOM_OFFERS_OPEN_KEY]: { vtaDid, count } });
+    await refreshPendingBadge();
+  },
+  now: () => Date.now(),
+});
+
+const roomPageGates = new RoomPageGates({
+  offers: roomOffers,
+  async active() {
+    const active = await readActiveConnection();
+    if (!active.ok) return { ok: false, error: active.error };
+    return {
+      ok: true,
+      vta: { vtaDid: active.conn.vtaDid, ...(active.conn.restBaseUrl ? { restBaseUrl: active.conn.restBaseUrl } : {}) },
+    };
+  },
+  async offscreen(vta, params) {
+    await ensureOffscreenDocument();
+    const reply = (await chrome.runtime.sendMessage({
+      target: OFFSCREEN_TARGET,
+      type: OFFSCREEN_ROOMS_PAGE,
+      vtaDid: vta.vtaDid,
+      ...(vta.restBaseUrl ? { restBaseUrl: vta.restBaseUrl } : {}),
+      params,
+    })) as OffscreenRoomsPageResponse | undefined;
+    return reply ?? { ok: false, error: "the offscreen document did not answer" };
+  },
+  canReach: (url) => hasOriginPermission(url),
+  async loadGrants(origin, vtaDid) {
+    const key = grantsKey(origin, vtaDid);
+    const stored = (await chrome.storage.local.get(key))[key];
+    return Array.isArray(stored) ? (stored as RoomGrant[]) : [];
+  },
+  async saveGrants(origin, vtaDid, grants) {
+    const key = grantsKey(origin, vtaDid);
+    if (grants.length === 0) await chrome.storage.local.remove(key);
+    else await chrome.storage.local.set({ [key]: grants });
+  },
+  async loadRoomNames(vtaDid, hostDid) {
+    const key = roomNamesKey(vtaDid, hostDid);
+    return (await chrome.storage.local.get(key))[key];
+  },
+  async saveRoomNames(vtaDid, hostDid, names) {
+    await chrome.storage.local.set({ [roomNamesKey(vtaDid, hostDid)]: names });
+  },
+  prompt: requestRoomConsent,
+  async openTransfer() {
+    await ensureOffscreenDocument();
+    return chrome.runtime.connect({ name: ROOM_FILES_PORT }) as unknown as PortLike;
+  },
+  now: () => Date.now(),
+});
+
+// ── A page's `window.vtaWallet.directory` ───────────────────────────────────
+//
+// Publishing the member's directory card from the community's portal. The
+// gates — the page is the portal by the community's DID document, the member is
+// one of the wallet's identities there, and the person approves every value in
+// the wallet's own window — are `directory-page.ts`; this wires them up.
+
+/** Raise the publish prompt and wait. Closed or unopened is a denial. */
+async function requestDirectoryConsent(view: DirectoryPublishConsentView): Promise<{ approved: boolean }> {
+  const consentId = crypto.randomUUID();
+  await chrome.storage.session.set({ [`${DIRECTORY_CONSENT_PREFIX}${consentId}`]: view });
+  const url = `${chrome.runtime.getURL("confirm.html")}?cid=${consentId}&kind=directory`;
+  const bounds = await consentWindowBounds(620);
+  return new Promise((resolve) => {
+    let settled = false;
+    const settle = (approved: boolean) => {
+      if (settled) return;
+      settled = true;
+      pendingConsents.delete(consentId);
+      void chrome.storage.session.remove(`${DIRECTORY_CONSENT_PREFIX}${consentId}`);
+      resolve({ approved });
+    };
+    pendingConsents.set(consentId, (approved) => settle(approved));
+    openConsentWindow({ url, bounds, deny: () => settle(false), tag: "[pnm directory]", what: "directory window" });
+  });
+}
+
+const directoryPageGates = new DirectoryPageGates({
+  async active() {
+    const active = await readActiveConnection();
+    if (!active.ok) return { ok: false, error: active.error };
+    return {
+      ok: true,
+      vta: { vtaDid: active.conn.vtaDid, ...(active.conn.restBaseUrl ? { restBaseUrl: active.conn.restBaseUrl } : {}) },
+    };
+  },
+  async offscreen(vta, params) {
+    await ensureOffscreenDocument();
+    const reply = (await chrome.runtime.sendMessage({
+      target: OFFSCREEN_TARGET,
+      type: OFFSCREEN_DIRECTORY_PAGE,
+      vtaDid: vta.vtaDid,
+      ...(vta.restBaseUrl ? { restBaseUrl: vta.restBaseUrl } : {}),
+      params,
+    })) as OffscreenDirectoryPageResponse | undefined;
+    return reply ?? { ok: false, error: "the offscreen document did not answer" };
+  },
+  canReach: (url) => hasOriginPermission(url),
+  prompt: requestDirectoryConsent,
+  now: () => Date.now(),
+});
+
+// `window.vtaWallet.membership.status`: the same portal gate and the same
+// offscreen listing as the directory, then a read of the wallet's own record.
+const membershipPageGates = new MembershipPageGates({
+  async active() {
+    const active = await readActiveConnection();
+    if (!active.ok) return { ok: false, error: active.error };
+    return {
+      ok: true,
+      vta: { vtaDid: active.conn.vtaDid, ...(active.conn.restBaseUrl ? { restBaseUrl: active.conn.restBaseUrl } : {}) },
+    };
+  },
+  async offscreen(vta, params) {
+    await ensureOffscreenDocument();
+    const reply = (await chrome.runtime.sendMessage({
+      target: OFFSCREEN_TARGET,
+      type: OFFSCREEN_DIRECTORY_PAGE,
+      vtaDid: vta.vtaDid,
+      ...(vta.restBaseUrl ? { restBaseUrl: vta.restBaseUrl } : {}),
+      params,
+    })) as OffscreenDirectoryPageResponse | undefined;
+    return reply ?? { ok: false, error: "the offscreen document did not answer" };
+  },
+  agreements: (vtaDid) => readAgreements(vtaDid),
+  now: () => Date.now(),
+});
+
+// One file transfer from a page. The origin is the port's browser-attested one;
+// a port from an extension page is not a page's and is refused.
+chrome.runtime.onConnect.addListener((port) => {
+  if (port.name !== ROOM_FILES_PAGE_PORT) return;
+  const origin = port.sender ? attestedOrigin(port.sender) : undefined;
+  if (!origin || !port.sender?.tab || isExtensionPageSender(port.sender)) {
+    port.disconnect();
+    return;
+  }
+  roomPageGates.servePort(port as unknown as PortLike, origin);
+});
 
 chrome.runtime.onConnect.addListener((port) => {
   if (port.name !== CONSENT_KEEPALIVE_PORT) return;
@@ -737,11 +1085,14 @@ const pendingConsents = new Map<string, ConsentDecision>();
  */
 async function consentWindowBounds(
   height: number,
+  /** A narrower cap, for a window whose content is a single short column
+   *  (the sign-in window) and would otherwise sit in a sea of ground. */
+  maxWidth = 1100,
 ): Promise<{ width: number; height: number; left?: number; top?: number }> {
   const MIN_WIDTH = 480;
   // Past this, diff/digest lines stop getting easier to scan and start getting
   // harder — the eye loses the line it is on.
-  const MAX_WIDTH = 1100;
+  const MAX_WIDTH = Math.max(MIN_WIDTH, maxWidth);
   // Keep the popup clear of the screen edges and of the OS window chrome.
   const MARGIN = 48;
 
@@ -2100,6 +2451,38 @@ async function handleManagerTask(
   })) as OffscreenRequestTaskResponse;
 }
 
+/**
+ * Before a room-file transfer: the host's endpoint (from its DID document,
+ * resolved in the offscreen document), whether the wallet may reach it, and the
+ * agent that acts. Leaves the offscreen document running for the port the
+ * console opens next.
+ *
+ * The permission is only *checked* here — a worker cannot ask for one. The
+ * console asks, in the click, for the origin this returns.
+ */
+async function handleRoomFilesPrepare(
+  req: RuntimeRoomFilesPrepareRequest,
+): Promise<RuntimeRoomFilesPrepareResponse> {
+  const active = await readActiveConnection();
+  if (!active.ok) return { ok: false, error: active.error };
+  await ensureOffscreenDocument();
+  const resolved = (await chrome.runtime.sendMessage({
+    target: OFFSCREEN_TARGET,
+    type: OFFSCREEN_ROOM_HOST_ENDPOINT,
+    hostDid: req.hostDid,
+  })) as OffscreenRoomHostEndpointResponse;
+  if (!resolved.ok) return { ok: false, error: resolved.error, ...(resolved.code ? { code: resolved.code } : {}) };
+  return {
+    ok: true,
+    result: {
+      endpoint: resolved.endpoint,
+      granted: await hasOriginPermission(resolved.endpoint),
+      vtaDid: active.conn.vtaDid,
+      ...(active.conn.restBaseUrl ? { restBaseUrl: active.conn.restBaseUrl } : {}),
+    },
+  };
+}
+
 // Sign a Trust-Task envelope with the wallet's holder did:peer #key-2.
 // Forward to the offscreen which loads the holder identity + calls the core
 // `signTrustTask` helper.
@@ -2124,6 +2507,12 @@ async function handleSignTrustTask(
 ): Promise<RuntimeSignTrustTaskResponse> {
   const active = await readActiveConnection();
   if (!active.ok) return { ok: false, error: active.error };
+  if ((req.params.envelope as { type?: unknown } | undefined)?.type === APPROVE_RESPONSE_0_6) {
+    return handleSignApproverResponse(req, active.conn.vtaDid, active.conn.restBaseUrl);
+  }
+  if (isApproverSignedDecision(req.params.envelope)) {
+    return handleSignApproverDecision(req, active.conn.vtaDid, active.conn.restBaseUrl);
+  }
   // Refused before any prompt: shapes no answer to the prompt could make safe
   // (unaddressed, addressed to the holder's own agent, an approval, a family a
   // page may not drive). See `pageSignRefusal`.
@@ -2175,6 +2564,302 @@ async function handleSignTrustTask(
     type: OFFSCREEN_SIGN_TRUST_TASK,
     vtaDid: active.conn.vtaDid,
     restBaseUrl: active.conn.restBaseUrl,
+    params: req.params,
+  })) as RuntimeSignTrustTaskResponse;
+}
+
+// ── Step-up approver (`auth/step-up/approver/attest/0.1`) ──────────────────
+//
+// Four page-facing methods over the wallet's per-audience approver
+// (`@openvtc/pnm-core`'s `store/step-up-approver.ts`). Every one is held to the
+// relying party the origin is pinned to (`pageApproverAudienceRefusal`), and
+// every signature waits on the approver prompt's biometric, whose PRF output is
+// the only thing that unwraps the key. The offscreen document holds the store
+// and re-runs every check beside the key; the background's checks only decide
+// whether a human is shown anything at all.
+
+/** Issued statements, by id, for the one approve-response each may ride in. */
+const ISSUED_STATEMENT_PREFIX = "approver-statement:";
+
+async function stepUpApproverOp(
+  req: StepUpApproverOp,
+): Promise<OffscreenStepUpApproverResponse> {
+  await ensureOffscreenDocument();
+  const reply = (await chrome.runtime.sendMessage({
+    target: OFFSCREEN_TARGET,
+    type: OFFSCREEN_STEP_UP_APPROVER,
+    ...req,
+  })) as OffscreenStepUpApproverResponse | undefined;
+  return reply ?? { ok: false, error: "the offscreen document did not answer" };
+}
+
+/** Raise the approver prompt and wait. A window that could not be opened, or
+ *  was closed, is a denial; only a gesture's PRF output is an approval. */
+async function requestApproverConsent(
+  view: ApproverConsentRequest,
+): Promise<{ approved: boolean; prfOutputB64u?: string }> {
+  const consentId = crypto.randomUUID();
+  await chrome.storage.session.set({ [`${APPROVER_CONSENT_PREFIX}${consentId}`]: view });
+  const url = `${chrome.runtime.getURL("confirm.html")}?cid=${consentId}&kind=approver`;
+  const bounds = await consentWindowBounds(
+    view.kind === "stepUp" || view.kind === "decision" ? 700 : 600,
+  );
+  return new Promise((resolve) => {
+    let settled = false;
+    const settle = (approved: boolean, prfOutputB64u?: string) => {
+      if (settled) return;
+      settled = true;
+      pendingConsents.delete(consentId);
+      void chrome.storage.session.remove(`${APPROVER_CONSENT_PREFIX}${consentId}`);
+      // An approval with no PRF output cannot be signed, so it is not one.
+      resolve(approved && prfOutputB64u ? { approved: true, prfOutputB64u } : { approved: false });
+    };
+    pendingConsents.set(consentId, (approved: boolean, _remember: boolean, prfOutputB64u?: string) =>
+      settle(approved, prfOutputB64u),
+    );
+    openConsentWindow({
+      url,
+      bounds,
+      deny: () => settle(false),
+      tag: "[pnm approver]",
+      what: "approver window",
+    });
+  });
+}
+
+async function approverAudienceGate(origin: string, audience: unknown): Promise<string | null> {
+  return pageApproverAudienceRefusal(origin, await readOriginPin(origin), audience);
+}
+
+// The approver DID for the pinned relying party. Signs nothing and, once the
+// wallet's sealing key exists, prompts for nothing: the DID is only ever this
+// community's, so returning it tells the page nothing about any other. The very
+// first approver in a wallet needs the sealing key created, which takes the one
+// setup gesture.
+async function handleApproverIdentity(
+  req: RuntimeApproverIdentityRequest,
+): Promise<RuntimeApproverIdentityResponse> {
+  const audience = req.params?.audience;
+  const refusal = await approverAudienceGate(req.origin, audience);
+  if (refusal) return { ok: false, error: refusal };
+  let reply = await stepUpApproverOp({ op: "identity", audience: audience as string });
+  if (!reply.ok && reply.code === STEP_UP_APPROVER_SETUP_REQUIRED) {
+    const consent = await requestApproverConsent({
+      kind: "setup",
+      origin: req.origin,
+      audience: audience as string,
+    });
+    if (!consent.approved) return { ok: false, error: "user denied approver setup" };
+    reply = await stepUpApproverOp({
+      op: "identity",
+      audience: audience as string,
+      prfOutputB64u: consent.prfOutputB64u!,
+    });
+  }
+  if (!reply.ok) return { ok: false, error: reply.error };
+  return { ok: true, result: { approverDid: String(reply.result.approverDid) } };
+}
+
+async function handleApproveStepUp(
+  req: RuntimeApproveStepUpRequest,
+): Promise<RuntimeApproverStatementResponse> {
+  const params = req.params;
+  const refusal = await approverAudienceGate(req.origin, params?.audience);
+  if (refusal) return { ok: false, error: refusal };
+  // Every refusal the request can earn, before a human sees anything: the
+  // approver offered, `boundTo` the digest of the operation shown.
+  const check = await stepUpApproverOp({ op: "check-step-up", params });
+  if (!check.ok) return { ok: false, error: check.error };
+  const consent = await requestApproverConsent({
+    kind: "stepUp",
+    origin: req.origin,
+    audience: params.audience,
+    approverDid: String(check.result.approverDid),
+    subject: String(params.request.subject),
+    reason: typeof params.request.reason === "string" ? params.request.reason : "",
+    operation: { type: params.operation.type, payload: params.operation.payload },
+    challenge: String(params.request.challenge),
+    boundTo: String(check.result.boundTo),
+  });
+  if (!consent.approved) return { ok: false, error: "user denied the step-up" };
+  const signed = await stepUpApproverOp({
+    op: "sign-step-up",
+    params,
+    prfOutputB64u: consent.prfOutputB64u!,
+  });
+  if (!signed.ok) return { ok: false, error: signed.error };
+  const statement = signed.result.statement as Record<string, unknown>;
+  const issued: IssuedApproverStatement = {
+    statement,
+    origin: req.origin,
+    audience: params.audience,
+    subject: String(params.request.subject),
+    challenge: String(params.request.challenge),
+    expiresAt: Date.now() + ISSUED_STATEMENT_TTL_MS,
+  };
+  await chrome.storage.session.set({ [`${ISSUED_STATEMENT_PREFIX}${String(statement.id)}`]: issued });
+  return { ok: true, result: { statement, approverDid: String(signed.result.approverDid) } };
+}
+
+async function handleAttestApprover(
+  req: RuntimeAttestApproverRequest,
+): Promise<RuntimeApproverStatementResponse> {
+  const params = req.params;
+  const refusal = await approverAudienceGate(req.origin, params?.audience);
+  if (refusal) return { ok: false, error: refusal };
+  // Enrolment only: a `decision` statement comes from `approveDecision`, which
+  // shows the action and recomputes its digest; a `stepUp` one from
+  // `approveStepUp`. The offscreen refuses the same.
+  const purposeRefusal = attestApproverPurposeRefusal(params?.purpose);
+  if (purposeRefusal) return { ok: false, error: purposeRefusal };
+  // The DID is shown on the prompt; with no sealing key yet the enrolment's own
+  // gesture creates one, so there is nothing to show until then.
+  const known = await stepUpApproverOp({ op: "identity", audience: params.audience });
+  const consent = await requestApproverConsent({
+    kind: "enrol",
+    origin: req.origin,
+    audience: params.audience,
+    ...(known.ok ? { approverDid: String(known.result.approverDid) } : {}),
+    subject: params.subject,
+    challenge: params.challenge,
+    boundTo: params.boundTo,
+  });
+  if (!consent.approved) return { ok: false, error: "user denied the approver enrolment" };
+  const signed = await stepUpApproverOp({
+    op: "sign-enrol",
+    params,
+    prfOutputB64u: consent.prfOutputB64u!,
+  });
+  if (!signed.ok) return { ok: false, error: signed.error };
+  return {
+    ok: true,
+    result: {
+      statement: signed.result.statement as Record<string, unknown>,
+      approverDid: String(signed.result.approverDid),
+    },
+  };
+}
+
+// A VTC administrator's own approver vouching for their task-consent decision
+// on one action (attest/0.1, `purpose: decision`). Same shape as a step-up:
+// pinned audience, every check before a prompt (the approver exists for this
+// community, the decision's `payloadDigest` is the task-consent wire digest of
+// the action shown), the action and the approve/deny on the prompt, the
+// biometric, the checks again beside the key, and the statement remembered for
+// the one decision that may carry it.
+async function handleApproveDecision(
+  req: RuntimeApproveDecisionRequest,
+): Promise<RuntimeApproverStatementResponse> {
+  const params = req.params;
+  const refusal = await approverAudienceGate(req.origin, params?.audience);
+  if (refusal) return { ok: false, error: refusal };
+  const reason = params.decision?.reason;
+  if (reason !== undefined && (typeof reason !== "string" || reason.length > 500)) {
+    return { ok: false, error: "decision.reason must be a string of at most 500 characters" };
+  }
+  const check = await stepUpApproverOp({ op: "check-decision", params });
+  if (!check.ok) return { ok: false, error: check.error };
+  const summary = decisionSummaryText(params.action.summary);
+  const consent = await requestApproverConsent({
+    kind: "decision",
+    origin: req.origin,
+    audience: params.audience,
+    approverDid: String(check.result.approverDid),
+    subject: params.subject,
+    operation: { type: params.action.type, payload: params.action.payload },
+    challenge: params.decision.challenge,
+    boundTo: String(check.result.boundTo),
+    decision: params.decision.decision,
+    ...(reason !== undefined ? { reason } : {}),
+    ...(summary !== undefined ? { summary } : {}),
+    ...(params.action.actionId !== undefined ? { actionId: params.action.actionId } : {}),
+  });
+  if (!consent.approved) return { ok: false, error: "user denied the decision" };
+  const signed = await stepUpApproverOp({
+    op: "sign-decision",
+    params,
+    prfOutputB64u: consent.prfOutputB64u!,
+  });
+  if (!signed.ok) return { ok: false, error: signed.error };
+  const statement = signed.result.statement as Record<string, unknown>;
+  const issued: IssuedApproverStatement = {
+    statement,
+    origin: req.origin,
+    audience: params.audience,
+    subject: params.subject,
+    challenge: params.decision.challenge,
+    expiresAt: Date.now() + ISSUED_STATEMENT_TTL_MS,
+    purpose: "decision",
+    payloadDigest: params.decision.payloadDigest,
+    decision: params.decision.decision,
+    ...(reason !== undefined ? { reason } : {}),
+    ...(params.action.actionId !== undefined ? { actionId: params.action.actionId } : {}),
+  };
+  await chrome.storage.session.set({ [`${ISSUED_STATEMENT_PREFIX}${String(statement.id)}`]: issued });
+  return { ok: true, result: { statement, approverDid: String(signed.result.approverDid) } };
+}
+
+// The task-consent decision 0.2 around a statement `approveDecision` just
+// issued: signed once, without a second prompt, exactly when it carries that
+// statement unchanged with what the human was shown. Any decision claiming
+// `approverSigned` evidence that is not that is refused, never prompted for.
+async function handleSignApproverDecision(
+  req: RuntimeSignTrustTaskRequest,
+  vtaDid: string,
+  restBaseUrl: string | undefined,
+): Promise<RuntimeSignTrustTaskResponse> {
+  const id = decisionStatementId(req.params.envelope);
+  const key = id ? `${ISSUED_STATEMENT_PREFIX}${id}` : undefined;
+  const issued = key
+    ? ((await chrome.storage.session.get(key))[key] as IssuedApproverStatement | undefined)
+    : undefined;
+  const refusal = decisionResponseRefusal(req.params.envelope, issued, req.origin, req.params.asDid);
+  if (refusal) return { ok: false, error: refusal };
+  const recipient = (req.params.envelope as { recipient: string }).recipient;
+  const bindingRefusal = pageSignBindingRefusal(req.origin, await readOriginPin(req.origin), recipient);
+  if (bindingRefusal) return { ok: false, error: bindingRefusal };
+  // Spent before signing: the statement backs one decision, once.
+  await chrome.storage.session.remove(key!);
+  await ensureOffscreenDocument();
+  return (await chrome.runtime.sendMessage({
+    target: OFFSCREEN_TARGET,
+    type: OFFSCREEN_SIGN_TRUST_TASK,
+    vtaDid,
+    restBaseUrl,
+    params: req.params,
+  })) as RuntimeSignTrustTaskResponse;
+}
+
+// The approve-response 0.6 around a statement `approveStepUp` just issued. It
+// is the ceremony's second half, so it is signed without a second prompt — the
+// human approved this operation on the approver prompt a moment ago — but only
+// when it carries that statement unchanged, for the same origin, relying party,
+// subject and challenge, signed as the subject, and only once. Anything else of
+// this type is refused exactly as `pageSignRefusal` refuses every approval.
+async function handleSignApproverResponse(
+  req: RuntimeSignTrustTaskRequest,
+  vtaDid: string,
+  restBaseUrl: string | undefined,
+): Promise<RuntimeSignTrustTaskResponse> {
+  const id = approverResponseStatementId(req.params.envelope);
+  const key = id ? `${ISSUED_STATEMENT_PREFIX}${id}` : undefined;
+  const issued = key
+    ? ((await chrome.storage.session.get(key))[key] as IssuedApproverStatement | undefined)
+    : undefined;
+  const refusal = approverResponseRefusal(req.params.envelope, issued, req.origin, req.params.asDid);
+  if (refusal) return { ok: false, error: refusal };
+  const recipient = (req.params.envelope as { recipient: string }).recipient;
+  const bindingRefusal = pageSignBindingRefusal(req.origin, await readOriginPin(req.origin), recipient);
+  if (bindingRefusal) return { ok: false, error: bindingRefusal };
+  // Spent before signing: a second request for the same statement finds
+  // nothing, whatever happens to this one.
+  await chrome.storage.session.remove(key!);
+  await ensureOffscreenDocument();
+  return (await chrome.runtime.sendMessage({
+    target: OFFSCREEN_TARGET,
+    type: OFFSCREEN_SIGN_TRUST_TASK,
+    vtaDid,
+    restBaseUrl,
     params: req.params,
   })) as RuntimeSignTrustTaskResponse;
 }
@@ -2448,6 +3133,23 @@ async function readActiveConnectionRaw(): Promise<
     ...(entry.restBaseUrl ? { restBaseUrl: entry.restBaseUrl } : {}),
     ...(entry.mediatorDid ? { mediatorDid: entry.mediatorDid } : {}),
   };
+}
+
+/** Every agent this wallet is onboarded to, and its REST base. */
+async function readConnectionsRaw(): Promise<Array<{ vtaDid: string; restBaseUrl?: string }>> {
+  const stored = await chrome.storage.local.get("pnm-connection/v3");
+  const raw = stored["pnm-connection/v3"];
+  if (typeof raw !== "string") return [];
+  try {
+    const parsed = JSON.parse(raw) as {
+      state?: { connections?: { vtas?: Record<string, { vtaDid?: string; restBaseUrl?: string }> } };
+    };
+    return Object.values(parsed.state?.connections?.vtas ?? {})
+      .filter((v): v is { vtaDid: string; restBaseUrl?: string } => typeof v?.vtaDid === "string")
+      .map((v) => ({ vtaDid: v.vtaDid, ...(v.restBaseUrl ? { restBaseUrl: v.restBaseUrl } : {}) }));
+  } catch {
+    return [];
+  }
 }
 
 async function handleVaultUpsert(
@@ -2783,56 +3485,34 @@ async function resolveProfileEntry(
 }
 
 /**
- * Bind the persona the operator picked to `origin`, as a vault entry.
- *
- * The prompt returns a DID string and nothing else. Everything the entry needs
- * beyond it — the context, the signing key — is re-derived here from the
- * agent's own answers, so a DID that is not one the agent hosts cannot be
- * bound no matter what the consent window sent back.
+ * Bind the persona the operator picked to `origin`, as a vault entry
+ * (`bindProfile`, shared with the trigger-link sign-in's join step).
  */
 async function bindProfileEntry(
   origin: string,
   did: string,
   rpDid: string | undefined,
 ): Promise<{ ok: true; entryId: string } | { ok: false; error: string }> {
-  const dids = await handleListDids({ type: RUNTIME_LIST_DIDS });
-  if (!dids.ok) return { ok: false, error: dids.error };
-  const record = dids.result.dids.find((d) => d.did === did);
-  if (!record) {
-    return { ok: false, error: `${did} is not an identity this agent hosts` };
-  }
-
-  const derived = await handleDeriveSigningKeyId({ type: RUNTIME_DERIVE_SIGNING_KEY_ID, did });
-  if (!derived.ok) return { ok: false, error: derived.error };
-  if (derived.result.error) return { ok: false, error: derived.result.error };
-  const candidates = derived.result.candidates;
-  if (candidates.length !== 1) {
-    // Zero: nothing in the document can sign, and an entry naming a key that
-    // does not exist fails later, opaquely, at the VTA. More than one: which
-    // key signs the id_token is a real choice with no default, and picking one
-    // here would be the wallet guessing. Both send the operator to the vault
-    // panel, which has the key picker this prompt deliberately does not.
-    return {
-      ok: false,
-      error:
-        candidates.length === 0
-          ? `no signing key could be derived from ${did}`
-          : `${did} has ${candidates.length} possible signing keys — bind it from the wallet's vault panel, which lets you choose one`,
-    };
-  }
-
-  const upserted = await handleVaultUpsert({
-    type: RUNTIME_VAULT_UPSERT,
-    ...buildProfileEntry({
-      origin,
-      did,
-      contextId: record.contextId,
-      signingKeyId: candidates[0]!,
-      ...(rpDid ? { rpDid } : {}),
-    }),
-  });
-  if (!upserted.ok) return { ok: false, error: upserted.error };
-  return { ok: true, entryId: upserted.result.entry.id };
+  return bindProfile(
+    {
+      listDids: async () => {
+        const r = await handleListDids({ type: RUNTIME_LIST_DIDS });
+        if (!r.ok) throw new Error(r.error);
+        return r.result.dids;
+      },
+      deriveSigningKeyIds: async (d) => {
+        const r = await handleDeriveSigningKeyId({ type: RUNTIME_DERIVE_SIGNING_KEY_ID, did: d });
+        if (!r.ok) throw new Error(r.error);
+        return r.result;
+      },
+      upsert: async (body) => {
+        const r = await handleVaultUpsert({ type: RUNTIME_VAULT_UPSERT, ...body });
+        if (!r.ok) throw new Error(r.error);
+        return { entryId: r.result.entry.id };
+      },
+    },
+    { origin, did, ...(rpDid ? { rpDid } : {}) },
+  );
 }
 
 // Authenticated POST proxied through the wallet (host permission → no CORS).
@@ -2867,6 +3547,193 @@ async function handleApiPost(req: RuntimeApiPostRequest): Promise<RuntimeApiGetR
  * confirm window, offscreen) carries no page origin and is not listed.
  */
 const PAGE_FACING_TYPES: ReadonlySet<string> = new Set(PAGE_FACING_RUNTIME_TYPES);
+
+// ─── Wallet sign-in from a trigger link (VTI spec 7a; contract C2/C3) ───
+//
+// The content script reports a person's click on a trigger link. The worker
+// re-parses it, records the link and the browser-attested origin under a fresh
+// flow id in `chrome.storage.session` (memory only, gone with the browser
+// session), and opens the sign-in window. The window drives the flow by id;
+// the link and the origin never come from it. Nothing is answered to the page.
+
+const SIGN_IN_FLOW_PREFIX = "sign-in-flow:";
+
+/** A flow started by a trigger link, or by a community's DID read off a code
+ *  or pasted (`RUNTIME_JOIN_COMMUNITY`). Both are the worker's own record; the
+ *  window names only the flow id. */
+type SignInFlowRecord =
+  | { link: string; origin: string }
+  | { joinDid: string; joinSource: RuntimeJoinCommunityRequest["source"] };
+
+/**
+ * Join a community by its DID (Star Key). The popup or the scan window hands
+ * over what it read; the shape is checked here again, the DID goes under a
+ * fresh flow id, and the sign-in window opens on it. Resolving, verifying and
+ * everything after are the flow's (`prepareJoin`), in the offscreen document;
+ * nothing is sent to the community before the person continues there.
+ */
+async function handleJoinCommunity(msg: RuntimeJoinCommunityRequest): Promise<RuntimeJoinCommunityResponse> {
+  const did = typeof msg.did === "string" ? communityDidFromText(msg.did) : undefined;
+  if (!did || did !== msg.did.trim()) return { ok: false, error: "That isn't a DID." };
+  const source: RuntimeJoinCommunityRequest["source"] =
+    msg.source === "page" || msg.source === "camera" || msg.source === "image" ? msg.source : "pasted";
+  const active = await readActiveConnection();
+  if (!active.ok) return { ok: false, error: active.error };
+  const flowId = crypto.randomUUID();
+  const record: SignInFlowRecord = { joinDid: did, joinSource: source };
+  await chrome.storage.session.set({ [`${SIGN_IN_FLOW_PREFIX}${flowId}`]: record });
+  const url = `${chrome.runtime.getURL("confirm.html")}?kind=sign-in&flow=${flowId}`;
+  const bounds = await consentWindowBounds(660, 560);
+  openConsentWindow({
+    url,
+    bounds,
+    deny: () => void endSignInFlow(flowId),
+    tag: "[pnm join]",
+    what: "join window",
+  });
+  return { ok: true };
+}
+
+async function handleTriggerLink(msg: RuntimeTriggerLinkRequest, tabId: number | undefined): Promise<void> {
+  const link = typeof msg.link === "string" ? msg.link : "";
+  // The content script's shape gate (link host, `/t`, fragment), held again.
+  if (!isTriggerLinkShaped(link)) return;
+  const parsed = parseTriggerLink(link, { now: Math.floor(Date.now() / 1000) });
+  // Text that is not a trigger link is not ours. The content script already
+  // let it navigate; this is the same rule, held again.
+  if (!parsed.ok && parsed.outcome === "pass-on") return;
+  // The wallet was disconnected after the page loaded, so the content script
+  // took a click there is no wallet for. Finish the navigation it prevented —
+  // to the link host's no-wallet page, as with no plugin installed (C2).
+  if (!(await readActiveConnection()).ok) {
+    if (tabId !== undefined) await chrome.tabs.update(tabId, { url: link }).catch(() => undefined);
+    return;
+  }
+  const flowId = crypto.randomUUID();
+  const record: SignInFlowRecord = { link: msg.link, origin: msg.origin };
+  await chrome.storage.session.set({ [`${SIGN_IN_FLOW_PREFIX}${flowId}`]: record });
+  const url = `${chrome.runtime.getURL("confirm.html")}?kind=sign-in&flow=${flowId}`;
+  const bounds = await consentWindowBounds(660, 560);
+  // Closing the window ends the flow: a claim the community holds is
+  // cancelled and K_a forgotten.
+  openConsentWindow({
+    url,
+    bounds,
+    deny: () => void endSignInFlow(flowId),
+    tag: "[pnm sign-in]",
+    what: "sign-in window",
+  });
+}
+
+/**
+ * The number the portal shows for a request (C11), from the content script on
+ * the page the code was clicked on. It goes to the flow whose link carries
+ * that request id and whose click came from this same attested origin — a
+ * number from any other page, or for a request no flow holds, is dropped. The
+ * flow decides whether it still wants it.
+ */
+async function handleTriggerLinkNumber(msg: RuntimeTriggerLinkNumberRequest): Promise<void> {
+  if (typeof msg.requestId !== "string" || typeof msg.matchNumber !== "string") return;
+  if (!/^[0-9]{2}$/.test(msg.matchNumber)) return;
+  const all = await chrome.storage.session.get(null);
+  for (const [key, value] of Object.entries(all)) {
+    if (!key.startsWith(SIGN_IN_FLOW_PREFIX)) continue;
+    const record = value as SignInFlowRecord;
+    // A join by DID has no page, so no number can be its.
+    if (!("link" in record) || record.origin !== msg.origin) continue;
+    // Expiry is the flow's to judge; only the id is read here.
+    const parsed = parseTriggerLink(record.link, { now: 0 });
+    if (!parsed.ok || parsed.link.id !== msg.requestId) continue;
+    await ensureOffscreenDocument();
+    await chrome.runtime.sendMessage({
+      target: OFFSCREEN_TARGET,
+      type: OFFSCREEN_SIGN_IN_PAGE_NUMBER,
+      flowId: key.slice(SIGN_IN_FLOW_PREFIX.length),
+      matchNumber: msg.matchNumber,
+    } satisfies OffscreenSignInPageNumberRequest);
+  }
+}
+
+async function endSignInFlow(flowId: string): Promise<void> {
+  const key = `${SIGN_IN_FLOW_PREFIX}${flowId}`;
+  const had = (await chrome.storage.session.get(key))[key] !== undefined;
+  await chrome.storage.session.remove(key);
+  if (!had) return;
+  try {
+    await ensureOffscreenDocument();
+    await chrome.runtime.sendMessage({
+      target: OFFSCREEN_TARGET,
+      type: OFFSCREEN_SIGN_IN_STEP,
+      flowId,
+      vtaDid: "",
+      step: "cancel",
+    } satisfies OffscreenSignInStepRequest);
+  } catch {
+    // The offscreen document is gone, and K_a with it.
+  }
+}
+
+/** Relay the options page's sign-in approval settings to the offscreen
+ *  document, with every agent this wallet is onboarded to from the worker's
+ *  own record: the page names an agent, never where to reach it. */
+async function handleUvSettings(msg: RuntimeUvSettingsRequest): Promise<RuntimeUvSettingsResponse> {
+  const agents = await readConnectionsRaw();
+  await ensureOffscreenDocument();
+  const { type: _type, ...op } = msg;
+  const res = (await chrome.runtime.sendMessage({
+    ...op,
+    target: OFFSCREEN_TARGET,
+    type: OFFSCREEN_UV_SETTINGS,
+    agents,
+  } as OffscreenUvSettingsRequest)) as RuntimeUvSettingsResponse | undefined;
+  return res ?? { ok: false, error: "The wallet's background document didn't answer." };
+}
+
+async function handleSignInStep(msg: RuntimeSignInStepRequest): Promise<RuntimeSignInStepResponse> {
+  const key = `${SIGN_IN_FLOW_PREFIX}${msg.flowId}`;
+  const record = (await chrome.storage.session.get(key))[key] as SignInFlowRecord | undefined;
+  if (!record) {
+    return {
+      ok: true,
+      result: { kind: "failed", code: "sign-in/out-of-order", message: "Refresh the code on the website and try again." },
+    };
+  }
+  const active = await readActiveConnection();
+  if (!active.ok) return { ok: false, error: active.error };
+  await ensureOffscreenDocument();
+  const { type: _type, flowId, ...step } = msg;
+  const forward = {
+    ...step,
+    target: OFFSCREEN_TARGET,
+    type: OFFSCREEN_SIGN_IN_STEP,
+    flowId,
+    vtaDid: active.conn.vtaDid,
+    ...(active.conn.restBaseUrl ? { restBaseUrl: active.conn.restBaseUrl } : {}),
+    // From the worker's own record, on the first step only.
+    ...(msg.step !== "prepare"
+      ? {}
+      : "link" in record
+        ? { link: record.link, origin: record.origin }
+        : { joinDid: record.joinDid, joinSource: record.joinSource }),
+  } as OffscreenSignInStepRequest;
+  const res = (await chrome.runtime.sendMessage(forward)) as RuntimeSignInStepResponse;
+  // Every refusal reads the same to the member; this is where whoever has to
+  // find out why can look. Stage, party and stable code only — never the
+  // link, the origin, a key or a message body (VTI-LNK-073).
+  if (res?.ok && res.result.kind === "failed") {
+    console.warn("[pnm sign-in] step failed", failureLogFields(msg.step, res.result));
+  }
+  if (res.ok && (res.result.kind === "done" || res.result.kind === "refused" ||
+      res.result.kind === "not-member" ||
+      res.result.kind === "join-elsewhere" ||
+      res.result.kind === "join-pending" ||
+      res.result.kind === "join-admitted" ||
+      res.result.kind === "already-member" ||
+      res.result.kind === "not-a-community")) {
+    await chrome.storage.session.remove(key);
+  }
+  return res;
+}
 
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
@@ -2912,6 +3779,16 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   // message with no tab behind it is an extension context impersonating a page
   // relay, and there is no legitimate caller for that.
   const msgType = (message as { type?: string })?.type;
+  // A trigger-link activation carries the origin the content script read at
+  // the click (VTI-LNK-056). It must be the page the browser says the message
+  // came from — a page that navigated in between gets nothing — and from here
+  // on only the browser's value is used.
+  if (msgType === RUNTIME_TRIGGER_LINK) {
+    const attested = attestedOrigin(sender);
+    if (!attested || isExtensionPageSender(sender) || (message as { origin?: unknown }).origin !== attested) {
+      return false;
+    }
+  }
   if (msgType && PAGE_FACING_TYPES.has(msgType)) {
     const attested = attestedOrigin(sender);
     if (!attested) {
@@ -2923,6 +3800,95 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return false;
     }
     (message as { origin?: string }).origin = attested;
+  }
+
+  if (msgType === RUNTIME_TRIGGER_LINK_NUMBER) {
+    // `origin` was overwritten above with the browser-attested one. Fire and
+    // forget, like the click: nothing goes back to the page.
+    if (isExtensionPageSender(sender)) return false;
+    void handleTriggerLinkNumber(message as RuntimeTriggerLinkNumberRequest).catch(() => undefined);
+    return false;
+  }
+
+  if (msgType === RUNTIME_TRIGGER_LINK) {
+    // Fire-and-forget: the page must not learn what the wallet decided.
+    void handleTriggerLink(message as RuntimeTriggerLinkRequest, sender.tab?.id).catch(() => undefined);
+    return false;
+  }
+
+  if (msgType === RUNTIME_JOIN_COMMUNITY) {
+    // Only the wallet's own surfaces (the popup, the scan window) start a
+    // join; a page naming a community is a page asking to be joined.
+    if (!isExtensionPageSender(sender)) {
+      sendResponse({ ok: false, error: "a join starts from the wallet's own window" });
+      return false;
+    }
+    handleJoinCommunity(message as RuntimeJoinCommunityRequest)
+      .then(sendResponse)
+      .catch((e: unknown) =>
+        sendResponse({ ok: false, error: e instanceof Error ? e.message : String(e) }),
+      );
+    return true; // async sendResponse
+  }
+
+  if (msgType === RUNTIME_SIGN_IN_STEP) {
+    // Only the sign-in window drives a flow; a content script naming a flow id
+    // it guessed is not that window.
+    if (!isExtensionPageSender(sender)) {
+      sendResponse({ ok: false, error: "sign-in steps come from the wallet's own window" });
+      return false;
+    }
+    handleSignInStep(message as RuntimeSignInStepRequest)
+      .then(sendResponse)
+      .catch((e: unknown) =>
+        sendResponse({ ok: false, error: e instanceof Error ? e.message : String(e) }),
+      );
+    return true; // async sendResponse
+  }
+
+  if (msgType === RUNTIME_UV_SETTINGS) {
+    // The options page only: a PIN crosses this, and a content script naming
+    // an agent is not the person at their settings.
+    if (!isExtensionPageSender(sender)) {
+      sendResponse({ ok: false, error: "sign-in approval settings are the wallet's own" } satisfies RuntimeUvSettingsResponse);
+      return false;
+    }
+    handleUvSettings(message as RuntimeUvSettingsRequest)
+      .then(sendResponse)
+      .catch((e: unknown) =>
+        sendResponse({ ok: false, error: e instanceof Error ? e.message : String(e) } satisfies RuntimeUvSettingsResponse),
+      );
+    return true; // async sendResponse
+  }
+
+  if (msgType === RUNTIME_DIRECTORY_PAGE) {
+    const req = message as RuntimeDirectoryPageRequest;
+    // `origin` was overwritten above with the browser-attested one.
+    directoryPageGates
+      .handle(req.origin, req.params)
+      .then(sendResponse)
+      .catch((e: unknown) => sendResponse({ ok: false, error: e instanceof Error ? e.message : String(e) }));
+    return true; // async sendResponse
+  }
+
+  if (msgType === RUNTIME_MEMBERSHIP_PAGE) {
+    const req = message as RuntimeMembershipPageRequest;
+    // `origin` was overwritten above with the browser-attested one.
+    membershipPageGates
+      .handle(req.origin, req.params)
+      .then(sendResponse)
+      .catch((e: unknown) => sendResponse({ ok: false, error: e instanceof Error ? e.message : String(e) }));
+    return true; // async sendResponse
+  }
+
+  if (msgType === RUNTIME_ROOMS_PAGE) {
+    const req = message as RuntimeRoomsPageRequest;
+    // `origin` was overwritten above with the browser-attested one.
+    roomPageGates
+      .handle(req.origin, req.params)
+      .then(sendResponse)
+      .catch((e: unknown) => sendResponse({ ok: false, error: e instanceof Error ? e.message : String(e) }));
+    return true; // async sendResponse
   }
 
   if ((message as { type?: string })?.type === RUNTIME_API_GET) {
@@ -2983,6 +3949,25 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       if (typeof digest === "string" && digest) consentReplays.recordGranted(digest);
     }
     void broadcastWalletEvent(m.event, m.detail);
+    return false;
+  }
+
+  // The offscreen document cannot reach `chrome.notifications`, so it asks us.
+  // Extension pages only: a content script carries this extension's id too,
+  // and a page must not be able to raise a notice in the wallet's name.
+  if ((message as { type?: string })?.type === RUNTIME_NOTIFY) {
+    if (!isExtensionPageSender(sender)) return false;
+    const m = message as RuntimeNotifyRequest;
+    chrome.notifications.create(
+      {
+        type: "basic",
+        iconUrl: chrome.runtime.getURL("icon-128.png"),
+        title: String(m.title),
+        message: String(m.message),
+        priority: 2,
+      },
+      () => void chrome.runtime.lastError,
+    );
     return false;
   }
 
@@ -3167,6 +4152,45 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true; // async sendResponse
   }
 
+  if ((message as { type?: string })?.type === RUNTIME_ROOM_OFFERS) {
+    // Console only. A portal reaches its own community's offers through
+    // `window.vtaWallet.rooms`, whose gates hold it to that community.
+    if (!isExtensionPageSender(sender)) {
+      console.warn(`[background] rejecting ${RUNTIME_ROOM_OFFERS} from non-extension sender url=${sender.url}`);
+      sendResponse({ ok: false, error: "room offers are not page-reachable" } satisfies RuntimeRoomOffersResponse);
+      return false;
+    }
+    const { params } = message as RuntimeRoomOffersRequest;
+    (params?.op === "accept"
+      ? roomOffers.accept({ communityDid: params.communityDid, member: params.member, roomId: params.roomId })
+      : roomOffers.overview({ force: params?.op === "overview" && params.force === true })
+    )
+      .then((result) => sendResponse({ ok: true, result } satisfies RuntimeRoomOffersResponse))
+      .catch((e: unknown) =>
+        sendResponse({
+          ok: false,
+          error: e instanceof Error ? e.message : String(e),
+          ...(e instanceof RoomOffersRefusal && e.code ? { code: e.code } : {}),
+        } satisfies RuntimeRoomOffersResponse),
+      );
+    return true; // async sendResponse
+  }
+
+  if ((message as { type?: string })?.type === RUNTIME_ROOM_FILES_PREPARE) {
+    // Console only, like the manager relay: a transfer moves a room's plaintext.
+    if (!isExtensionPageSender(sender)) {
+      console.warn(`[background] rejecting ${RUNTIME_ROOM_FILES_PREPARE} from non-extension sender url=${sender.url}`);
+      sendResponse({ ok: false, error: "room files are not page-reachable" } satisfies RuntimeRoomFilesPrepareResponse);
+      return false;
+    }
+    handleRoomFilesPrepare(message as RuntimeRoomFilesPrepareRequest)
+      .then(sendResponse)
+      .catch((e: unknown) =>
+        sendResponse({ ok: false, error: e instanceof Error ? e.message : String(e) } satisfies RuntimeRoomFilesPrepareResponse),
+      );
+    return true; // async sendResponse
+  }
+
   if ((message as { type?: string })?.type === RUNTIME_MANAGER_TASK) {
     // Extension pages only. A content script carries our extension id but not
     // our URL, and this relay does not stop to ask a human — so the gate is the
@@ -3200,6 +4224,42 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   if ((message as { type?: string })?.type === RUNTIME_REQUEST_TASK) {
     handleRequestTask(message as RuntimeRequestTaskRequest)
+      .then(sendResponse)
+      .catch((e: unknown) =>
+        sendResponse({ ok: false, error: e instanceof Error ? e.message : String(e) }),
+      );
+    return true; // async sendResponse
+  }
+
+  if ((message as { type?: string })?.type === RUNTIME_APPROVER_IDENTITY) {
+    handleApproverIdentity(message as RuntimeApproverIdentityRequest)
+      .then(sendResponse)
+      .catch((e: unknown) =>
+        sendResponse({ ok: false, error: e instanceof Error ? e.message : String(e) }),
+      );
+    return true; // async sendResponse
+  }
+
+  if ((message as { type?: string })?.type === RUNTIME_APPROVE_STEP_UP) {
+    handleApproveStepUp(message as RuntimeApproveStepUpRequest)
+      .then(sendResponse)
+      .catch((e: unknown) =>
+        sendResponse({ ok: false, error: e instanceof Error ? e.message : String(e) }),
+      );
+    return true; // async sendResponse
+  }
+
+  if ((message as { type?: string })?.type === RUNTIME_APPROVE_DECISION) {
+    handleApproveDecision(message as RuntimeApproveDecisionRequest)
+      .then(sendResponse)
+      .catch((e: unknown) =>
+        sendResponse({ ok: false, error: e instanceof Error ? e.message : String(e) }),
+      );
+    return true; // async sendResponse
+  }
+
+  if ((message as { type?: string })?.type === RUNTIME_ATTEST_APPROVER) {
+    handleAttestApprover(message as RuntimeAttestApproverRequest)
       .then(sendResponse)
       .catch((e: unknown) =>
         sendResponse({ ok: false, error: e instanceof Error ? e.message : String(e) }),

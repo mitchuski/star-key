@@ -1,11 +1,18 @@
 /// <reference types="chrome" />
 
-// Content script (isolated world). Two jobs:
+// Content script (isolated world). Three jobs:
 //   1. Inject the page-world provider (`provider.js`) so the RP page can
 //      call `window.vtaWallet.login(...)`.
 //   2. Relay each provider request to the background service worker and
 //      post the response back into the page.
+//   3. Catch a person's click on a trigger link (a sign-in QR code that is also
+//      a link) and hand it to the worker instead of navigating — see
+//      `trigger-link-click.ts`. Nothing about the result reaches the page.
+//      After that click it reads the number the portal shows for the request
+//      and hands it to the worker too (contract C11).
 
+import { parseActiveVtaDid } from "./active-vta.js";
+import { installTriggerLinkClickHandler } from "./trigger-link-click.js";
 import type {
   BridgeMethod,
   ContentResponse,
@@ -14,9 +21,12 @@ import type {
 } from "./bridge-protocol.js";
 
 // A content script is injected as a *classic* script and cannot `import`,
-// so this file must bundle to a single self-contained chunk. We therefore
-// inline the protocol string constants instead of importing their values.
-// Keep these in sync with `bridge-protocol.ts`.
+// so this file must bundle to a single self-contained chunk. It is built on
+// its own (`vite.config.content.ts`, `codeSplitting: false`), which is what
+// lets it import the trigger-link parser from core: there is no other entry to
+// share a chunk with. The protocol string constants are still inlined rather
+// than imported, so `bridge-protocol.ts` (and everything it names) stays out
+// of the page's process; `page-facing-surface.test.mts` checks them against it.
 const INPAGE_SOURCE = "vta-wallet/inpage";
 const CONTENT_SOURCE = "vta-wallet/content";
 const RUNTIME_LOGIN = "vta-wallet/login";
@@ -32,7 +42,17 @@ const RUNTIME_WALLET_PROFILE = "vta-wallet/wallet-profile";
 const RUNTIME_VAULT_LIST_PAGE = "vta-wallet/vault-list-page";
 const RUNTIME_REQUEST_TASK = "vta-wallet/request-task";
 const RUNTIME_DISCLOSE = "vta-wallet/disclose";
+const RUNTIME_APPROVER_IDENTITY = "vta-wallet/approver-identity";
+const RUNTIME_APPROVE_STEP_UP = "vta-wallet/approve-step-up";
+const RUNTIME_ATTEST_APPROVER = "vta-wallet/attest-approver";
+const RUNTIME_APPROVE_DECISION = "vta-wallet/approve-decision";
 const RUNTIME_BROADCAST_EVENT = "vta-wallet/broadcast-event";
+const RUNTIME_TRIGGER_LINK = "vta-wallet/trigger-link";
+const RUNTIME_TRIGGER_LINK_NUMBER = "vta-wallet/trigger-link-number";
+const RUNTIME_ROOMS_PAGE = "vta-wallet/rooms-page";
+const RUNTIME_DIRECTORY_PAGE = "vta-wallet/directory-page";
+const RUNTIME_MEMBERSHIP_PAGE = "vta-wallet/membership-page";
+const ROOM_FILES_PAGE_PORT = "vta-wallet/room-files-page";
 
 // ─── 1. Inject the provider into the page world. ───
 // The content script runs in an isolated world, so assigning
@@ -67,6 +87,13 @@ const RUNTIME_TYPE_BY_METHOD: Record<BridgeMethod, string> = {
   vaultList: RUNTIME_VAULT_LIST_PAGE,
   requestTask: RUNTIME_REQUEST_TASK,
   disclose: RUNTIME_DISCLOSE,
+  approverIdentity: RUNTIME_APPROVER_IDENTITY,
+  approveStepUp: RUNTIME_APPROVE_STEP_UP,
+  attestApprover: RUNTIME_ATTEST_APPROVER,
+  approveDecision: RUNTIME_APPROVE_DECISION,
+  rooms: RUNTIME_ROOMS_PAGE,
+  directory: RUNTIME_DIRECTORY_PAGE,
+  membership: RUNTIME_MEMBERSHIP_PAGE,
 };
 
 // ─── 2. Relay provider → background → provider. ───
@@ -83,6 +110,10 @@ window.addEventListener("message", (event: MessageEvent) => {
   if (event.origin !== window.origin) return;
   const req = event.data as InpageRequest | undefined;
   if (!req || req.source !== INPAGE_SOURCE) return;
+  if ((req as unknown as { kind?: unknown }).kind === "roomFile") {
+    relayRoomFile(req as unknown as RoomFileFrame);
+    return;
+  }
 
   void (async () => {
     let response: ContentResponse;
@@ -123,6 +154,52 @@ window.addEventListener("message", (event: MessageEvent) => {
   })();
 });
 
+// ─── 2b. Room-file transfers: one port per transfer, page ⇄ background. ───
+//
+// `window.vtaWallet.rooms.{getFile,putFile}` (P7b). The page's frames carry a
+// transfer id and one protocol message (`RoomFilesPageOpen`, then data on a
+// put); each transfer gets its own port to the background, which checks the
+// page's portal and grant on the port's browser-attested origin — never on
+// anything in a frame — and relays to the offscreen document. Closing the port
+// stops the transfer. What comes back is posted to the page as it arrives:
+// progress, and a download's bytes only once the whole file has verified.
+interface RoomFileFrame {
+  source: typeof INPAGE_SOURCE;
+  kind: "roomFile";
+  id: string;
+  msg: { kind?: unknown } & Record<string, unknown>;
+}
+
+const roomFilePorts = new Map<string, chrome.runtime.Port>();
+
+function relayRoomFile(frame: RoomFileFrame): void {
+  if (typeof frame.id !== "string" || !frame.msg || typeof frame.msg !== "object") return;
+  const back = (msg: unknown) =>
+    window.postMessage({ source: CONTENT_SOURCE, kind: "roomFile", id: frame.id, msg }, window.origin);
+  let port = roomFilePorts.get(frame.id);
+  if (frame.msg.kind === "cancel") {
+    port?.disconnect();
+    roomFilePorts.delete(frame.id);
+    return;
+  }
+  if (!port) {
+    try {
+      port = chrome.runtime.connect({ name: ROOM_FILES_PAGE_PORT });
+    } catch (e) {
+      back({ kind: "failed", error: e instanceof Error ? e.message : String(e) });
+      return;
+    }
+    roomFilePorts.set(frame.id, port);
+    port.onMessage.addListener((m: unknown) => back(m));
+    port.onDisconnect.addListener(() => {
+      void chrome.runtime.lastError;
+      roomFilePorts.delete(frame.id);
+      back({ kind: "closed" });
+    });
+  }
+  port.postMessage(frame.msg);
+}
+
 // ─── 3. Forward background broadcasts (wallet lifecycle events) into
 //        the page world. ───
 // Background fires these on unlock / lock / connection change. Pages
@@ -143,7 +220,53 @@ chrome.runtime.onMessage.addListener((message) => {
   );
 });
 
-// ─── 4. Emit `ready` on initial content-script load. ───
+// ─── 4. Same-device trigger links (VTI-LNK-056). ───
+// The worker's answer is deliberately not awaited or read: the page must not
+// learn what the wallet decided about a link it was shown.
+//
+// With no active VTA connection the click is not taken at all, so a browser
+// with the plugin but no wallet behaves exactly as one without it (C2: the
+// click lands on the link host's no-wallet page). The flag starts false and is
+// read from the popup's persisted connection state, then kept current; a click
+// before the first read simply navigates.
+const CONNECTION_STORAGE_KEY = "pnm-connection/v3";
+let walletReady = false;
+try {
+  void chrome.storage.local
+    .get(CONNECTION_STORAGE_KEY)
+    .then((stored) => {
+      walletReady = parseActiveVtaDid(stored[CONNECTION_STORAGE_KEY]) !== null;
+    })
+    .catch(() => undefined);
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area === "local" && CONNECTION_STORAGE_KEY in changes) {
+      walletReady = parseActiveVtaDid(changes[CONNECTION_STORAGE_KEY]?.newValue) !== null;
+    }
+  });
+} catch {
+  // Extension context invalidated: leave every click to the browser.
+}
+installTriggerLinkClickHandler(window, {
+  walletReady: () => walletReady,
+  now: () => Math.floor(Date.now() / 1000),
+  send: (activation) => {
+    void chrome.runtime
+      .sendMessage({ type: RUNTIME_TRIGGER_LINK, link: activation.link, origin: activation.origin })
+      .catch(() => undefined);
+  },
+  sendNumber: (n) => {
+    void chrome.runtime
+      .sendMessage({
+        type: RUNTIME_TRIGGER_LINK_NUMBER,
+        requestId: n.requestId,
+        matchNumber: n.matchNumber,
+        origin: n.origin,
+      })
+      .catch(() => undefined);
+  },
+});
+
+// ─── 5. Emit `ready` on initial content-script load. ───
 // Fires once per fresh content-script instance. On extension reload,
 // the OLD content script in this tab is orphaned (`chrome.runtime`
 // calls all fail with "Extension context invalidated"). The

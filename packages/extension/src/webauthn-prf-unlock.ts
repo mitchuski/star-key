@@ -24,6 +24,7 @@
 
 import { base64url } from "@openvtc/vti-didcomm-js";
 import { IndexedDBKVStore } from "@openvtc/pnm-core";
+import { browserOffersPrf, PRF_BROWSER_MESSAGE, PRF_NO_OUTPUT_MESSAGE } from "./webauthn-prf-wrap.js";
 
 // Same keys WebAuthnPrfSecretWrap writes when it enrolls. Kept in
 // sync by convention; both files need to agree on the slot.
@@ -104,6 +105,34 @@ export async function runApproverUnlockCeremony(
   return prfCeremony(rpId, credentialIdB64u, saltB64u, challenge);
 }
 
+/** Whether this wallet has its passkey: the PRF credential the holder's
+ *  encryption at rest enrols, which the sign-in approval key reuses. */
+export async function hasPrfEnrolment(): Promise<boolean> {
+  const store = new IndexedDBKVStore();
+  return Boolean((await store.get<string>(CREDENTIAL_KEY)) && (await store.get<string>(SALT_KEY)));
+}
+
+/**
+ * The **sign-in approval** ceremony, bound to one grant.
+ *
+ * The WebAuthn `challenge` is the bytes the flow handed the window (the UTF-8
+ * of the grant digest, base64url), so the gesture is made for this grant. The
+ * PRF output unseals this browser's sign-in approval key
+ * (`SignInUvPrfSecretWrap`) for the one decision; it is never cached.
+ */
+export async function runSignInApprovalCeremony(
+  rpId: string,
+  challengeB64u: string,
+): Promise<PrfUnlockMaterial> {
+  const store = new IndexedDBKVStore();
+  const credentialIdB64u = await store.get<string>(CREDENTIAL_KEY);
+  const saltB64u = await store.get<string>(SALT_KEY);
+  if (!credentialIdB64u || !saltB64u) {
+    throw new PrfUnlockError("no-enrolment", "This wallet has no passkey yet.");
+  }
+  return prfCeremony(rpId, credentialIdB64u, saltB64u, base64url.decode(challengeB64u));
+}
+
 /** Shared WebAuthn-PRF assertion: challenge in, PRF output out. */
 async function prfCeremony(
   rpId: string,
@@ -121,7 +150,7 @@ async function prfCeremony(
         rpId,
         challenge: challenge as BufferSource,
         allowCredentials: [
-          { type: "public-key", id: credentialId.buffer as ArrayBuffer },
+          { type: "public-key", id: credentialId as BufferSource },
         ],
         userVerification: "required",
         extensions: {
@@ -148,9 +177,11 @@ async function prfCeremony(
   };
   const prfOutput = extOutputs.prf?.results?.first;
   if (!prfOutput) {
+    // The browser's own answer first: the fix for "this browser has no PRF"
+    // is a different browser, not a different key.
     throw new PrfUnlockError(
       "no-prf-output",
-      "Authenticator returned no PRF output. The authenticator may not support the PRF extension, or its keys may have rotated.",
+      (await browserOffersPrf()) === false ? PRF_BROWSER_MESSAGE : PRF_NO_OUTPUT_MESSAGE,
     );
   }
   return { prfOutput: new Uint8Array(prfOutput) };

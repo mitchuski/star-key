@@ -43,7 +43,7 @@ import type { CSSProperties } from "react";
 export type IconName =
   // Sections, one per `SectionId`.
   | "contexts" | "keys" | "dids" | "did-templates"
-  | "credentials" | "persona" | "memory" | "app-state" | "rooms"
+  | "credentials" | "persona" | "memory" | "app-state" | "rooms" | "terms"
   | "services" | "mediator" | "maintenance" | "audit"
   | "access" | "approvals" | "policy" | "sessions"
   // Attribute families, one per `AttributeFamily`.
@@ -61,6 +61,9 @@ export type IconName =
 const PATHS: Record<IconName, string> = {
   contexts:
     "M3.4 4.6h17.2v14.8H3.4zM12 4.6v14.8M3.4 12h17.2",
+  // A sheet with three lines and a tick: an agreement, kept.
+  terms:
+    "M6 3.4h8.6l3.8 3.8v13.4H6zM14.6 3.4v3.8h3.8M8.8 10h6.4M8.8 13.2h6.4M9.6 17l1.6 1.6 3.2-3.2",
   keys:
     "M11.2 12h9.4M18 12v3.2M15.1 12v2.4",
   dids:

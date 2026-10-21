@@ -35,9 +35,18 @@ export type BridgeMethod =
   | "walletProfile"
   | "vaultList"
   | "requestTask"
-  | "disclose";
+  | "disclose"
+  | "approverIdentity"
+  | "approveStepUp"
+  | "attestApprover"
+  | "approveDecision"
+  | "rooms"
+  | "directory"
+  | "membership";
 
-/** Parameters for `window.vtaWallet.login(...)` (REST SIOPv2). */
+/** Parameters for `window.vtaWallet.login(...)` (REST SIOPv2).
+ *  @deprecated Legacy sign-in (sign-in contract C7); kept working. New pages
+ *  use wallet sign-in with a trigger link. */
 export interface LoginParams {
   /** The RP's identifier (its server DID). It is the `recipient` of both auth
    *  documents, and every reply must be signed by it. */
@@ -60,7 +69,9 @@ export interface LoginParams {
   sessionKey?: string;
 }
 
-/** Parameters for `window.vtaWallet.loginDidcomm(...)` (DIDComm transport). */
+/** Parameters for `window.vtaWallet.loginDidcomm(...)` (DIDComm transport).
+ *  @deprecated Legacy sign-in (sign-in contract C7); kept working. New pages
+ *  use wallet sign-in with a trigger link. */
 export interface DidcommLoginParams {
   /** The RP's control DID — authcrypt recipient + the DID the RP ACL-checks. */
   controlDid: string;
@@ -172,6 +183,84 @@ export interface SignTrustTaskResult {
   holderDid: string;
 }
 
+// ── Step-up approver (`auth/step-up/approver/attest/0.1`) ───────────────────
+//
+// The page-facing half of the wallet's per-audience step-up approver. Each
+// method takes the relying party's DID as `audience`, and the wallet serves it
+// only for the relying party the page's origin is pinned to — so a page can
+// neither name another community's approver (correlation) nor have one sign
+// for another community. The approver key is chosen by the wallet from the
+// audience; no parameter names one.
+
+/** Parameters for `window.vtaWallet.approverIdentity(...)`. */
+export interface ApproverIdentityParams {
+  /** The relying party (VTC) DID. Must be the origin's pinned RP. */
+  audience: string;
+}
+
+/** Result of `window.vtaWallet.approverIdentity(...)`. */
+export interface ApproverIdentityResult {
+  approverDid: string;
+}
+
+/** Parameters for `window.vtaWallet.approveStepUp(...)`. */
+export interface ApproveStepUpParams {
+  /** The inline `auth/step-up/approve-request/0.4` payload, as received. */
+  request: Record<string, unknown>;
+  /** The refused document's type and payload. The wallet recomputes
+   *  `request.boundTo` from it and refuses on a mismatch. */
+  operation: { type: string; payload: unknown };
+  /** The relying party (VTC) DID. Must be the origin's pinned RP. */
+  audience: string;
+}
+
+/** Parameters for `window.vtaWallet.attestApprover(...)`. Enrolment only: a
+ *  `decision` statement goes through {@link ApproveDecisionParams}, which shows
+ *  the action and recomputes its digest; `attestApprover` refuses any other
+ *  purpose. */
+export interface AttestApproverParams {
+  purpose: "enrol";
+  subject: string;
+  audience: string;
+  challenge: string;
+  boundTo: string;
+}
+
+/** Parameters for `window.vtaWallet.approveDecision(...)`: the approver for
+ *  `audience` vouches (attest/0.1, `purpose: decision`) for a VTC
+ *  administrator's `task-consent/decision/0.2` on one action. */
+export interface ApproveDecisionParams {
+  /** The relying party (VTC) DID. Must be the origin's pinned RP. Becomes the
+   *  statement's `audience` and `recipient`, and must be the decision's
+   *  `recipient`. */
+  audience: string;
+  /** The administrator who signs the decision — the statement's `subject`. The
+   *  decision must then be signed `asDid` this DID. */
+  subject: string;
+  /** The action, as `vtc/admin/actions/list/0.1` listed it. `type` and
+   *  `payload` are what the wallet shows and digests; `summary` is the VTC's
+   *  rendering of it (its `title`/`effect` are shown, labelled unverified). */
+  action: { type: string; payload: unknown; actionId?: string; summary?: unknown };
+  /** The decision being vouched for. `challenge` is the action's `challenge`
+   *  for this administrator; `payloadDigest` the task-consent wire digest the
+   *  decision echoes (`vta/task-consent/v1\0`, salted with `challenge`) — the
+   *  wallet recomputes it from `action` and refuses on a mismatch. `reason`,
+   *  when given, is shown and is the only `reason` the decision may carry. */
+  decision: {
+    challenge: string;
+    payloadDigest: string;
+    decision: "approve" | "deny";
+    reason?: string;
+  };
+}
+
+/** Result of `approveStepUp` / `attestApprover` / `approveDecision`: the complete signed
+ *  attest/0.1 document. */
+export interface ApproverStatementResult {
+  statement: Record<string, unknown>;
+  approverDid: string;
+}
+
 /** Result handed back to the RP page on a successful login. */
 export interface LoginResult {
   accessToken: string;
@@ -277,6 +366,19 @@ export interface RuntimeEmitWalletEvent {
   detail?: Record<string, unknown>;
 }
 
+/** offscreen → background: raise a browser notification. An offscreen
+ *  document gets `chrome.runtime` and no other extension API, so it cannot
+ *  call `chrome.notifications` itself. Not page-facing: the background accepts
+ *  it only from an extension page, so a site cannot put words in the wallet's
+ *  mouth. */
+export const RUNTIME_NOTIFY = "vta-wallet/notify" as const;
+
+export interface RuntimeNotifyRequest {
+  type: typeof RUNTIME_NOTIFY;
+  title: string;
+  message: string;
+}
+
 export const RUNTIME_LOGIN = "vta-wallet/login" as const;
 export const RUNTIME_LOGIN_DIDCOMM = "vta-wallet/login-didcomm" as const;
 export const RUNTIME_STEP_UP_VTA = "vta-wallet/step-up-vta" as const;
@@ -285,6 +387,14 @@ export const RUNTIME_API_POST = "vta-wallet/api-post" as const;
 export const RUNTIME_MEDIATOR_STATUS = "vta-wallet/mediator-status" as const;
 export const RUNTIME_WALLET_DEFAULTS = "vta-wallet/wallet-defaults" as const;
 export const RUNTIME_SIGN_TRUST_TASK = "vta-wallet/sign-trust-task" as const;
+/** page → background: the step-up approver DID for the pinned RP. */
+export const RUNTIME_APPROVER_IDENTITY = "vta-wallet/approver-identity" as const;
+/** page → background: answer a bound step-up with the approver. */
+export const RUNTIME_APPROVE_STEP_UP = "vta-wallet/approve-step-up" as const;
+/** page → background: the approver's enrolment statement. */
+export const RUNTIME_ATTEST_APPROVER = "vta-wallet/attest-approver" as const;
+/** page → background: vouch for a task-consent decision with the approver. */
+export const RUNTIME_APPROVE_DECISION = "vta-wallet/approve-decision" as const;
 /** page → background: propose a Trust Task for the VTA to execute.
  *
  *  The generic relay. Unlike {@link RUNTIME_SIGN_TRUST_TASK}, the page supplies
@@ -459,6 +569,38 @@ export type RuntimeSignTrustTaskResponse =
   | { ok: true; result: SignTrustTaskResult }
   | { ok: false; error: string };
 
+export interface RuntimeApproverIdentityRequest {
+  type: typeof RUNTIME_APPROVER_IDENTITY;
+  params: ApproverIdentityParams;
+  origin: string;
+}
+
+export type RuntimeApproverIdentityResponse =
+  | { ok: true; result: ApproverIdentityResult }
+  | { ok: false; error: string };
+
+export interface RuntimeApproveStepUpRequest {
+  type: typeof RUNTIME_APPROVE_STEP_UP;
+  params: ApproveStepUpParams;
+  origin: string;
+}
+
+export interface RuntimeAttestApproverRequest {
+  type: typeof RUNTIME_ATTEST_APPROVER;
+  params: AttestApproverParams;
+  origin: string;
+}
+
+export interface RuntimeApproveDecisionRequest {
+  type: typeof RUNTIME_APPROVE_DECISION;
+  params: ApproveDecisionParams;
+  origin: string;
+}
+
+export type RuntimeApproverStatementResponse =
+  | { ok: true; result: ApproverStatementResult }
+  | { ok: false; error: string };
+
 /** background → content (sendResponse). */
 export type RuntimeLoginResponse =
   | { ok: true; result: LoginResult }
@@ -490,6 +632,10 @@ export interface RuntimeConsentResult {
    *  treats an approval that arrives without it as a denial rather than
    *  guessing a persona on the operator's behalf. */
   selectedDid?: string;
+  /** Room-share prompt only: the rows the member ticked to share with the
+   *  page's origin (`data-rooms-files.md` §8.5), each `heldRoomKey` — the room
+   *  and the member it is shared as. Ignored on a denial. */
+  selectedRooms?: string[];
 }
 
 /** confirm popup → background: resolve + verify an RP DID. */
@@ -1381,7 +1527,9 @@ export type RuntimeVaultProxyLoginResponse =
 /** Params shape the page-world provider posts to the content script
  *  for `window.vtaWallet.proxyLogin(...)`. Mirrors the popup's
  *  request body — the content script + background unwrap `params`
- *  and reuse the same offscreen pipeline. */
+ *  and reuse the same offscreen pipeline.
+ *  @deprecated as a page sign-in (sign-in contract C7); kept working. The
+ *  popup's own use of this shape is unaffected. */
 export interface ProxyLoginParams {
   /** The vault entry to log in with.
    *
@@ -1611,6 +1759,39 @@ export interface OffscreenSetWakeResponse {
 /** background → offscreen: sign a Trust-Task envelope with the holder did:peer.
  *  Reply is a [`SignTrustTaskResult`] (or `{error}`) via sendResponse. */
 export const OFFSCREEN_SIGN_TRUST_TASK = "offscreen/sign-trust-task" as const;
+/** background → offscreen: the per-audience step-up approver store. One type,
+ *  four operations — see {@link OffscreenStepUpApproverRequest}. */
+export const OFFSCREEN_STEP_UP_APPROVER = "offscreen/step-up-approver" as const;
+
+/**
+ * - `identity`: the approver DID for `audience`, minting it if the sealing key
+ *   exists (no gesture). With `prfOutputB64u`, creates the sealing key too.
+ *   Replies `{ok: true, result: {approverDid}}`, or `{ok: false, code:
+ *   "step-up-approver/setup-required"}` when a gesture is needed first.
+ * - `check-step-up`: every check `approveStepUp` makes, before a prompt.
+ *   Replies `{ok: true, result: {approverDid, boundTo}}` or a refusal.
+ * - `check-decision`: every check `approveDecision` makes, before a prompt —
+ *   the approver exists for the audience, `payloadDigest` is the action's.
+ *   Replies `{ok: true, result: {approverDid, boundTo}}` or a refusal.
+ * - `sign-step-up` / `sign-enrol` / `sign-decision`: unseal with the gesture's
+ *   PRF output and sign. The checks run again here, beside the key.
+ */
+export type StepUpApproverOp =
+  | { op: "identity"; audience: string; prfOutputB64u?: string }
+  | { op: "check-step-up"; params: ApproveStepUpParams }
+  | { op: "sign-step-up"; params: ApproveStepUpParams; prfOutputB64u: string }
+  | { op: "sign-enrol"; params: AttestApproverParams; prfOutputB64u: string }
+  | { op: "check-decision"; params: ApproveDecisionParams }
+  | { op: "sign-decision"; params: ApproveDecisionParams; prfOutputB64u: string };
+
+export type OffscreenStepUpApproverRequest = {
+  target: typeof OFFSCREEN_TARGET;
+  type: typeof OFFSCREEN_STEP_UP_APPROVER;
+} & StepUpApproverOp;
+
+export type OffscreenStepUpApproverResponse =
+  | { ok: true; result: Record<string, unknown> }
+  | { ok: false; error: string; code?: string };
 /** background → offscreen: resolve + verify a DID (used by the consent
  *  prompt's verification badge). Reply is a [`VerifyRpDidResult`] via
  *  sendResponse. */
@@ -2223,6 +2404,337 @@ export type MonitorMessage =
  * the two in step; the `page_facing_types_cover_the_content_dispatch_table`
  * assertion in `background.ts` fails if a type here has no home.
  */
+/** content → background: a person's click on a trigger link. Declared here,
+ *  above the list it is in; the rest of the sign-in protocol is at the end of
+ *  this file. */
+export const RUNTIME_TRIGGER_LINK = "vta-wallet/trigger-link" as const;
+/** content script → background: the number the portal shows for a request
+ *  the person clicked the code of (contract C11). */
+export const RUNTIME_TRIGGER_LINK_NUMBER = "vta-wallet/trigger-link-number" as const;
+
+// ─── Joining a community from its DID (Star Key) ────────────────────────────
+//
+//   popup / scan window ──RUNTIME_JOIN_COMMUNITY──▶ background
+//       The person read a community's DID off its QR code (the one on its
+//       landing page, `/v1/community/did-qr.svg`) or pasted it. The
+//       background checks the shape, records the DID under a fresh flow id in
+//       `chrome.storage.session` and opens the sign-in window on it. The
+//       window runs the same join steps a trigger link reaches for a site the
+//       wallet does not know (`sign-in-flows.ts`, `prepareJoin`): the DID
+//       document is resolved and verified, nothing is sent until the person
+//       continues, the manifest is asked for as a throwaway key, and the
+//       request is signed by the member's agent as the chosen persona. What
+//       differs: there is no page, so there is no portal origin to hold the
+//       click to — the verified document's portal is shown instead — and an
+//       admission ends the flow (`join-admitted`) rather than going on to a
+//       sign-in, since no website is waiting for one.
+
+export const RUNTIME_JOIN_COMMUNITY = "vta-wallet/join-community" as const;
+
+/** Where the DID came from, for the window's sentence. */
+export type JoinSource = "page" | "camera" | "image" | "pasted";
+
+export interface RuntimeJoinCommunityRequest {
+  type: typeof RUNTIME_JOIN_COMMUNITY;
+  did: string;
+  source: JoinSource;
+}
+
+export type RuntimeJoinCommunityResponse = { ok: true } | { ok: false; error: string };
+
+/** MyTerms at the join door (`@openvtc/pnm-core/vtc`'s `myterms.ts`): what
+ *  the person would join under, for the `join-apply` screen. */
+export type SignInJoinTermsView =
+  | {
+      status: "offered";
+      /** The roster code, its title and one-sentence meaning. */
+      code: string;
+      title: string;
+      meaning: string;
+      /** `true`: the community's counter-offer (the person's standing choice,
+       *  `declined`, is not among what it accepts, or they have none). */
+      counter: boolean;
+      declined?: string;
+      /** What the community accepts, most protective first. */
+      accepts: string[];
+      /** Where the community publishes its accepted agreements. */
+      agreementsUrl?: string;
+      /** The holder's switch for this community (console → Agreements):
+       *  `false` turns the "join under terms" box off by default. The person
+       *  can still tick it; the switch is a default, not a refusal. */
+      enabled: boolean;
+    }
+  /** The community takes terms, but none this wallet's roster mirror carries. */
+  | { status: "no-match"; accepts: string[] }
+  /** The community names a MyTerms service whose configuration could not be
+   *  read. The join goes on without terms. */
+  | { status: "unavailable" };
+
+/** What a request under terms was sent as. */
+export interface SignInJoinTermsRecord {
+  code: string;
+  agreementId: string;
+}
+
+// ─── Data rooms for a page: `window.vtaWallet.rooms` (P7b) ──────────────────
+//
+// VTI `docs/05-design-notes/data-rooms-files.md` §8.5. A page never drives a
+// `rooms/*` task: `requestTask` and `signTrustTask` still refuse the whole
+// family (`page-task-policy.ts`). It calls these methods, whose verbs are fixed,
+// whose flows run in the extension, and whose answers are views the wallet
+// built — never a task result, a presentation, a signed document or a key.
+//
+// Every call names `hostDid`, the community whose portal the page claims to be.
+// The background refuses unless the page's browser-attested origin is the
+// origin of that DID document's `SignInPortal`, and acts only on rooms the
+// member shared with that origin (`room-page-policy.ts`).
+
+/** page → background, through the content script: one room operation. */
+export const RUNTIME_ROOMS_PAGE = "vta-wallet/rooms-page" as const;
+
+export type RoomsPageOp =
+  | { op: "list"; hostDid: string }
+  /** `member` is the DID the page says is signed in. A hint only: the wallet
+   *  offers just the identities it holds for this community, and uses this to
+   *  pre-tick among them, never to add one. */
+  | { op: "choose"; hostDid: string; suggest?: string; member?: string }
+  | { op: "forget"; hostDid: string; roomId: string }
+  | { op: "info"; hostDid: string; roomId: string }
+  | { op: "browse"; hostDid: string; roomId: string; prefix?: string; sinceVersion?: number }
+  | { op: "read"; hostDid: string; roomId: string; key: string }
+  /** This community's offers of its rooms to the identities the member uses here. Never prompts. */
+  | { op: "offers"; hostDid: string }
+  /** Ask to accept one: the member decides in the wallet's own window. `member`
+   *  picks among the identities offered the room, never adds one. */
+  | { op: "acceptOffer"; hostDid: string; roomId: string; member?: string }
+  | {
+      op: "putNote";
+      hostDid: string;
+      roomId: string;
+      title: string;
+      body?: string;
+      description?: string;
+      tags?: string[];
+    };
+
+export interface RuntimeRoomsPageRequest {
+  type: typeof RUNTIME_ROOMS_PAGE;
+  /** Overwritten by the background with the browser-attested origin. */
+  origin: string;
+  params: RoomsPageOp;
+}
+
+export type RuntimeRoomsPageResponse = { ok: true; result: unknown } | { ok: false; error: string };
+
+/** A room the member shared with this page's origin. */
+export interface PageRoomView {
+  roomId: string;
+  /** The member (persona DID) the wallet acts as in this room for this page. */
+  member: string;
+  /** The epoch the member's VTA is at, and the earliest it can read. */
+  epoch?: number;
+  earliestReadableEpoch?: number;
+  /** False when the VTA no longer holds keys for it (removed, or not yet welcomed). */
+  held: boolean;
+  sharedAt: string;
+  expiresAt: string;
+  /**
+   * The room's name: its own profile's name where it has one
+   * (`rooms/keys/profile/read`), else — for a room this community owns — the
+   * label its administrators gave it, as the community's record of the member's
+   * rooms carries it (`vtc/rooms/memberships/list`). Absent whenever the wallet has
+   * learned neither — the page then shows the room's DID. Plain text.
+   */
+  label?: string;
+  /** The room's tier, as the same offer carried it. */
+  visibility?: string;
+  /**
+   * Where `label` came from: `profile` — the room's own profile, sealed inside
+   * it and read by the member's VTA (`rooms/keys/profile/read`), which wins —
+   * or `community`, the label of the community's offer.
+   */
+  labelSource?: "profile" | "community";
+  /** What the room says it is for, from its profile. Plain text, never markup. */
+  description?: string;
+  /** The profile predates the room's latest epoch advance and was not written again since. */
+  profileStale?: boolean;
+  /** Somebody without the standing to name the room wrote a newer profile; it was ignored. */
+  renameRefused?: boolean;
+}
+
+/** What the wallet keeps of one room's profile for a view — text only, already inert. */
+export interface RoomProfileSummary {
+  status: "found" | "absent" | "cleared";
+  name?: string;
+  description?: string;
+  emoji?: string;
+  stale: boolean;
+  renameRefused: boolean;
+}
+
+/** `rooms.info`: the room as its host reports it to the member. */
+export interface PageRoomInfoView {
+  roomId: string;
+  visibility: string;
+  epoch: number;
+  /** The member the wallet acts as in this room. */
+  member: string;
+  limits: unknown;
+  usage: unknown;
+}
+
+/** One row of `rooms.browse`: metadata, never a body. */
+export interface PageRecordSummary {
+  key: string;
+  version: number;
+  updatedAt: string;
+  status?: string;
+  epoch?: number;
+  author?: string;
+  /** `open` rooms only: on a sealed room the title is inside the body. */
+  title?: string;
+  description?: string;
+}
+
+export interface PageListingView {
+  records: PageRecordSummary[];
+  complete: boolean;
+  /** The member's VTA's account of what it checked. A verdict, never a failure. */
+  verification: unknown;
+}
+
+/** `rooms.read`: one record, verified before any of it is shown. */
+export interface PageRecordView {
+  key: string;
+  version: number;
+  status: string;
+  updatedAt: string;
+  author?: string;
+  title?: string;
+  description?: string;
+  /** Markdown, untrusted text from another member: render it inert. */
+  body?: string;
+  tags?: string[];
+  file?: { name: string; mediaType?: string; size: number };
+  /** False on an `open` room, where the host stores and can alter cleartext. */
+  sealed: boolean;
+  verification: unknown;
+}
+
+/** page ⇄ background: one file transfer, over a port the content script opens. */
+export const ROOM_FILES_PAGE_PORT = "vta-wallet/room-files-page" as const;
+
+/** page → background, once, as the port's first message. */
+export type RoomFilesPageOpen =
+  | { kind: "get"; hostDid: string; roomId: string; key: string }
+  | {
+      kind: "put";
+      hostDid: string;
+      roomId: string;
+      name: string;
+      mediaType?: string;
+      size: number;
+      title?: string;
+      description?: string;
+      tags?: string[];
+    };
+
+/** page → background, after `ready` on a put: the file, in order, then `end`. */
+export type RoomFilesPageUpload = { kind: "data"; data: string /* base64url */ } | { kind: "end" };
+
+/** background → page. A download's bytes come only after the whole file verified. */
+export type RoomFilesPageMessage =
+  | { kind: "progress"; stage: string; done?: number; total?: number }
+  /** The member confirmed the upload: send the bytes. */
+  | { kind: "ready" }
+  | { kind: "put"; key: string; version: number; size: number }
+  | {
+      kind: "got";
+      file: { name: string; mediaType?: string; size: number };
+      author: string;
+      version: number;
+      title?: string;
+      description?: string;
+      tags?: string[];
+    }
+  | { kind: "data"; data: string /* base64url */ }
+  | { kind: "done" }
+  | { kind: "failed"; error: string };
+
+// ─── A member's directory card for a page: `window.vtaWallet.directory` ──────
+//
+// `vtc/directory/card/publish/0.1`. A page never drives a `vtc/directory/*`
+// task or `keys/sign-document` (`page-task-policy.ts` refuses both): it asks to
+// publish the member's card, and the wallet does the rest — reads the card as
+// the member, shows the person every value and that anyone can read it, has the
+// agent sign it as the member's DID, and sends it — or does nothing.
+//
+// The call names `hostDid`, the community whose portal the page claims to be.
+// The background refuses unless the page's browser-attested origin is the
+// origin of that DID document's `SignInPortal` (`directory-page.ts`).
+
+/** page → background, through the content script: one directory operation. */
+export const RUNTIME_DIRECTORY_PAGE = "vta-wallet/directory-page" as const;
+
+/** `member` is the DID the page says is signed in: a hint that picks among the
+ *  identities the wallet holds for this community, never adds one. */
+export type DirectoryPageOp = { op: "publishCard"; hostDid: string; member?: string };
+
+export interface RuntimeDirectoryPageRequest {
+  type: typeof RUNTIME_DIRECTORY_PAGE;
+  /** Overwritten by the background with the browser-attested origin. */
+  origin: string;
+  params: DirectoryPageOp;
+}
+
+/** Where the member's card stands once the wallet published it. */
+export interface PagePublishedCardView {
+  state: "published" | "awaitingSignature";
+  cardDigest?: string;
+  publishedAt?: string;
+}
+
+export type RuntimeDirectoryPageResponse =
+  | { ok: true; result: PagePublishedCardView }
+  | { ok: false; error: string };
+
+// ─── Membership for a page: `window.vtaWallet.membership` ───────────────────
+//
+// A community's own portal asks whether the person at the page is a member,
+// and as whom, so the page can change once they are: show the door, not the
+// join form. The answer is the wallet's own record — the identities it signs
+// in with at that community (`membersAt`), and the agreement it holds with
+// it — never a credential, a presentation or anything signed. The page is
+// the community's `SignInPortal` by its DID document or it gets nothing. No
+// prompt: it is a read of what the wallet already told this community.
+
+/** page → background, through the content script. */
+export const RUNTIME_MEMBERSHIP_PAGE = "vta-wallet/membership-page" as const;
+
+export type MembershipPageOp = { op: "status"; hostDid: string };
+
+export interface RuntimeMembershipPageRequest {
+  type: typeof RUNTIME_MEMBERSHIP_PAGE;
+  /** Overwritten by the background with the browser-attested origin. */
+  origin: string;
+  params: MembershipPageOp;
+}
+
+/** What a portal is told about the person at the page. */
+export type PageMembershipView =
+  | { member: false }
+  | {
+      member: true;
+      /** The identities the wallet uses at this community (persona DIDs the
+       *  community already knows, since it admitted them). */
+      identities: string[];
+      /** The standing agreement with this community, if a request went out
+       *  under terms: the code, how it stands, when. */
+      agreement?: { code: string; status: "proffered" | "agreed" | "declined"; at: number };
+    };
+
+export type RuntimeMembershipPageResponse = { ok: true; result: PageMembershipView } | { ok: false; error: string };
+
 export const PAGE_FACING_RUNTIME_TYPES = [
   RUNTIME_LOGIN,
   RUNTIME_LOGIN_DIDCOMM,
@@ -2237,5 +2749,713 @@ export const PAGE_FACING_RUNTIME_TYPES = [
   RUNTIME_VAULT_LIST_PAGE,
   RUNTIME_REQUEST_TASK,
   RUNTIME_DISCLOSE,
+  RUNTIME_APPROVER_IDENTITY,
+  RUNTIME_APPROVE_STEP_UP,
+  RUNTIME_ATTEST_APPROVER,
+  RUNTIME_APPROVE_DECISION,
+  RUNTIME_ROOMS_PAGE,
+  RUNTIME_DIRECTORY_PAGE,
+  RUNTIME_MEMBERSHIP_PAGE,
+  // Not a provider method: the content script's own click listener sends it
+  // (`trigger-link-click.ts`). Listed so the background takes the activation
+  // origin from the browser, never from the body (VTI-LNK-056).
+  RUNTIME_TRIGGER_LINK,
+  // Not a provider method either: the same listener, reporting the number the
+  // portal shows after that click (C11). Its origin is the browser's too.
+  RUNTIME_TRIGGER_LINK_NUMBER,
 ] as const;
 
+
+// ─── Wallet sign-in from a trigger link (VTI spec 7a; sign-in contract C3) ───
+//
+// Three hops, and only the first touches a page:
+//
+//   content script ──RUNTIME_TRIGGER_LINK──▶ background
+//       The person clicked a link that parses as a trigger link. Carries the
+//       link and the origin the content script read at the click; the
+//       background replaces the origin with the browser-attested one, parses
+//       the link again, stores both in `chrome.storage.session` under a fresh
+//       flow id, and opens the sign-in window. Nothing is answered to the page.
+//
+//   sign-in window ──RUNTIME_SIGN_IN_STEP──▶ background ──OFFSCREEN_SIGN_IN_STEP──▶ offscreen
+//       One message per step the person takes. The window names only the flow
+//       id and what the person chose or typed; the link and the origin are
+//       added by the background from its own record, so an extension page
+//       cannot re-point a flow at another origin. The offscreen document runs
+//       the protocol and holds `K_a`, in memory only, for the flow's life.
+//
+//   content script ──RUNTIME_TRIGGER_LINK_NUMBER──▶ background ──OFFSCREEN_SIGN_IN_PAGE_NUMBER──▶ offscreen
+//       After the click, the content script watches the page for the number
+//       the portal shows once the request is claimed: the element carrying
+//       `data-oob-request-id` (the link's `_id`) and `data-oob-match-number`
+//       (contract C11). The background hands it to the flow whose link has
+//       that id and whose click came from the same attested origin; the flow
+//       proves with it, so the person does not type it. The community still
+//       checks the number. Nothing is answered to the page.
+
+export interface RuntimeTriggerLinkRequest {
+  type: typeof RUNTIME_TRIGGER_LINK;
+  link: string;
+  /** Overwritten by the background with the attested `sender.origin`. */
+  origin: string;
+}
+
+export interface RuntimeTriggerLinkNumberRequest {
+  type: typeof RUNTIME_TRIGGER_LINK_NUMBER;
+  /** The link's `_id`, as the page's `data-oob-request-id` names it. */
+  requestId: string;
+  /** Two digits, as the page's `data-oob-match-number` shows them. */
+  matchNumber: string;
+  /** Overwritten by the background with the attested `sender.origin`. */
+  origin: string;
+}
+
+/** background → offscreen: the portal's number for a held flow (C11). */
+export const OFFSCREEN_SIGN_IN_PAGE_NUMBER = "offscreen/sign-in-page-number" as const;
+
+export interface OffscreenSignInPageNumberRequest {
+  target: typeof OFFSCREEN_TARGET;
+  type: typeof OFFSCREEN_SIGN_IN_PAGE_NUMBER;
+  flowId: string;
+  matchNumber: string;
+}
+
+/** sign-in window → background, and background → offscreen. */
+export const RUNTIME_SIGN_IN_STEP = "vta-wallet/sign-in-step" as const;
+export const OFFSCREEN_SIGN_IN_STEP = "offscreen/sign-in-step" as const;
+
+/** What the person did. `prepare` is the window opening. */
+export type SignInStep =
+  | { step: "prepare" }
+  /** Unknown DID hosting service: the person agreed to use it, as `did` (one
+   *  of the `join-hosting` candidates). Records it in the vault the way the
+   *  legacy first-use prompt does, then the flow goes on to `confirm`. */
+  | { step: "join"; did: string }
+  /** Unknown community (VTC): the person asked what it requires. The wallet
+   *  fetches its join manifest as a throwaway key, saying nothing of who is
+   *  asking. */
+  | { step: "join-manifest" }
+  /** Unknown community: the person sent a join request as `did` (one of the
+   *  `join-apply` candidates), with their answers to what it asked. */
+  | {
+      step: "join-submit";
+      did: string;
+      attributes: Array<{ type: string; value: string }>;
+      registryConsent: boolean;
+      /** MyTerms: join under this agreement (the one `join-apply` offered).
+       *  Absent: no terms are proffered, even where the community takes them. */
+      terms?: { code: string };
+    }
+  | { step: "claim"; entryId: string }
+  | { step: "prove"; enteredNumber: string }
+  /** The community's signed name differs from the wallet's record and the
+   *  person chose to call it that in their wallet: the record is renamed and
+   *  the sign-in goes on (with the page's number, when it has it). */
+  | { step: "adopt-name" }
+  | { step: "grant-digest" }
+  /** The devices the person may approve on instead of this browser (their
+   *  phone): `uv-approvers`. */
+  | { step: "uv-approvers" }
+  /** Approve: the PRF output of the wallet passkey's ceremony, bound to the
+   *  grant digest. It unseals this browser's UV key for the one decision and
+   *  is not kept. */
+  | { step: "respond"; decision: "approve"; prfOutputB64u: string }
+  /** Approve with the PIN (`vtaPin`). `setPin`: enrol it first, as this
+   *  browser's way of approving at the agent. The PIN is used to derive the
+   *  proof and is not kept. */
+  | { step: "respond"; decision: "approve"; pin: string; setPin?: true }
+  /** Approve on the person's phone (`remoteApprover`). `approver`: enrol that
+   *  phone first. Sent again, unchanged but without `approver`, to poll while
+   *  the answer is `uv-pending`. */
+  | { step: "respond"; decision: "approve"; remote: true; approver?: string }
+  | { step: "respond"; decision: "decline" }
+  | { step: "cancel" };
+
+export type RuntimeSignInStepRequest = { type: typeof RUNTIME_SIGN_IN_STEP; flowId: string } & SignInStep;
+
+export type OffscreenSignInStepRequest = {
+  target: typeof OFFSCREEN_TARGET;
+  type: typeof OFFSCREEN_SIGN_IN_STEP;
+  flowId: string;
+  vtaDid: string;
+  restBaseUrl?: string;
+  /** Present on `prepare` only, from the background's own record. */
+  link?: string;
+  origin?: string;
+  /** Present on `prepare` only, instead of `link`/`origin`: a join by DID
+   *  (`RUNTIME_JOIN_COMMUNITY`), from the background's own record. */
+  joinDid?: string;
+  joinSource?: JoinSource;
+} & SignInStep;
+
+/** How this browser approves sign-ins at an agent: the kind of UV key the
+ *  agent holds for it. */
+export type SignInUvMethod = "prfSealedKey" | "vtaPin" | "remoteApprover";
+
+/** A device that may approve for this browser (the person's phone). */
+export interface SignInUvApproverView {
+  did: string;
+  displayName?: string;
+  formFactor?: string;
+}
+
+/** One identity the member can sign in as: a `didSelfIssued` vault entry
+ *  that targets the community. */
+export interface SignInIdentityView {
+  entryId: string;
+  did: string;
+  label: string;
+}
+
+/** A DID the member's agent hosts, offered when they start using a DID
+ *  hosting service (`join-hosting`). */
+export interface SignInPersonaView {
+  did: string;
+  contextId: string;
+  /** Labels of the vault entries this DID already signs in to, so the person
+   *  can see when one identity would link two communities. */
+  usedAt?: string[];
+}
+
+/** One attribute a community asks an applicant for. Self-asserted. */
+export interface SignInJoinAttributeView {
+  type: string;
+  required: boolean;
+  /** The community's reason, in its words. */
+  purpose?: string;
+}
+
+/** What the window shows. Every variant is a screen. */
+export type SignInStepResult =
+  /** A refusal, with the VTI-LNK-021 message. A refusal about the contact's
+   *  DID document or the page (not a link field) also carries `detail`, for
+   *  the window's "Details" line only. */
+  | {
+      kind: "refused";
+      outcome: "update" | "expired" | "unreachable" | "invalid";
+      message: string;
+      detail?: SignInRefusalDetail;
+    }
+  /** VTI-LNK-101: not one of this wallet's communities. Nothing was sent to
+   *  it. `contactLabel` is the unverified domain label (VTI-LNK-050);
+   *  `portalOrigin` is present when its DID document verified and the link was
+   *  clicked on its portal. */
+  | { kind: "not-member"; contactLabel?: string; portalOrigin?: string }
+  /** An unknown site whose verified DID document says it is a DID hosting
+   *  service (`WebVHHosting`): "Use <host> to host your DIDs?". Nothing has
+   *  been sent to it. `identities` are the DIDs the member's agent hosts. */
+  | { kind: "join-hosting"; host: string; portalOrigin: string; identities: SignInPersonaView[] }
+  /** An unknown site whose verified DID document says it is a community
+   *  (`VTCRest`): "Join <host>?". Nothing has been sent to it. */
+  | {
+      kind: "join-community";
+      host: string;
+      portalOrigin: string;
+      /** The origin of the community's `TrustTaskHTTPS` endpoint: where the
+       *  wallet will POST. Named so the join window can ask the browser for
+       *  both origins before anything is fetched (the wallet holds no host
+       *  permission by default, and a cross-origin GET or POST from it is
+       *  refused by CORS without one). */
+      trustTaskOrigin: string;
+      source?: JoinSource;
+    }
+  /** A join by DID: the DID names a verified community this wallet already
+   *  signs in to. Nothing was sent; the flow has ended. */
+  | { kind: "already-member"; communityName: string; portalOrigin: string }
+  /** A join by DID: the DID's verified document is not a community's (no
+   *  `VTCRest` service). Nothing was sent; the flow has ended. */
+  | { kind: "not-a-community"; did: string; portalOrigin?: string }
+  /** A join by DID: admitted on the spot. The flow has ended — there is no
+   *  website waiting for a sign-in — so the person is pointed at the portal. */
+  | { kind: "join-admitted"; host: string; portalOrigin: string; displayName?: string; role?: string; terms?: SignInJoinTermsRecord }
+  /** The community's join manifest, as far as this wallet can apply under it.
+   *  Only the anonymous manifest request has been sent. `displayName` is the
+   *  community's own name for itself (unverified). */
+  | {
+      kind: "join-apply";
+      host: string;
+      portalOrigin: string;
+      displayName?: string;
+      /** `automatic`: admitted on the spot. `review`: an administrator decides. */
+      admission: "automatic" | "review";
+      attributes: SignInJoinAttributeView[];
+      /** What the community's directory would show about the person, and to
+       *  whom, in plain sentences (VTI-DIR-130), and the digest naming that
+       *  statement. Absent when the community states none. */
+      directory?: { lines: string[]; statementDigest: string };
+      identities: SignInPersonaView[];
+      /** MyTerms: what the person would join under, when the community takes
+       *  terms (a `MyTerms` service in its verified document). Absent when it
+       *  does not. */
+      terms?: SignInJoinTermsView;
+    }
+  /** The community asks for evidence this wallet cannot provide (a
+   *  credential, an invitation, vetting), or takes no members. The flow has
+   *  ended; nothing about the person was sent. */
+  | {
+      kind: "join-elsewhere";
+      host: string;
+      portalOrigin: string;
+      reason: "not-accepting" | "needs-more";
+      needs: string[];
+      displayName?: string;
+    }
+  /** The request was sent and is waiting on the community (`refer`), or it
+   *  wants more evidence (`requestMore`, `needs`). The flow has ended; no
+   *  sign-in document was sent. */
+  | { kind: "join-pending"; host: string; portalOrigin: string; needs?: string[]; terms?: SignInJoinTermsRecord }
+  /** C3 step 5: "Sign in to <name> at <portal origin>?" */
+  | { kind: "confirm"; communityName: string; portalOrigin: string; identities: SignInIdentityView[] }
+  /** After the claim: type the number. `nameMismatch` is the community's own
+   *  name for itself when it differs from this wallet's record (VTI-LNK-104).
+   *  `audience` is the session the website asked for, from the community's
+   *  signed step 1: its member portal, or its operator console (`admin`). */
+  | {
+      kind: "enter-number";
+      nameMismatch?: string;
+      /** The record could not be renamed (`adopt-name`); why, to show. */
+      adoptFailed?: string;
+      /** Epoch ms. */ decisionDeadline: number;
+      audience: "member" | "admin";
+    }
+  /** Step 2: where the request came from (base design §14 step 11). */
+  | {
+      kind: "review";
+      location: string;
+      browser: string;
+      os: string;
+      createdAt: string;
+      network: "same" | "different" | "unknown";
+      identifiedAs: string;
+      /** As step 1's; step 2 repeats it, and the grant's digest covers it. */
+      audience: "member" | "admin";
+      /** Epoch ms: step 1's decision deadline, for the countdown when the
+       *  number came from the page and no number screen was shown. */
+      decisionDeadline: number;
+      /** The task families approving also lets that browser sign as the
+       *  member, for the session (auth/oob/grant/0.2). Absent: none. */
+      signingScope?: string[];
+      /** How this browser approves at the member's agent. Absent: not set up
+       *  yet — the first approval sets it up. */
+      uvMethod?: SignInUvMethod;
+    }
+  /** What the passkey ceremony for the grant is bound to: base64url of the
+   *  UTF-8 bytes of the grant digest string D (contract C9). */
+  | {
+      kind: "uv-challenge";
+      challenge: string;
+      /** The VTA the flow signs at: the wallet record a first approval
+       *  encrypts at rest, when the wallet has no passkey yet. */
+      vtaDid: string;
+    }
+  /** The phones this browser may approve on (`uv-approvers`). `error`: the
+   *  agent could not be asked; the list is then empty. */
+  | { kind: "uv-approvers"; approvers: SignInUvApproverView[]; error?: string }
+  /** The PIN was not accepted: `attemptsRemaining` wrong PINs are left before
+   *  it locks, or it is locked until `lockedUntil` (epoch ms). The flow is
+   *  still open; the person may try again or decline. */
+  | { kind: "uv-pin"; attemptsRemaining?: number; lockedUntil?: number }
+  /** The person's phone has been asked and has not answered. `matchCode` is
+   *  what the phone shows beside the request; `expiresAt` (epoch ms) is when
+   *  the ask lapses. Poll by sending the same `respond` again. */
+  | { kind: "uv-pending"; matchCode?: string; expiresAt?: number }
+  | { kind: "done"; decision: "approve" | "decline"; status: string }
+  /** The community — or the member's own VTA — refused with a stable code
+   *  (R3.7). `stage`, `party` and `cause` say where, for the window's
+   *  "Details" line and the background's console; they never change what the
+   *  flow does, and none carries link content, a key or a message body. */
+  | {
+      kind: "failed";
+      code: string;
+      message: string;
+      /** Which exchange failed. */
+      stage?: SignInFailureStage;
+      /** Who refused: the community, the member's own VTA, or this wallet
+       *  (a reply or signed document that did not check out). */
+      party?: SignInFailureParty;
+      /** The underlying stable code, or error name, when `code` is the
+       *  generic one and something more specific is known. */
+      cause?: string;
+      /** A DID hosting service refused the proof (`auth/oob:notAuthorized`):
+       *  the member's DID is not on its access list yet. The window shows the
+       *  DID to send to the service's operator. */
+      unlisted?: { host: string; did: string };
+      /** What the wallet checked, for `domain-not-linked`. */
+      detail?: SignInRefusalDetail;
+    };
+
+/** Why a sign-in was refused, when the cause is the contact's DID document or
+ *  the page the code was on rather than a link field (VTI-LNK-021 forbids
+ *  naming a failing link field). Shown in the window's "Details" so an
+ *  operator can fix it; never logged and never in the message (VTI-LNK-073).
+ *  - `did-document-unverified`: `did` could not be resolved or verified.
+ *  - `unsupported-vid`: no resolver for `method`.
+ *  - `no-portal-service` / `no-common-transport`: `service` is missing from
+ *    `did`'s document, or listed with no usable endpoint (`unusable`).
+ *  - `wrong-origin`: `pageOrigin` is not `portalOrigin`.
+ *  - `from-not-allowed`: `method` is not accepted for sign-in.
+ *  - `domain-not-linked`: `portalOrigin` is not linked to `did`. */
+export interface SignInRefusalDetail {
+  reason:
+    | "did-document-unverified"
+    | "unsupported-vid"
+    | "no-portal-service"
+    | "no-common-transport"
+    | "wrong-origin"
+    | "from-not-allowed"
+    | "domain-not-linked";
+  did?: string;
+  method?: string;
+  service?: string;
+  unusable?: true;
+  pageOrigin?: string;
+  portalOrigin?: string;
+}
+
+/** Where in the flow a sign-in failed. `domain-linkage` is the wallet
+ *  checking a domain-linked community's website (its DID Configuration);
+ *  `identify` and `grant` are the member's VTA signing; `claim`, `prove` and
+ *  `respond` are the exchanges with the community. */
+export type SignInFailureStage = "domain-linkage" | "join" | "join-manifest" | "join-sign" | "join-submit" | "claim" | "identify" | "prove" | "grant-digest" | "enrol-uv" | "grant" | "respond";
+export type SignInFailureParty = "community" | "vta" | "wallet";
+
+export type RuntimeSignInStepResponse =
+  | { ok: true; result: SignInStepResult }
+  | { ok: false; error: string };
+
+// ── How this browser approves sign-ins (settings) ───────────────────────────
+//
+// The options page's "Sign-in approval" section: per agent, which kind of UV
+// key it holds for this browser, and changing it (a new PIN, a switch to the
+// phone or to a PIN). Options page → background → offscreen, which holds the
+// sessions and derives the PIN's key.
+//
+// NOT page-facing: absent from `PAGE_FACING_RUNTIME_TYPES` and `content.ts`,
+// gated on `sender.url` in the background (`isExtensionPageSender`) and again
+// in the offscreen document. A PIN crosses it.
+
+export const RUNTIME_UV_SETTINGS = "vta-wallet/uv-settings" as const;
+export const OFFSCREEN_UV_SETTINGS = "offscreen/uv-settings" as const;
+
+export type UvSettingsOp =
+  /** Every agent this wallet is onboarded to, and its method. */
+  | { op: "status" }
+  /** The phones that may approve for this browser at `vtaDid`. */
+  | { op: "approvers"; vtaDid: string }
+  /** Set a new PIN. Replacing a PIN needs the current one. */
+  | { op: "use-pin"; vtaDid: string; newPin: string; currentPin?: string }
+  /** Approve on `approver` from now on. Replacing a PIN needs it. */
+  | { op: "use-phone"; vtaDid: string; approver: string; currentPin?: string };
+
+export interface UvSettingsAgent {
+  vtaDid: string;
+  /** Absent: not set up; the first sign-in approval does. */
+  method?: SignInUvMethod;
+  /** `remoteApprover`: the phone. */
+  approver?: string;
+}
+
+export type UvSettingsResult =
+  | { op: "status"; agents: UvSettingsAgent[] }
+  | { op: "approvers"; approvers: SignInUvApproverView[] }
+  | { op: "use-pin" | "use-phone"; agent: UvSettingsAgent };
+
+export type RuntimeUvSettingsRequest = { type: typeof RUNTIME_UV_SETTINGS } & UvSettingsOp;
+
+/** `code`: the agent's refusal (`uvPinWrong` with `attemptsRemaining`,
+ *  `uvKeyLocked` with `lockedUntil` in epoch ms). */
+export type RuntimeUvSettingsResponse =
+  | { ok: true; result: UvSettingsResult }
+  | { ok: false; error: string; code?: string; attemptsRemaining?: number; lockedUntil?: number };
+
+export type OffscreenUvSettingsRequest = {
+  target: typeof OFFSCREEN_TARGET;
+  type: typeof OFFSCREEN_UV_SETTINGS;
+  /** The agents this wallet is onboarded to, from the background's record. */
+  agents: Array<{ vtaDid: string; restBaseUrl?: string }>;
+} & UvSettingsOp;
+
+// ── Room files ───────────────────────────────────────────────────────────────
+//
+// The console puts a file in a room, or gets one out. The offscreen document
+// does all of it — asks the VTA for the presentations and the file's key, seals
+// or opens with `@openvtc/vti-rooms-wasm`, and talks to the room's host
+// directly, signed by the wallet's DID — and the console sends intents and
+// bytes and receives progress and plaintext. **The file key never crosses this
+// boundary:** CI fails the build if `rooms/keys/file-key` appears in any bundle
+// but the offscreen document's.
+//
+// Operator surface, like `RUNTIME_MANAGER_TASK`: NOT page-facing, absent from
+// `content.ts`, gated on `sender.url` in the background and again in the
+// offscreen document.
+
+/**
+ * console → background, before a transfer: where is this host, may the wallet
+ * reach it, and which agent acts. Also makes sure the offscreen document is up
+ * for the port that follows.
+ *
+ * Asked twice: once when the pane learns the host, so a click can request the
+ * host permission as its *first* act (`requestOriginPermission` must be reached
+ * with the gesture still live), and again just before connecting, because the
+ * offscreen document may have gone in between.
+ */
+export const RUNTIME_ROOM_FILES_PREPARE = "vta-wallet/room-files-prepare" as const;
+export const OFFSCREEN_ROOM_HOST_ENDPOINT = "offscreen/room-host-endpoint" as const;
+
+export interface RuntimeRoomFilesPrepareRequest {
+  type: typeof RUNTIME_ROOM_FILES_PREPARE;
+  hostDid: string;
+}
+
+export interface RoomFilesPrepared {
+  /** The host's dispatcher URL, from its DID document. */
+  endpoint: string;
+  /** Whether the wallet already holds a host permission for the endpoint's origin. */
+  granted: boolean;
+  /** The agent whose presentations and keys the transfer uses. */
+  vtaDid: string;
+  restBaseUrl?: string;
+}
+
+export type RuntimeRoomFilesPrepareResponse = { ok: true; result: RoomFilesPrepared } | { ok: false; error: string; code?: string };
+
+export interface OffscreenRoomHostEndpointRequest {
+  target: typeof OFFSCREEN_TARGET;
+  type: typeof OFFSCREEN_ROOM_HOST_ENDPOINT;
+  hostDid: string;
+}
+
+/** `code` is `noTrustTaskService` when the host's DID document advertises no
+ *  Trust-Task HTTPS endpoint — matched by code, never by message (R3.7). */
+export type OffscreenRoomHostEndpointResponse = { ok: true; endpoint: string } | { ok: false; error: string; code?: string };
+
+/** background → offscreen: the room work behind a page's `rooms.*` call. Sent
+ *  only after the background has checked the page's portal and grant. */
+export const OFFSCREEN_ROOMS_PAGE = "offscreen/rooms-page" as const;
+
+export type OffscreenRoomsPageOp =
+  /** The host's portal origin and Trust-Task endpoint, from its verified DID document. */
+  | { op: "portal"; hostDid: string }
+  /** The rooms the member's VTA holds keys for, one entry per (room, member). */
+  | { op: "held" }
+  /** The identities the member uses at `hostDid`: the principals of their
+   *  `didSelfIssued` vault entries naming it — never `hostDid` itself. */
+  | { op: "members"; hostDid: string }
+  /** The names of `hostDid`'s own rooms, from its record of each of `members`
+   *  (`vtc/rooms/memberships/list`, signed as that member): `{ [roomId]: { label, visibility? } }`.
+   *  A member whose record could not be read contributes nothing. */
+  | { op: "roomNames"; hostDid: string; members: string[] }
+  /** Each room's own profile, read from `hostDid` as its member by the member's
+   *  VTA (`rooms/keys/profile/read`): `{ [roomId]: RoomProfileSummary }`. A room
+   *  whose profile could not be read contributes nothing. */
+  | { op: "roomProfiles"; hostDid: string; rooms: { roomId: string; member: string }[] }
+  // `member`: the persona the request acts as — the share's, never the page's.
+  | { op: "info"; hostDid: string; roomId: string; member: string }
+  | { op: "browse"; hostDid: string; roomId: string; member: string; prefix?: string; sinceVersion?: number }
+  | { op: "read"; hostDid: string; roomId: string; member: string; key: string }
+  | {
+      op: "putNote";
+      hostDid: string;
+      roomId: string;
+      member: string;
+      title: string;
+      body?: string;
+      description?: string;
+      tags?: string[];
+    };
+
+export interface OffscreenRoomsPageRequest {
+  target: typeof OFFSCREEN_TARGET;
+  type: typeof OFFSCREEN_ROOMS_PAGE;
+  vtaDid: string;
+  restBaseUrl?: string;
+  params: OffscreenRoomsPageOp;
+}
+
+export type OffscreenRoomsPageResponse = { ok: true; result: unknown } | { ok: false; error: string };
+
+/** background → offscreen: the directory work behind a page's call, after the
+ *  background checked the page is the community's portal. */
+export const OFFSCREEN_DIRECTORY_PAGE = "offscreen/directory-page" as const;
+
+export type OffscreenDirectoryPageOp =
+  /** The community's portal origin and Trust-Task endpoint, from its verified DID document. */
+  | { op: "portal"; hostDid: string }
+  /** The identities the member signs in with at this community. */
+  | { op: "members"; hostDid: string }
+  /** Read the member's card and schema as them, and build the card to sign. */
+  | { op: "prepare"; hostDid: string; member: string }
+  /** Have the agent sign `card` as the member and publish it. `card` is the
+   *  one `prepare` built, which the person approved. */
+  | { op: "publish"; hostDid: string; member: string; card: Record<string, unknown>; revision: number };
+
+export interface OffscreenDirectoryPageRequest {
+  target: typeof OFFSCREEN_TARGET;
+  type: typeof OFFSCREEN_DIRECTORY_PAGE;
+  vtaDid: string;
+  restBaseUrl?: string;
+  params: OffscreenDirectoryPageOp;
+}
+
+export type OffscreenDirectoryPageResponse = { ok: true; result: unknown } | { ok: false; error: string };
+
+/**
+ * Port name for one room write from the console — a file transfer, a note, or a
+ * curation — console → offscreen. The port's lifetime is the operation's:
+ * closing it stops it, and an upload stopped part way releases what the host
+ * reserved for it. Records go to the host from the offscreen document, never
+ * from the console, whose bridge reaches only the wallet's own agent.
+ */
+export const ROOM_FILES_PORT = "vta-wallet/room-files" as const;
+
+interface RoomFilesTarget {
+  vtaDid: string;
+  restBaseUrl?: string;
+  roomId: string;
+  hostDid: string;
+  /** The member (persona DID) to act as. Required where the VTA holds more
+   *  than one member of the room: it refuses rather than choose. */
+  member?: string;
+}
+
+/** console → offscreen, once, as the port's first message. */
+export type RoomFilesOpen =
+  | (RoomFilesTarget & {
+      kind: "put";
+      name: string;
+      mediaType?: string;
+      /** The number of bytes the `data` messages will carry, in all. */
+      size: number;
+      title?: string;
+      description?: string;
+      tags?: string[];
+      padme?: boolean;
+    })
+  | (RoomFilesTarget & { kind: "get"; key: string })
+  /**
+   * Write a note, or replace one. With no `key` it is a new record under a
+   * fresh opaque key; with one, `replaces` is the version the member read, and
+   * the host refuses the write if anything has replaced it since.
+   */
+  | (RoomFilesTarget & { kind: "note"; key?: string; replaces?: number; title: string; body?: string })
+  /** Change a record's standing: retract, demote, restore, pin. */
+  | (RoomFilesTarget & {
+      kind: "curate";
+      key: string;
+      status?: "active" | "deprecated" | "retracted";
+      pinned?: boolean;
+      reason?: string;
+      expectedVersion?: number;
+    });
+
+/** console → offscreen, after a `put` open: the file, in order, then `end`. */
+export type RoomFilesUpload = { kind: "data"; data: string /* base64url */ } | { kind: "end" };
+
+/** offscreen → console. */
+export type RoomFilesMessage =
+  | { kind: "progress"; stage: string; done?: number; total?: number }
+  /** Plaintext that has opened but is not yet the file its author signed. Held,
+   *  never released, until `got`; discarded on `failed`. */
+  | { kind: "provisional"; data: string /* base64url */ }
+  /** `author`: the member the record was written as — the persona, never the wallet. */
+  | { kind: "put"; key: string; version: number; blobRef: string; size: number; author: string }
+  | {
+      kind: "got";
+      /** The author's manifest. Untrusted text from another member. */
+      file: { name: string; mediaType?: string; size: number };
+      author: string;
+      version: number;
+      title?: string;
+      description?: string;
+      tags?: string[];
+    }
+  /** A note written or replaced, as the member. */
+  | { kind: "noted"; key: string; version: number; author: string }
+  /** A record's new standing, as the host recorded it. */
+  | { kind: "curated"; key: string; version: number; status: "active" | "deprecated" | "retracted"; pinned?: boolean }
+  | { kind: "failed"; error: string; code?: string };
+
+// ── A community's offers of its rooms ───────────────────────────────────────
+//
+// `vtc/rooms/offers/{list,accept}/0.1`, as the member, from the wallet: the
+// console's Data rooms page lists the offers of every community the member
+// signs in to, and accepts one after the member confirms it in the wallet's own
+// window. The work runs in the offscreen document (`room-offers-offscreen.ts`);
+// the background decides who may ask and raises the confirm window
+// (`room-offers-background.ts`). See `room-offers-policy.ts`.
+
+/** console → background: list offers, or accept one. Extension pages only. */
+export const RUNTIME_ROOM_OFFERS = "vta-wallet/room-offers" as const;
+
+export type RoomOffersConsoleOp =
+  /** Every community the member signs in to, and its offers to each identity used there. `force` reads afresh. */
+  | { op: "overview"; force?: boolean }
+  /** Accept one offer, after the member confirms it in the wallet's window. */
+  | { op: "accept"; communityDid: string; member: string; roomId: string };
+
+export interface RuntimeRoomOffersRequest {
+  type: typeof RUNTIME_ROOM_OFFERS;
+  params: RoomOffersConsoleOp;
+}
+
+export type RuntimeRoomOffersResponse = { ok: true; result: unknown } | { ok: false; error: string; code?: string };
+
+/** One community in the console's overview. */
+export interface OffersCommunityView {
+  communityDid: string;
+  /** The community's Trust-Task origin, from its DID document. */
+  endpointOrigin?: string;
+  /** False until the member lets the wallet reach `endpointOrigin` (asked in a click). */
+  reachable: boolean;
+  /** Why the community's endpoint could not be found. */
+  error?: string;
+  members: { member: string; offers: import("./room-offers-policy.js").OfferView[]; error?: string; code?: string }[];
+}
+
+export interface OffersOverview {
+  vtaDid: string;
+  communities: OffersCommunityView[];
+  /**
+   * Parties the member signs in to that make no room offers — no
+   * `TrustTaskHTTPS` service, or `vtc/rooms/memberships/list` not served (code
+   * `noRoomOffers`). Left out of `communities`: nothing there to act on.
+   */
+  noOffers: string[];
+  /** Offers that wait for the member: what the badge shows. */
+  openCount: number;
+  readAt: string;
+}
+
+/** What an accept reports back. */
+export interface OfferAcceptedView {
+  communityDid: string;
+  member: string;
+  roomId: string;
+  visibility: string;
+  joined: boolean;
+  epoch?: number;
+  resumed: boolean;
+}
+
+/** background → offscreen: the offer work. */
+export const OFFSCREEN_ROOM_OFFERS = "offscreen/room-offers" as const;
+
+export type OffscreenRoomOffersOp =
+  /** Every (community, member) the wallet's sign-in entries name. */
+  | { op: "sources" }
+  /** The community's Trust-Task dispatcher URL, from its DID document. */
+  | { op: "endpoint"; communityDid: string }
+  /** The community's offers to `member`, as views (no credential). */
+  | { op: "list"; communityDid: string; member: string }
+  /** Accept one; the member has confirmed it. */
+  | { op: "accept"; communityDid: string; member: string; roomId: string };
+
+export interface OffscreenRoomOffersRequest {
+  target: typeof OFFSCREEN_TARGET;
+  type: typeof OFFSCREEN_ROOM_OFFERS;
+  vtaDid: string;
+  restBaseUrl?: string;
+  params: OffscreenRoomOffersOp;
+}
+
+export type OffscreenRoomOffersResponse = { ok: true; result: unknown } | { ok: false; error: string; code?: string };

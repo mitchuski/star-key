@@ -6,3 +6,10 @@
 // a VTC rather than by an agent, and is not wrapped here.
 
 export * from "./membership.js";
+export * from "./oob-sign-in.js";
+export * from "./domain-linkage.js";
+export * from "./join.js";
+export * from "./directory-disclosure.js";
+export * from "./directory-card.js";
+export * from "./myterms.js";
+export * from "./agreements.js";

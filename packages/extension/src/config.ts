@@ -134,6 +134,16 @@ export interface WalletSettings {
    * particular mediator's TSP delivery misbehaves).
    */
   preferTsp?: boolean;
+  /**
+   * MyTerms (IEEE 7012): the agreements this person is willing to present at
+   * a community's door, by roster code (`SD-BASE-DP`, `SD-BASE`, …;
+   * `@openvtc/pnm-core/vtc`'s `MYTERMS_ROSTER`), most preferred first. The
+   * first one a community accepts is proffered. Absent or empty: no standing
+   * offers, and the join screen shows the community's own most protective
+   * agreement as its counter-offer. Chosen in the console (Agreements) or
+   * Options; the same chooser in both.
+   */
+  myTermsOffers?: string[];
 }
 
 /**
@@ -244,6 +254,9 @@ export async function getSettings(): Promise<WalletSettings> {
       : {}),
     encryptHolderSecret,
     preferTsp: typeof s?.preferTsp === "boolean" ? s.preferTsp : true,
+    ...(Array.isArray(s?.myTermsOffers) && s.myTermsOffers.some((c) => typeof c === "string" && c !== "")
+      ? { myTermsOffers: s.myTermsOffers.filter((c): c is string => typeof c === "string" && c !== "") }
+      : {}),
     ...(s?.pushGatewayUrl ? { pushGatewayUrl: s.pushGatewayUrl } : {}),
     ...(s?.pushGatewayVapidPublicKey
       ? { pushGatewayVapidPublicKey: s.pushGatewayVapidPublicKey }

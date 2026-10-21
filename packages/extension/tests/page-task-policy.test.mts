@@ -72,6 +72,12 @@ test("a page cannot mint a room's own credentials", () => {
 // seen from their side — the fact a `private` room exists to withhold.
 test("a page cannot enumerate the holder's rooms", () => {
   assert.notEqual(pageTaskRefusal(`${R}keys/list/0.1`), null);
+  assert.notEqual(pageTaskRefusal(`${R}keys/list/0.2`), null);
+});
+
+// A member's own name for a room is theirs: a page may neither read nor write it.
+test("a page cannot read or write the member's own labels", () => {
+  assert.notEqual(pageTaskRefusal(`${R}keys/label/0.1`), null);
 });
 
 // Host-served verbs are refused here too. A page reaching them through the
@@ -197,5 +203,15 @@ test("a page cannot have the wallet sign a family it may not request", () => {
 test("a page cannot have the wallet sign something that is not a document", () => {
   for (const env of [undefined, null, "doc", [], { recipient: RP }]) {
     assert.notEqual(pageSignRefusal(env, AGENT), null, JSON.stringify(env));
+  }
+});
+
+test("a page cannot drive the directory or have a document signed as the holder", () => {
+  for (const t of [
+    "https://trusttasks.org/spec/vtc/directory/card/publish/0.1",
+    "https://trusttasks.org/spec/vtc/directory/card/show/0.1",
+    "https://trusttasks.org/spec/keys/sign-document/0.1",
+  ]) {
+    assert.match(pageTaskRefusal(t) ?? "", /cannot be requested by a page/, t);
   }
 });

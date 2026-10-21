@@ -45,7 +45,7 @@ async function vtaFixture({ replier } = {}) {
   const vtaSigning = generateSigningIdentity();
   const vta = Identity.generate(vtaSigning.did);
   const signedReply = { type: `${VAULT_DELETE}#response`, payload: { deleted: true } };
-  await signTrustTask({ envelope: signedReply, signing: vtaSigning });
+  await signTrustTask({ envelope: signedReply, signing: vtaSigning, proofPurpose: "authentication" });
   const inner = new InMemoryDidcommBridge({
     vta,
     holderPublicJwk: holder.publicJwk(),
@@ -121,4 +121,31 @@ test("a mediator request names the mediator as the only peer that may answer", a
   });
   await client.queryKeylist().catch(() => {});
   assert.deepEqual(seen.map((o) => o.from), [mediator.did]);
+});
+
+test("MediatorSessionBridge observes its waiter when the send throws", async () => {
+  // A connection already closed throws on send. The waiter registered before
+  // it still rejects later (timeout or socket close); left unobserved, that is
+  // an uncaught rejection on top of the real error.
+  let rejectWaiter;
+  const connection = {
+    waitFor: () => new Promise((_, reject) => { rejectWaiter = reject; }),
+    send: () => { throw new Error("mediator-transport: not connected"); },
+    close: () => {},
+  };
+  const unhandled = [];
+  const onUnhandled = (reason) => unhandled.push(reason);
+  process.on("unhandledRejection", onUnhandled);
+  try {
+    const bridge = new MediatorSessionBridge(connection, 1234);
+    await assert.rejects(
+      bridge.sendAndAwaitReply("jwe", "urn:uuid:t", { from: ["did:example:vta"] }),
+      /not connected/,
+    );
+    rejectWaiter(new Error("mediator-transport: WebSocket closed"));
+    await new Promise((r) => setImmediate(r));
+    assert.deepEqual(unhandled, []);
+  } finally {
+    process.off("unhandledRejection", onUnhandled);
+  }
 });

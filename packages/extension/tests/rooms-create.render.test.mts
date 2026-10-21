@@ -17,6 +17,12 @@ import assert from "node:assert/strict";
 import { agent, h, render, PARTIES } from "./harness/dom.mjs";
 import { CreateRoom } from "../src/manager/panes/rooms-create.js";
 
+
+/** Pick a context in the tree picker, reopening it if one is already chosen. */
+const chooseContext = async (screen: { all: (s: string) => Element[]; click: (el: Element) => Promise<void>; button: (t: string) => Element }, id: string) => {
+  if (screen.all(`[data-context-id="${id}"]`).length === 0) await screen.click(screen.button("Change"));
+  await screen.click(screen.all(`[data-context-id="${id}"]`)[0]!);
+};
 const SERVERS = "vta/webvh/servers/list/1.0";
 const SERVICES = "vta/services/list/1.0";
 const DIDS_LIST = "vta/webvh/dids/list/1.0";
@@ -81,6 +87,9 @@ const keyRecord = (keyId: string, keyType = "ed25519") => ({
   keyId, keyType, status: "active", publicKey: "z6Mk", createdAt: AT,
 });
 
+/** What the background says when asked for a host's HTTPS endpoint; `undefined` leaves it to the agent fake. */
+let hostEndpoint: unknown = undefined;
+
 const mount = async (answers: Record<string, unknown>, contexts: unknown[] = CONTEXTS) => {
   const a = agent({
     [SERVERS]: { servers: [{ id: "webvh-1", did: "did:webvh:QmS:webvh.example", label: "Primary", createdAt: "x", updatedAt: "x" }] },
@@ -89,9 +98,14 @@ const mount = async (answers: Record<string, unknown>, contexts: unknown[] = CON
     [KEYS_LIST]: { keys: [], total: 0, offset: 0, limit: 0 },
     ...answers,
   });
+  const answer = hostEndpoint as ((hostDid: string) => unknown) | undefined;
+  const sendMessage = (m: { type?: string; hostDid?: string }) => {
+    const said = m?.type === "vta-wallet/room-files-prepare" && answer ? answer(m.hostDid ?? "") : undefined;
+    return said !== undefined ? Promise.resolve(said) : a.sendMessage(m as never);
+  };
   const screen = await render(
     h(CreateRoom, { parties: PARTIES, contexts, onCreated: () => {} } as never),
-    { chrome: { runtime: { sendMessage: a.sendMessage } } },
+    { chrome: { runtime: { sendMessage } } },
   );
   return { a, screen };
 };
@@ -124,14 +138,14 @@ const mintOf = (a: { calls: { type: string; payload: any }[] }, template: string
 /** The context whose DID is the host, and a server for the room — every field
  *  the form needs. The mediator is not typed: the agent's own is chosen. */
 const fillAll = async (screen: Screen) => {
-  await screen.select(field(screen, "Context"), "openvtc");
+  await chooseContext(screen, "openvtc");
   await screen.settle();
   await screen.select(field(screen, "Room hosting server"), "webvh-1");
 };
 
 /** In a context with no DID, mint a host's DID. Stops before confirming. */
 const mintAHost = async (screen: Screen, before?: () => Promise<void>, url = "https://host.example") => {
-  await screen.select(field(screen, "Context"), "empty");
+  await chooseContext(screen, "empty");
   await screen.settle();
   await screen.select(field(screen, "Host hosting server"), "webvh-1");
   await screen.type(field(screen, "Host URL"), url);
@@ -153,7 +167,7 @@ test("the form asks for the context, then the host, then the room", async () => 
 
 test("the room's steps stay closed until the host is ready", async () => {
   const { screen } = await mount({});
-  await screen.select(field(screen, "Context"), "empty");
+  await chooseContext(screen, "empty");
   await screen.settle();
   assert.match(screen.text(), /Finish step 2 first/);
   assert.equal(hasField(screen, "Room hosting server"), false);
@@ -238,7 +252,7 @@ test("retrying after a failed registration registers rather than minting again",
 
 test("the context's own DID is offered as the host, with a check to make", async () => {
   const { screen } = await mount({});
-  await screen.select(field(screen, "Context"), "openvtc");
+  await chooseContext(screen, "openvtc");
   await screen.settle();
   assert.equal(radio(screen, "host-context").checked, true);
   assert.match(screen.text(), new RegExp(HOST_DID));
@@ -261,7 +275,7 @@ test("another DID in the context can be made the host, with one write", async ()
     },
     contexts,
   );
-  await screen.select(field(screen, "Context"), "openvtc");
+  await chooseContext(screen, "openvtc");
   await screen.settle();
   await screen.click(radio(screen, "host-pick"));
   await screen.select(field(screen, "Host DID in context"), OLD_HOST);
@@ -291,7 +305,7 @@ test("a host run outside this agent can be pasted", async () => {
 
 test("a context with no DID starts on minting the host's", async () => {
   const { screen } = await mount({});
-  await screen.select(field(screen, "Context"), "empty");
+  await chooseContext(screen, "empty");
   await screen.settle();
   assert.equal(radio(screen, "host-mint").checked, true);
   assert.equal(screen.all('input[type="radio"][value="host-context"]').length, 0);
@@ -313,7 +327,7 @@ test("the host's DID is minted as the context's own, from the room-host template
 
 test("minting a host where the context already has a DID says it replaces it", async () => {
   const { screen } = await mount({});
-  await screen.select(field(screen, "Context"), "openvtc");
+  await chooseContext(screen, "openvtc");
   await screen.settle();
   await screen.click(radio(screen, "host-mint"));
   assert.match(screen.text(), /already acts as/);
@@ -385,7 +399,7 @@ test("a mediator chosen for the host is the one the room is seeded with", async 
 // agent calls hosts over REST only. The mediator is for members.
 test("the host step says the URL is for the agent and the mediator is for members", async () => {
   const { screen } = await mount({});
-  await screen.select(field(screen, "Context"), "empty");
+  await chooseContext(screen, "empty");
   await screen.settle();
   const text = screen.text();
   assert.match(text, /your agent calls hosts over REST only/);
@@ -407,7 +421,7 @@ test("an existing room is picked from the context, and its one signing key fille
     [KEYS_LIST]: { keys: ROOM_KEYS, total: 3, offset: 0, limit: 100 },
     [REGISTER]: REGISTERED,
   });
-  await screen.select(field(screen, "Context"), "openvtc");
+  await chooseContext(screen, "openvtc");
   await screen.settle();
   await screen.click(radio(screen, "existing"));
 
@@ -428,7 +442,7 @@ test("with several signing keys, none is chosen for the operator", async () => {
     [DIDS_LIST]: { dids: [didRecord(MINTED.did)] },
     [KEYS_LIST]: { keys: [keyRecord(`${MINTED.did}#key-0`), keyRecord(`${MINTED.did}#key-2`)], total: 2, offset: 0, limit: 100 },
   });
-  await screen.select(field(screen, "Context"), "openvtc");
+  await chooseContext(screen, "openvtc");
   await screen.settle();
   await screen.click(radio(screen, "existing"));
   await screen.select(field(screen, "Existing room DID"), MINTED.did);
@@ -437,7 +451,7 @@ test("with several signing keys, none is chosen for the operator", async () => {
 
 test("a DID not in the list can be entered, and needs both halves", async () => {
   const { screen } = await mount({});
-  await screen.select(field(screen, "Context"), "openvtc");
+  await chooseContext(screen, "openvtc");
   await screen.settle();
   await screen.click(radio(screen, "existing"));
   await screen.select(field(screen, "Existing room DID"), "__other__");
@@ -447,7 +461,7 @@ test("a DID not in the list can be entered, and needs both halves", async () => 
 
 test("a room cannot use the host's DID", async () => {
   const { screen } = await mount({});
-  await screen.select(field(screen, "Context"), "openvtc");
+  await chooseContext(screen, "openvtc");
   await screen.settle();
   await screen.click(radio(screen, "existing"));
   await screen.select(field(screen, "Existing room DID"), "__other__");
@@ -462,7 +476,7 @@ test("a listing that cannot be read falls back to typing, and says why", async (
       throw new Error("forbidden");
     },
   });
-  await screen.select(field(screen, "Context"), "openvtc");
+  await chooseContext(screen, "openvtc");
   await screen.settle();
   await screen.click(radio(screen, "existing"));
   assert.match(screen.text(), /could not be read \(forbidden\)/);
@@ -648,4 +662,50 @@ test("a new host advertises TSP only when asked", async () => {
   const { a, screen } = await mount({ [DIDS_CREATE]: HOST_MINTED });
   await mintAHost(screen);
   assert.equal(mintOf(a, "room-host").payload.addTspService, undefined);
+});
+
+// ── A host that cannot be registered with ───────────────────────────────────
+
+// The agent can tell a host about a room only over HTTPS, so a host whose DID
+// document publishes no Trust-Task HTTPS endpoint cannot be registered with —
+// and the form used to find out only after minting the room's identity, which
+// it then left orphaned. The check closes step 3 before anything is minted.
+test("a host with no HTTPS endpoint closes the room's steps, before anything is minted", async () => {
+  const OUTSIDE = "did:webvh:QmOutside:airport-electric.example";
+  hostEndpoint = (did: string) =>
+    did === OUTSIDE ? { ok: false, error: `${OUTSIDE} advertises no TrustTaskHTTPS service`, code: "noTrustTaskService" } : undefined;
+  try {
+    const { a, screen } = await mount({ [DIDS_CREATE]: MINTED, [REGISTER]: REGISTERED });
+    await fillAll(screen);
+    await screen.click(radio(screen, "host-paste"));
+    await screen.type(field(screen, "Host DID"), OUTSIDE);
+    await screen.settle();
+    assert.match(screen.text(), /This host cannot be registered with yet/);
+    assert.match(screen.text(), /publishes no HTTPS endpoint/);
+    const create = screen.button("Create room") as HTMLButtonElement;
+    assert.equal(create.disabled, true);
+    await screen.click(create);
+    assert.equal(a.of("webvh/dids/create").length, 0, "no identity minted for a room that could not be registered");
+  } finally {
+    hostEndpoint = undefined;
+  }
+});
+
+// A resolution that failed for any other reason is not a verdict about the
+// host: it does not close the step.
+test("a host that could not be resolved just now does not close the step", async () => {
+  const OUTSIDE = "did:webvh:QmOutside:rooms.elsewhere.example";
+  hostEndpoint = (did: string) => (did === OUTSIDE ? { ok: false, error: "network down" } : undefined);
+  try {
+    const { a, screen } = await mount({ [DIDS_CREATE]: MINTED, [REGISTER]: REGISTERED });
+    await fillAll(screen);
+    await screen.click(radio(screen, "host-paste"));
+    await screen.type(field(screen, "Host DID"), OUTSIDE);
+    await screen.settle();
+    assert.doesNotMatch(screen.text(), /cannot be registered with yet/);
+    await screen.click(screen.button("Create room"));
+    assert.equal(a.of("owner/register")[0]!.payload.host, OUTSIDE);
+  } finally {
+    hostEndpoint = undefined;
+  }
 });

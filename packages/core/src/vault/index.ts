@@ -11,3 +11,5 @@ export * from "./sign-trust-task.js";
 export * from "./credentials.js";
 export * from "./task-signer.js";
 export type { VtaAuthInputs } from "../vta/auth.js";
+export * from "./sign-oob.js";
+export * from "./uv-pin.js";

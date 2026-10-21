@@ -157,8 +157,19 @@ export async function hasOriginPermission(input: string): Promise<boolean> {
  * caller persists enough state to resume when it reopens.
  */
 export function requestOriginPermission(input: string): Promise<boolean> {
-  const pattern = originPatternFor(input);
-  if (!pattern) return Promise.resolve(false);
+  return requestOriginPermissions([input]);
+}
+
+/**
+ * Prompt for several origins in one dialog — the join window asks for a
+ * community's portal and its Trust-Task endpoint together, because two
+ * dialogs for one act is a person clicking Allow twice for one decision.
+ * Same rules as `requestOriginPermission`: UI contexts, inside a gesture, as
+ * the first await. Resolves true only when every origin is held afterwards.
+ */
+export function requestOriginPermissions(inputs: readonly string[]): Promise<boolean> {
+  const patterns = [...new Set(inputs.map(originPatternFor))].filter((p): p is string => p !== null);
+  if (patterns.length === 0 || patterns.length !== new Set(inputs.map(originPatternFor)).size) return Promise.resolve(false);
 
   return new Promise<boolean>((resolve) => {
     let settled = false;
@@ -179,7 +190,7 @@ export function requestOriginPermission(input: string): Promise<boolean> {
     // string-equal to what we asked for.
     const onAdded = (): void => {
       void chrome.permissions
-        .contains({ origins: [pattern] })
+        .contains({ origins: patterns })
         .then((held) => {
           if (held) finish(true);
         })
@@ -205,14 +216,14 @@ export function requestOriginPermission(input: string): Promise<boolean> {
     // against the actual permission state before we conclude.
     const settleWithVerification = (): void => {
       void chrome.permissions
-        .contains({ origins: [pattern] })
+        .contains({ origins: patterns })
         .then((held) => finish(held))
         .catch(() => finish(false));
     };
 
     // No `await` above this line, by design. See (1).
     try {
-      chrome.permissions.request({ origins: [pattern] }).then(
+      chrome.permissions.request({ origins: patterns }).then(
         (granted) => (granted ? finish(true) : settleWithVerification()),
         settleWithVerification,
       );

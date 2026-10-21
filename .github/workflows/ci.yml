@@ -40,7 +40,7 @@ jobs:
           # read it — `npm ci`'s install scripts included.
           persist-credentials: false
 
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: ${{ matrix.node }}
           cache: npm
@@ -75,6 +75,21 @@ jobs:
             exit 1
           fi
           echo "OK: $bundle is a single bundle with no dynamic import()"
+
+      # `content.js` is injected as a *classic* script, which cannot import at
+      # all. It is built on its own (vite.config.content.ts, IIFE,
+      # `codeSplitting: false`) so it can use the trigger-link parser from core;
+      # a lost option would leave an `import` behind and a dead content script
+      # — no provider, no trigger-link clicks — behind a green build.
+      - name: Assert the content script is one classic script
+        run: |
+          bundle=packages/extension/dist/content.js
+          test -f "$bundle" || { echo "::error::$bundle was not emitted"; exit 1; }
+          if grep -qE '(^|[;}])\s*import[\s{*"]|\bimport\s*\(|^export\b' "$bundle"; then
+            echo "::error::$bundle contains an import or export; a classic content script cannot load it"
+            exit 1
+          fi
+          echo "OK: $bundle is self-contained"
 
       # `@openvtc/pnm-core/admin` is operator surface — granting authority at an
       # agent, revoking it, destroying contexts. The task URIs are the tell:
@@ -253,6 +268,54 @@ jobs:
           done
           echo "OK: the lens and its signer carry the mediator surface"
 
+      # A fifth guard, and the only one whose permitted file is NOT the console.
+      #
+      # `rooms/keys/file-key` returns one room file's key. Like the seeds family
+      # it returns *material*, but unlike it a browser does need it: a member
+      # opening a file has to decrypt it somewhere. So the guard does what the
+      # seeds guard cannot — name the one place that may ask — and that place is
+      # the offscreen document, not the console. A file key never expires (a
+      # leaked one opens that file's ciphertext for as long as it exists), and
+      # the offscreen document is the one context the extension owns that is not
+      # a page: it asks the VTA for the key, seals or opens the file with
+      # `@openvtc/vti-rooms-wasm`, and hands the console verified plaintext. The
+      # console sends intents and bytes and never names the task.
+      #
+      # So: banned everywhere in `dist/` except the offscreen entry chunk —
+      # manager.js included. The way it would leak is someone importing
+      # `@openvtc/pnm-core/rooms/files` from a console pane (it is the
+      # offscreen document's subpath), or Rollup hoisting it into a shared
+      # chunk. See CLAUDE.md, "Key material never reaches a browser".
+      - name: Assert the room-file key is asked for only by the offscreen document
+        run: |
+          offscreen=$(grep -o 'src="/assets/offscreen-[^"]*\.js"' packages/extension/dist/offscreen.html | sed 's|src="/||; s|"$||')
+          test -n "$offscreen" || { echo "::error::offscreen.html loads no assets/offscreen-*.js — this guard names a file that no longer exists"; exit 1; }
+          task='rooms/keys/file-key/0.1'
+          leaked=$(grep -rlF "$task" packages/extension/dist/ | grep -v -x "packages/extension/dist/$offscreen" || true)
+          if [ -n "$leaked" ]; then
+            echo "::error::$leaked contains $task — a room file's key is requested only by the offscreen document, never by the console or any page-reachable surface. Check for an import of @openvtc/pnm-core/rooms/files outside room-files-offscreen.ts, or a shared chunk."
+            exit 1
+          fi
+          # …and present there, for the persona guard's reason: an engine that
+          # was tree-shaken out is a green build and a file pane that does nothing.
+          grep -qF "$task" "packages/extension/dist/$offscreen" || { echo "::error::$offscreen no longer contains $task — the offscreen document cannot seal or open a room file"; exit 1; }
+          echo "OK: $task appears only in $offscreen"
+
+      # A page uses rooms only through `window.vtaWallet.rooms`, whose verbs are
+      # fixed and whose flows run in the extension (VTI data-rooms-files.md
+      # §8.5). The two page-world bundles and the worker never name a rooms/*
+      # task: a URI there would mean a page could pick a verb, or the worker
+      # had started building room requests itself.
+      - name: Assert no page-reachable bundle names a rooms task
+        run: |
+          # A task URI, not the bare family prefix `page-task-policy.ts` refuses by.
+          leaked=$(grep -lE 'trusttasks\.org/spec/rooms/[a-z]' packages/extension/dist/provider.js packages/extension/dist/content.js packages/extension/dist/background.js || true)
+          if [ -n "$leaked" ]; then
+            echo "::error::$leaked names a rooms/* task. Pages reach rooms only through the wallet's own room methods; see CLAUDE.md, \"A portal page uses rooms through the wallet's own methods\"."
+            exit 1
+          fi
+          echo "OK: provider.js, content.js and background.js name no rooms/* task"
+
       # The console's isolation rests on it being one self-contained file: the
       # guard above names exactly one exception, so a second chunk would be a
       # file nothing checks. Losing `codeSplitting: false` in a future upgrade
@@ -327,7 +390,7 @@ jobs:
       # and the zip is identical across the Node matrix.
       - name: Upload Web Store zip
         if: matrix.node == '26'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: vta-wallet-extension
           path: packages/extension/release/*.zip

@@ -10,6 +10,16 @@ The web reader lets you inspect a version-1 City Key, choose whether claimed ver
 
 The MV3 extension retains upstream VTA setup, consent and protocol controls. A complete verified VTA/RP encounter is still an integration gate. The provider pilot defaults to disabled and never falls back to simulated success.
 
+## Join a community
+
+Open the Star popup and press the 🤝 in its header. A small window takes the community's DID: paste it, **Read the code on the page** (the page you were on, for example [first.openvtc.net](https://first.openvtc.net/)), **Use the camera**, or drop an image of the code. For a page, the wallet reads the community's DID off the QR code on the page (`/v1/community/did-qr.svg` carries the bare DID), resolves and verifies its DID document, and opens the join window on the verified community.
+
+Nothing is sent to the community until you continue in that window. Then the wallet asks for its join manifest as a throwaway key, shows what it asks and what its directory would show about you, and sends the request signed by your agent as the persona you choose, which becomes your member DID there. Switch the popup to the agent you want to join with first, for instance your Mages City VTA. A community that admits on the spot ends with **Open the member page**; one that reviews requests shows the request as pending, and you sign in from its page once admitted.
+
+## Agreements (MyTerms first)
+
+A community that takes terms names a `MyTerms` service in its DID document, pointing at its configuration (what it accepts, in roster codes). Pick your standing agreement in Settings, from the Customer Commons roster the wallet mirrors (`SD-BASE` and its modifiers; the wallet invents none). On "Ask to join", the screen shows your agreement when the community accepts it, or its counter-offer when not: one round. The agreement rides inside your signed join request as `extensions["org.agentprivacy.myterms"]`; the community's signed answer is the other half, and the wallet keeps both by digest in the console's **Agreements** pane, which lists what stands with each community and carries a switch per community: proffer terms at its door, or not (a default for the "join under terms" box, never a refusal). MyTerms sits above membership: the 🤝 window, opened on any page, shows the agreements you already hold with that site, reads the site's own MyTerms configuration when the wallet may reach it, and says whether your standing agreement is one it accepts; a community's join door is the first place an agreement is made, not the only one. Mages City is the first community that takes terms. This is not a claim of IEEE 7012 conformance; see `docs/MYTERMS_PLAN_2026-10-20.md`.
+
 ## Build
 
 Use Node 24 or newer. Run `npm ci`, `npm test`, `npm run build` and `node --test pilot/test.mjs`. Load `packages/extension/dist` unpacked in Chrome or Edge. Star has a distinct development extension ID: `cdffmakpanghoamdnhbijolhncijajjc`.

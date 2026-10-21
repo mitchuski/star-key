@@ -6,14 +6,17 @@ import {
   approverDid,
   clearHolderIdentity,
   IndexedDBKVStore,
+  listHolderRecords,
   mintApproverIdentity,
-  rewrapHolderSecret,
+  rewrapHolderV4Secret,
 } from "@openvtc/pnm-core";
 import { getSettings, setSettings } from "./config.js";
+import { TermsChooser } from "./terms-chooser.js";
 import { base64url } from "@openvtc/vti-didcomm-js";
 import { readActiveHolderDid, readActiveVtaDid } from "./active-vta.js";
 import { WebAuthnPrfSecretWrap } from "./webauthn-prf-wrap.js";
 import { runPrfUnlockCeremony } from "./webauthn-prf-unlock.js";
+import { encryptHolderSecretInPopup } from "./encrypt-holder.js";
 import {
   RUNTIME_APPROVER_STATE,
   RUNTIME_UNLOCK_APPROVER,
@@ -25,6 +28,7 @@ import { sendToBackground } from "./send-message.js";
 import { VaultPanel } from "./vault-panel.js";
 import { releaseSelectAfterPointerChange } from "./select-wheel.js";
 import { DidQrButton } from "./did-qr-view.js";
+import { SignInApprovalSettings } from "./sign-in-approval-settings.js";
 import "./theme.css";
 
 const inputStyle: React.CSSProperties = {
@@ -58,6 +62,9 @@ export function AdvancedPane() {
   const [encryptOn, setEncryptOn] = useState(false);
   const [encryptBusy, setEncryptBusy] = useState(false);
   const [preferTspOn, setPreferTspOn] = useState(false);
+  // MyTerms: the agreement proffered when joining a community that takes
+  // terms. "" is no standing choice.
+  const [myTermsOffers, setMyTermsOffers] = useState<string[]>([]);
   // The co-located approver identity for the active VTA (Phase 2): its DID once
   // minted, so the operator can register it in the VTA's approver_set + ACL.
   const [approverDidValue, setApproverDidValue] = useState<string | null>(null);
@@ -78,6 +85,7 @@ export function AdvancedPane() {
       setPushGatewayVapidPublicKey(s.pushGatewayVapidPublicKey ?? "");
       setEncryptOn(Boolean(s.encryptHolderSecret));
       setPreferTspOn(Boolean(s.preferTsp));
+      setMyTermsOffers(s.myTermsOffers ?? []);
       // Multi-VTA: show the active VTA's holder DID. Read straight
       // from the persisted connection — no decryption needed for a
       // display string, and options runs in a context with no PRF
@@ -220,13 +228,25 @@ export function AdvancedPane() {
         }
       }
 
-      const wrap = new WebAuthnPrfSecretWrap(chrome.runtime.id);
       const store = new IndexedDBKVStore();
+      // Every wallet on this device is one v4 record per VTA. The v3
+      // single-holder record this toggle used to re-wrap is never written
+      // any more, so reading it failed with "no persisted holder identity
+      // to re-wrap" on every wallet onboarded today.
+      const records = await listHolderRecords(store);
+      if (records.length === 0) {
+        setStatus("Connect to a VTA first: there is no wallet on this device to encrypt yet.");
+        return;
+      }
 
       if (next) {
-        // Flip ON: re-persist the existing plaintext secret behind
-        // the wrap. Triggers a WebAuthn enrollment ceremony.
-        await rewrapHolderSecret(store, { toWrap: wrap });
+        // Flip ON: re-persist each plaintext record behind the wrap, the
+        // same enrol-rewrap-relay the popup's prompt runs. The first one
+        // enrols the authenticator; any further one reuses it.
+        for (const r of records) {
+          if (r.wrapAlgorithm !== "passthrough") continue;
+          await encryptHolderSecretInPopup(r.vtaDid);
+        }
         await setSettings({ encryptHolderSecret: true });
         setEncryptOn(true);
         setStatus(
@@ -238,7 +258,15 @@ export function AdvancedPane() {
         // re-persist plaintext. Clear the enrolled credential after
         // so a future re-enable doesn't trip the "credential already
         // enrolled" guard.
-        await rewrapHolderSecret(store, { fromWrap: wrap });
+        // `unwrap` reads only this page's in-memory key, so unlock here
+        // first; the offscreen document's key is not this page's.
+        const { prfOutput } = await runPrfUnlockCeremony(chrome.runtime.id);
+        await WebAuthnPrfSecretWrap.seedCachedKeyFromPrfOutput(prfOutput);
+        const wrap = new WebAuthnPrfSecretWrap(chrome.runtime.id);
+        for (const r of records) {
+          if (r.wrapAlgorithm === "passthrough") continue;
+          await rewrapHolderV4Secret(store, { vtaDid: r.vtaDid, fromWrap: wrap });
+        }
         await WebAuthnPrfSecretWrap.unenroll();
         await setSettings({ encryptHolderSecret: false });
         setEncryptOn(false);
@@ -553,6 +581,8 @@ export function AdvancedPane() {
         )}
       </div>
 
+      <SignInApprovalSettings />
+
       <div
         style={{
           marginTop: 22,
@@ -583,6 +613,39 @@ export function AdvancedPane() {
           first (TSP &gt; DIDComm &gt; REST). TSP shares the same mediator socket as DIDComm and
           falls back to DIDComm if it can&apos;t connect. <strong>On by default.</strong> Turn off
           to pin a VTA to DIDComm/REST if a particular mediator&apos;s TSP delivery misbehaves.
+        </div>
+      </div>
+
+      <div
+        data-testid="myterms"
+        style={{
+          marginTop: 22,
+          padding: 14,
+          border: "1px solid var(--w-line)",
+          borderRadius: 8,
+          background: "var(--w-surface)",
+        }}
+      >
+        <div style={{ fontSize: 14, color: "var(--w-text)" }}>Your terms (MyTerms, IEEE 7012)</div>
+        <div style={{ margin: "6px 0 10px", fontSize: 12, color: "var(--w-muted)", lineHeight: 1.5 }}>
+          Tick the agreements you are willing to present at a community's door and put them in
+          your order. The first one a community accepts is proffered; with none accepted, its
+          counter-offer is shown instead. The roster is Customer Commons'; this wallet carries a
+          mirror and invents none. The same choice, with each community's switch and your
+          records, is in the console under Agreements.
+        </div>
+        <TermsChooser
+          compact
+          value={myTermsOffers}
+          onChange={(next) => {
+            setMyTermsOffers(next);
+            void setSettings({ myTermsOffers: next });
+          }}
+        />
+        <div style={{ marginTop: 10, fontSize: 12, color: "var(--w-muted)", lineHeight: 1.5 }}>
+          When you join a community whose DID document names a <code>MyTerms</code> service, the
+          join screen shows the agreement it will take. The agreement rides inside your signed
+          request. Nothing is sent to a community on its own.
         </div>
       </div>
 
