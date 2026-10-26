@@ -33,19 +33,23 @@ export function compressReading(reading: StarProjection, includeVertices: boolea
 // are disclosable before export.
 export interface RetainedSummary {
   descriptions: number; lit: number; focus: number; walks: number; packets: number; receipts: number; credentials: number;
+  /** faces of the evidence folded into the key (`chains.count`, agentprivacy lib/chain-face.ts) — a count, never the roots */
+  chains: number;
   identity: boolean; did: boolean; kappa: boolean; prior: boolean; trace: boolean; figures: boolean; geometry: boolean;
   /** names of any further top-level fields, never their values */
   other: string[];
 }
-const RETAINED_KNOWN = new Set(['name', 'version', 'palette', 'lit', 'descriptions', 'focus', 'walks', 'packets', 'identity', 'did', 'kappa', 'prior', 'trace', 'figures', 'geometry', 'receipts', 'credentials']);
+const RETAINED_KNOWN = new Set(['name', 'version', 'palette', 'lit', 'descriptions', 'focus', 'walks', 'packets', 'chains', 'identity', 'did', 'kappa', 'prior', 'trace', 'figures', 'geometry', 'receipts', 'credentials']);
 export function retainedSummary(value: unknown): RetainedSummary {
   const key = (value && typeof value === 'object' && !Array.isArray(value)) ? value as Record<string, unknown> : {};
   const count = (v: unknown) => Array.isArray(v) ? v.length : (v && typeof v === 'object') ? Object.keys(v as object).length : 0;
   const has = (v: unknown) => v !== undefined && v !== null && v !== '';
   const packets = key.packets as Record<string, unknown> | undefined;
+  const chains = key.chains as Record<string, unknown> | undefined;
   return {
     descriptions: count(key.descriptions), lit: count(key.lit), focus: count(key.focus), walks: count(key.walks),
     packets: typeof packets?.count === 'number' ? packets.count : count(packets),
+    chains: typeof chains?.count === 'number' ? chains.count : 0,
     receipts: count(key.receipts), credentials: count(key.credentials),
     identity: has(key.identity), did: has(key.did), kappa: has(key.kappa), prior: has(key.prior), trace: has(key.trace), figures: has(key.figures), geometry: has(key.geometry),
     other: Object.keys(key).filter(k => !RETAINED_KNOWN.has(k)).sort(),
