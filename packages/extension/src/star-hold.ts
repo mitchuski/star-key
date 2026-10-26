@@ -16,8 +16,14 @@
 // every item and re-derives every ref and the root. Nothing here grants access,
 // standing or a relationship — it says what is held and what has been checked.
 import { verifyTrustTaskProof } from '@openvtc/pnm-core/trust-tasks';
+import { holdRootV2, holdProofV2, holdVerifyV2, type ProofStep } from './kappa-merkle.js';
+import { HOLD_KIND_V1, DISCLOSURE_KIND_V1, isNodePreimage, merkleRootV1, merklePathV1, rootFromPathV1, type PathStep } from './star-hold-v1.js';
+export { HOLD_KIND_V1, DISCLOSURE_KIND_V1, isNodePreimage, type PathStep, type ProofStep };
 
-export const HOLD_KIND = 'agentprivacy.star-hold/1';
+// /2 roots the items with the κ registry's tagged tree (kappa-merkle.ts). /1 Holds and
+// their disclosures are still verified, through the frozen star-hold-v1.ts, by the
+// `kind` each artefact carries; nothing new is built or disclosed under /1's tree.
+export const HOLD_KIND = 'agentprivacy.star-hold/2';
 export const VERIFIER = 'star-key/hold@0.1';
 export type ItemState = 'not-checked' | 'valid' | 'invalid' | 'unsupported' | 'unavailable';
 export type Profile = 'trust-task/eddsa-jcs-2022' | 'vc/eddsa-jcs-2022' | 'agentprivacy.vta/1' | 'agentprivacy.vrc/1' | 'vc/ecdsa-secp256k1-2019' | 'vc/ed25519-2020' | 'webauthn-assertion';
@@ -31,9 +37,9 @@ export interface HoldItem {
   role: 'self' | 'counterpart' | 'issuer' | 'witness'; subject?: string; issued?: string; expires?: string;
   status: { state: string }; acceptedAt: string; verification: { state: ItemState; verifier: string; inputDigest: string; at: string; reason: string | null };
 }
-export interface StarHold { kind: typeof HOLD_KIND; bearer: string; bearerPublicKeyHex: string; kappa: string; items: HoldItem[]; root: string; count: number; budget: { bytes: number; used: number; fits: boolean }; at: string; sig: string }
+export interface StarHold { kind: typeof HOLD_KIND | typeof HOLD_KIND_V1; bearer: string; bearerPublicKeyHex: string; kappa: string; items: HoldItem[]; root: string; count: number; budget: { bytes: number; used: number; fits: boolean }; at: string; sig: string }
 export interface ItemResult { ref: string; profile: Profile; role: HoldItem['role']; state: ItemState; reason: string | null; signer: string | null; signed: Measured }
-export interface HoldVerification { ok: boolean; bearerSig: boolean; root: { derived: string | null; stamped: string | null; matches: boolean }; refsMatch: boolean; keyChecked: boolean; keyMatches: boolean | null; items: ItemResult[]; allValid: boolean; budget: { bytes: number | null; used: number; fits: boolean | null }; checkedAt: string; why: string[] }
+export interface HoldVerification { ok: boolean; tree: 'kappa-merkle/1' | 'legacy-packets/1'; legacy: boolean; bearerSig: boolean; root: { derived: string | null; stamped: string | null; matches: boolean }; refsMatch: boolean; keyChecked: boolean; keyMatches: boolean | null; items: ItemResult[]; allValid: boolean; budget: { bytes: number | null; used: number; fits: boolean | null }; checkedAt: string; why: string[] }
 
 // ---- canonical forms and hashes ------------------------------------------------
 // JCS (RFC 8785), the same rule as packages/core/src/trust-tasks/canonical.ts —
@@ -60,6 +66,8 @@ function jcsString(s: string): string {
   return out + '"';
 }
 export function canonicalJSON(v: unknown): string {
+  // not JSON: refuse rather than print it (NaN/Infinity would print as null and [undefined] as [], giving different values one κ — formal_mage O12b; star-registry.ts refuses the same way)
+  if (v === undefined || typeof v === 'function' || typeof v === 'symbol' || typeof v === 'bigint' || (typeof v === 'number' && !Number.isFinite(v))) throw new Error('canonical JSON: ' + (typeof v === 'number' ? String(v) : typeof v) + ' is not a JSON value');
   if (v === null || typeof v !== 'object') return JSON.stringify(v);
   if (Array.isArray(v)) return '[' + v.map(canonicalJSON).join(',') + ']';
   const o = v as Record<string, unknown>;
@@ -72,24 +80,10 @@ export const sha256hex = async (data: Uint8Array | string) => hex(await crypto.s
 export const kappaOf = async (obj: Record<string, unknown>) => { const c = { ...obj }; delete c.kappa; return 'sha256:' + (await sha256hex(canonicalJSON(c))); };
 export const refOf = async (bytes: Uint8Array) => 'sha256:' + (await sha256hex(bytes));
 const isHex = (s: unknown, n: number) => typeof s === 'string' && new RegExp(`^[0-9a-f]{${n}}$`, 'i').test(s);
-export function itemBytes(item: HoldItem): Uint8Array {
+export function itemBytes(item: { envelope: string }): Uint8Array {
   const b64 = item.envelope.replace(/-/g, '+').replace(/_/g, '/');
   const bin = atob(b64 + '='.repeat((4 - (b64.length % 4)) % 4));
   return Uint8Array.from(bin, (c) => c.charCodeAt(0));
-}
-// Merkle root over sorted leaves, odd promoted — the packets rule (kappa.mjs merkleRoot).
-export async function merkleRoot(leaves: string[]): Promise<string | null> {
-  let level = [...leaves].sort();
-  if (!level.length) return null;
-  while (level.length > 1) {
-    const next: string[] = [];
-    for (let i = 0; i < level.length; i += 2) {
-      const a = level[i]!, b = level[i + 1];
-      next.push(b !== undefined ? 'sha256:' + (await sha256hex(a + '|' + b)) : a);
-    }
-    level = next;
-  }
-  return level[0] ?? null;
 }
 // ---- ed25519 (WebCrypto) and did:key ---------------------------------------------
 async function edVerify(pubHex: string, data: Uint8Array, sig: Uint8Array): Promise<boolean> {
@@ -146,23 +140,29 @@ export async function verifyEnvelope(profile: Profile, bytes: Uint8Array): Promi
   if (family === 'declared') return { state: 'unsupported', reason: `profile ${profile} is declared, not verified by ${VERIFIER}`, signer: null, verificationMethod: null, signed: measure(null) };
   let doc: Record<string, unknown>;
   try { doc = JSON.parse(new TextDecoder().decode(bytes)); } catch { return { state: 'invalid', reason: 'envelope is not JSON', signer: null, verificationMethod: null, signed: measure(null) }; }
-  const r = family === 'di' ? await verifyDI(doc) : family === 'vta' ? await verifyVta(doc) : await verifyVrc(doc);
+  // a record with a non-JSON field (canonicalJSON refuses it) is invalid, never a crash
+  let r: Verified;
+  try { r = family === 'di' ? await verifyDI(doc) : family === 'vta' ? await verifyVta(doc) : await verifyVrc(doc); }
+  catch (e) { return { state: 'invalid', reason: 'record has a field that is not a JSON value: ' + (e instanceof Error ? e.message : String(e)), signer: null, verificationMethod: null, signed: measure(null) }; }
   return { state: r.state, reason: r.reason, signer: r.signer, verificationMethod: r.verificationMethod, signed: measure(r) };
 }
 // ---- the Hold ------------------------------------------------------------------------
 export const holdBytes = (h: StarHold) => enc.encode(canonicalJSON({ kind: h.kind, bearer: h.bearer, kappa: h.kappa, root: h.root, count: h.count, at: h.at }));
 export async function verifyHold(hold: StarHold, { key = null, now = new Date() }: { key?: Record<string, unknown> | null; now?: Date } = {}): Promise<HoldVerification> {
   const why: string[] = []; const push = (c: boolean, m: string) => { if (!c) why.push(m); return c; };
-  push(hold?.kind === HOLD_KIND, 'kind');
+  const legacy = hold?.kind === HOLD_KIND_V1;
+  push(hold?.kind === HOLD_KIND || legacy, 'kind');
   push(isHex(hold?.bearerPublicKeyHex, 64) && hold?.bearer === didKey(hold.bearerPublicKeyHex), 'bearer did does not derive from bearerPublicKeyHex');
   const items = Array.isArray(hold?.items) ? hold.items : [];
   push(items.length > 0, 'items');
   const bearerSig = isHex(hold?.sig, 128) && isHex(hold?.bearerPublicKeyHex, 64) && (await edVerify(hold.bearerPublicKeyHex, holdBytes(hold), fromHex(hold.sig)));
   push(bearerSig, 'bearer signature over {kind,bearer,kappa,root,count,at} does not verify');
   let refsMatch = true;
-  for (const i of items) if (typeof i?.envelope !== 'string' || (await refOf(itemBytes(i))) !== i.ref) refsMatch = false;
+  for (const i of items) if (typeof i?.envelope !== 'string' || (legacy && isNodePreimage(itemBytes(i))) || (await refOf(itemBytes(i))) !== i.ref) refsMatch = false;
   push(refsMatch, 'an item ref does not re-derive from its retained bytes');
-  const derived = await merkleRoot(items.map((i) => i.ref));
+  let derived: string | null = null;
+  try { derived = legacy ? await merkleRootV1(items.map((i) => i.ref)) : await holdRootV2(items.map((i) => i.ref)); }
+  catch { push(false, 'two items share a ref'); }
   const rootMatches = derived === hold?.root;
   push(rootMatches, 'root does not re-derive from item refs');
   push(hold?.count === items.length, 'count');
@@ -175,7 +175,7 @@ export async function verifyHold(hold: StarHold, { key = null, now = new Date() 
     push(keyMatches, 'the Hold does not belong to this key (κ or holds{root,count} differ)');
   }
   const used = items.reduce((n, i) => n + (i?.signed?.envelopeBytes ?? 0), 0);
-  return { ok: why.length === 0, bearerSig, root: { derived, stamped: hold?.root ?? null, matches: rootMatches }, refsMatch, keyChecked: !!key, keyMatches, items: results,
+  return { ok: why.length === 0, tree: legacy ? 'legacy-packets/1' : 'kappa-merkle/1', legacy, bearerSig, root: { derived, stamped: hold?.root ?? null, matches: rootMatches }, refsMatch, keyChecked: !!key, keyMatches, items: results,
     allValid: results.length > 0 && results.every((r) => r.state === 'valid'), budget: { bytes: hold?.budget?.bytes ?? null, used, fits: hold?.budget?.bytes == null ? null : used <= hold.budget.bytes }, checkedAt: now.toISOString(), why };
 }
 // Refs and states only: no envelopes, no counterpart DIDs, no subjects.
@@ -183,3 +183,79 @@ export function projectHold(hold: StarHold) {
   return { kind: 'agentprivacy.star-hold-projection/1', bearer: hold.bearer, kappa: hold.kappa, root: hold.root, count: hold.count, at: hold.at, sig: hold.sig,
     items: hold.items.map((i) => ({ ref: i.ref, profile: i.profile, role: i.role, signed: i.signed, verification: { state: i.verification.state } })) };
 }
+
+// ---- a disclosure: chosen items under the root ----------------------------------------
+// The rung before a presentation: the bearer shows the items they choose, each
+// with its path to the root the key carries, so anyone holding that root can
+// verify them. It discloses exactly those items (their bytes, their signers)
+// and of the others only their number. The zero-knowledge presentation of the
+// reference runtime (dtg-zkp/star-hold, which refuses even the raw root on the
+// public side) is a later rung, and is not this.
+export const DISCLOSURE_KIND = 'agentprivacy.star-hold-disclosure/2';
+// /2 items carry a κ-tree inclusion proof; /1 items (legacy) carry the old path.
+export interface DisclosedItem { ref: string; profile: Profile; role: HoldItem['role']; envelope: string; signed: Measured; proof?: ProofStep[]; path?: PathStep[] }
+export interface HoldDisclosure { kind: typeof DISCLOSURE_KIND | typeof DISCLOSURE_KIND_V1; bearer: string; root: string; count: number; k: number; items: DisclosedItem[]; at: string }
+export interface DisclosureVerification {
+  ok: boolean; root: { stamped: string; expected: string | null; matches: boolean | null }; k: number; count: number;
+  items: { ref: string; profile: Profile; role: HoldItem['role']; state: ItemState; reason: string | null; signer: string | null; signed: Measured; underRoot: boolean }[];
+  bytes: number; legacy: boolean; why: string[];
+}
+
+/** The bearer's chosen items, each with its path to the Hold's root. */
+export async function discloseHold(hold: StarHold, refs: readonly string[], now: Date = new Date()): Promise<HoldDisclosure> {
+  const chosen = hold.items.filter((i) => refs.includes(i.ref));
+  if (!chosen.length) throw new Error('choose at least one item');
+  const leaves = hold.items.map((i) => i.ref);
+  const legacy = hold.kind === HOLD_KIND_V1;
+  const items: DisclosedItem[] = [];
+  for (const i of chosen) {
+    const base = { ref: i.ref, profile: i.profile, role: i.role, envelope: i.envelope, signed: i.signed };
+    if (legacy) {
+      const path = await merklePathV1(leaves, i.ref);
+      if (!path) throw new Error('item not in hold');
+      items.push({ ...base, path });
+    } else {
+      const proof = await holdProofV2(leaves, i.ref);
+      if (!proof) throw new Error('item not in hold');
+      items.push({ ...base, proof });
+    }
+  }
+  return { kind: legacy ? DISCLOSURE_KIND_V1 : DISCLOSURE_KIND, bearer: hold.bearer, root: hold.root, count: hold.count, k: items.length, items, at: now.toISOString() };
+}
+
+export const disclosureBytes = (d: HoldDisclosure) => enc.encode(canonicalJSON(d)).length;
+
+/** Verify a disclosure: each item's bytes re-derive its ref, its path leads to the
+ *  stamped root and its envelope verifies; and when the verifier holds a root
+ *  (a key's `holds.root`), the stamped root is that one. */
+export async function verifyDisclosure(d: HoldDisclosure, { root = null }: { root?: string | null } = {}): Promise<DisclosureVerification> {
+  const why: string[] = []; const push = (c: boolean, m: string) => { if (!c) why.push(m); return c; };
+  const legacy = d?.kind === DISCLOSURE_KIND_V1;
+  push(d?.kind === DISCLOSURE_KIND || legacy, 'kind');
+  const items = Array.isArray(d?.items) ? d.items : [];
+  push(items.length > 0, 'items');
+  push(d?.k === items.length, 'k');
+  push(Number.isInteger(d?.count) && d.count >= items.length, 'count');
+  const results: DisclosureVerification['items'] = [];
+  for (const i of items) {
+    const bytes = itemBytes(i);
+    // /2's leaf tag makes an interior node unpresentable as an item; /1 refuses its shape instead
+    const nodeShaped = legacy && isNodePreimage(bytes);
+    push(!nodeShaped, 'item bytes have the form of an interior Merkle node (leaf/node confusion)');
+    const refOk = !nodeShaped && (await refOf(bytes)) === i.ref;
+    push(refOk || nodeShaped, 'an item ref does not re-derive from its bytes');
+    const underRoot = refOk && (legacy
+      ? Array.isArray(i.path) && (await rootFromPathV1(i.ref, i.path)) === d.root
+      : Array.isArray(i.proof) && (await holdVerifyV2(d.root, i.ref, i.proof)));
+    push(underRoot, 'an item path does not lead to the root');
+    const v = await verifyEnvelope(i.profile, bytes);
+    results.push({ ref: i.ref, profile: i.profile, role: i.role, state: v.state, reason: v.reason, signer: v.signer, signed: v.signed, underRoot });
+  }
+  const matches = root == null ? null : d?.root === root;
+  push(matches !== false, 'the stamped root is not the root the verifier holds');
+  return { ok: why.length === 0, root: { stamped: d?.root ?? '', expected: root, matches }, k: items.length, count: d?.count ?? 0, items: results, bytes: d ? disclosureBytes(d) : 0, legacy, why };
+}
+
+// /1 helpers under their former names, for code and tests that read sealed /1 artefacts.
+export { merkleRootV1 as merkleRoot, merklePathV1 as merklePath, rootFromPathV1 as rootFromPath };
+export { holdRootV2, holdProofV2, holdVerifyV2 };

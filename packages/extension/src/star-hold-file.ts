@@ -3,7 +3,9 @@
 // (`agentprivacy.star-hold/1`) or the reference runtime's fixture wrapper
 // (`star-hold-fixture/1`, which carries the key beside the hold), so the pane
 // can show the same fixture the three verifiers agree on.
-import { HOLD_KIND, type StarHold } from './star-hold.js';
+import { HOLD_KIND, HOLD_KIND_V1, type StarHold } from './star-hold.js';
+// /2 Holds, and /1 Holds sealed before the κ-tree cutover (verified as legacy).
+const isHoldKind = (k: unknown) => k === HOLD_KIND || k === HOLD_KIND_V1;
 
 export interface HoldFile { hold: StarHold; key: Record<string, unknown> | null; source: 'hold' | 'fixture' }
 
@@ -14,12 +16,12 @@ export function readHoldFile(text: string): HoldFile {
   let parsed: unknown;
   try { parsed = JSON.parse(text); } catch { throw new Error('The file is not valid JSON.'); }
   if (!isObject(parsed)) throw new Error('Expected a Hold object.');
-  if (parsed.kind === HOLD_KIND) return { hold: parsed as unknown as StarHold, key: null, source: 'hold' };
+  if (isHoldKind(parsed.kind)) return { hold: parsed as unknown as StarHold, key: null, source: 'hold' };
   if (parsed.schema === 'star-hold-fixture/1') {
-    if (!isObject(parsed.hold) || parsed.hold.kind !== HOLD_KIND) throw new Error('The fixture carries no Hold of kind ' + HOLD_KIND + '.');
+    if (!isObject(parsed.hold) || !isHoldKind(parsed.hold.kind)) throw new Error('The fixture carries no Hold of kind ' + HOLD_KIND + ' or ' + HOLD_KIND_V1 + '.');
     return { hold: parsed.hold as unknown as StarHold, key: isObject(parsed.key) ? parsed.key : null, source: 'fixture' };
   }
-  throw new Error('Not a Star Hold (kind ' + HOLD_KIND + ') or a star-hold-fixture/1.');
+  throw new Error('Not a Star Hold (kind ' + HOLD_KIND + ' or ' + HOLD_KIND_V1 + ') or a star-hold-fixture/1.');
 }
 
 export function readKeyFile(text: string): Record<string, unknown> {
