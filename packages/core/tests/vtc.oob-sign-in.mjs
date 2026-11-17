@@ -63,7 +63,7 @@ const step1 = (over = {}) => ({
   service: { did: VTC, name: "Example Community" },
   origin: PORTAL,
   purpose: "login",
-  decisionDeadline: Math.floor(Date.now() / 1000) + 120,
+  decisionClosesAt: new Date(Date.now() + 120_000).toISOString(),
   ...over,
 });
 
@@ -235,6 +235,74 @@ test("sendOob: a long Retry-After is capped, and a limiter that never relents is
   assert.equal(c.seen.length, 4);
 });
 
+/** A community that cannot yet check what the document carries: the first `n`
+ *  posts are answered with the framework's retryable `indeterminate`. */
+function indeterminate(n, extra = {}) {
+  const c = community(() => ({ payload: step1() }));
+  let refused = 0;
+  const waits = [];
+  const fetch = async (url, init) => {
+    if (refused < n) {
+      refused++;
+      c.seen.push({ url, doc: JSON.parse(init.body), indeterminate: true });
+      return new Response(
+        JSON.stringify({
+          type: "https://trusttasks.org/spec/trust-task-error/0.2",
+          payload: { code: "indeterminate", retryable: true, ...extra },
+        }),
+        { status: 503, headers: { "content-type": "application/json" } },
+      );
+    }
+    return c.fetch(url, init);
+  };
+  const sleep = async (ms) => void waits.push(ms);
+  return { fetch, sleep, seen: c.seen, waits };
+}
+
+test("vti_vot_018: an indeterminate answer is resent as the same document, with backoff", async () => {
+  const kA = newApproverKey();
+  const c = indeterminate(2);
+  const reply = await sendOob(kA, buildClaim(kA, VTC, REQ), { ...sendOpts(c.fetch), sleep: c.sleep }, "claim");
+  assert.equal(reply.payload.service.name, "Example Community");
+  assert.deepEqual(c.waits, [2000, 4000]);
+  assert.equal(c.seen.length, 3);
+  assert.deepEqual(c.seen[2].doc, c.seen[0].doc, "the same signed document, byte for byte");
+});
+
+test("an indeterminate answer's retryAfter is waited for, capped; one that persists is a refusal with its code", async () => {
+  const kA = newApproverKey();
+  const now = Date.parse("2026-11-03T00:00:00Z");
+  const c = indeterminate(99, { retryAfter: "2026-11-03T00:00:05Z" });
+  await assert.rejects(
+    sendOob(kA, buildClaim(kA, VTC, REQ), { ...sendOpts(c.fetch), sleep: c.sleep, now: () => now }, "claim"),
+    (e) => e instanceof OobRefusedError && e.code === "indeterminate",
+  );
+  assert.deepEqual(c.waits, [5000, 5000, 5000]);
+  assert.equal(c.seen.length, 4);
+  const far = indeterminate(1, { retryAfter: "2026-11-03T01:00:00Z" });
+  await sendOob(kA, buildClaim(kA, VTC, REQ), { ...sendOpts(far.fetch), sleep: far.sleep, now: () => now }, "claim");
+  assert.deepEqual(far.waits, [10_000]);
+});
+
+test("an indeterminate answer is not resent once the document would have expired", async () => {
+  const kA = newApproverKey();
+  const now = Date.now();
+  const c = indeterminate(99);
+  const doc = { ...buildClaim(kA, VTC, REQ), expiresAt: new Date(now + 1000).toISOString() };
+  await assert.rejects(
+    sendOob(kA, doc, { ...sendOpts(c.fetch), sleep: c.sleep, now: () => now }, "claim"),
+    (e) => e instanceof OobRefusedError && e.code === "indeterminate",
+  );
+  assert.equal(c.seen.length, 1);
+});
+
+test("a refusal that is not retryable is not resent", async () => {
+  const kA = newApproverKey();
+  const c = community(() => ({ error: "indeterminate" })); // retryable: false
+  await assert.rejects(sendOob(kA, buildClaim(kA, VTC, REQ), sendOpts(c.fetch), "claim"), (e) => e.code === "indeterminate");
+  assert.equal(c.seen.length, 1);
+});
+
 test("sendOob: a refusal carries its stable code", async () => {
   const kA = newApproverKey();
   const c = community(() => ({ error: "alreadyClaimed" }));
@@ -275,10 +343,14 @@ test("the published endpoint is a base: the POST URL is <base>/trust-tasks, a tr
   assert.equal(selectSignInServices(svc("https://h.example")).services.trustTaskEndpoint, "https://h.example/trust-tasks");
 });
 
-test("C9: a deadline is integer epoch seconds only", () => {
+test("claim 0.2: the deadline is decisionClosesAt, an RFC 3339 date-time", () => {
   const want = { requestId: REQ, vtcDid: VTC, portalOrigin: PORTAL, now: Date.now() };
   checkStep1(step1(), want);
-  assert.throws(() => checkStep1(step1({ decisionDeadline: new Date(Date.now() + 60_000).toISOString() }), want));
+  // The 0.1 spelling and shape — epoch seconds under `decisionDeadline` — is not one.
+  const { decisionClosesAt: _, ...rest } = step1();
+  assert.throws(() => checkStep1({ ...rest, decisionDeadline: Math.floor(Date.now() / 1000) + 60 }, want));
+  assert.throws(() => checkStep1(step1({ decisionClosesAt: Math.floor(Date.now() / 1000) + 60 }), want));
+  assert.throws(() => checkStep1(step1({ decisionClosesAt: "2026-10-10 10:02:40" }), want), "no offset, no T");
 });
 
 test("step 1 checks", () => {
@@ -288,9 +360,8 @@ test("step 1 checks", () => {
     { service: { did: "did:web:evil.example", name: "x" } },
     { purpose: "step-up" },
     { origin: "https://evil.example" },
-    { decisionDeadline: Math.floor(Date.now() / 1000) - 1 },
-    { decisionDeadline: new Date(Date.now() - 1000).toISOString() },
-    { decisionDeadline: "soon" },
+    { decisionClosesAt: new Date(Date.now() - 1000).toISOString() },
+    { decisionClosesAt: "soon" },
   ]) {
     assert.throws(() => checkStep1(step1(over), want), (e) => e.code === OOB_REPLY_INVALID, JSON.stringify(over));
   }
@@ -365,7 +436,7 @@ test("digests: contextDigest covers the proof; the grant digest excludes one; th
     approverKey: "did:key:z6Mk",
     origin: PORTAL,
     contextDigest: await contextDigest(signedA),
-    notAfter: Math.floor(Date.now() / 1000) + 3600,
+    sessionEndsAt: new Date(Date.now() + 3_600_000).toISOString(),
   });
   const d = await grantDigest(grant);
   assert.equal(d, await grantDigest({ ...grant, proof: { x: 1 } }));

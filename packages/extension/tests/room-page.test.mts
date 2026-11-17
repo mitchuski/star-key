@@ -19,6 +19,7 @@ import {
 import {
   ROOM_GRANT_TTL_MS,
   ROOM_NAMES_MAX,
+  admittedOpenRooms,
   liveGrants,
   mergeRoomNames,
   rememberedRoomHosts,
@@ -50,6 +51,8 @@ const VTA = "did:webvh:QmAgent:agent.example";
 const ROOM = "did:webvh:QmRoom:rooms.example";
 const OTHER_ROOM = "did:webvh:QmOther:rooms.example";
 const PRIVATE_ROOM = "did:webvh:QmPrivate:rooms.example";
+/** An open room the member is in: no group, so the VTA never lists it. */
+const OPEN_ROOM = "did:webvh:QmOpen:rooms.example";
 const MEMBER = "did:webvh:QmAlice:people.example";
 /** A second identity the member signs in to this community with. */
 const MEMBER_2 = "did:webvh:QmAliceWork:people.example";
@@ -112,6 +115,8 @@ interface Harness {
   members: string[];
   /** What the VTA lists: one entry per (room, member). */
   held: { roomId: string; member?: string; actions?: string[] }[];
+  /** The open rooms the community's record says the member is in (`openRooms`). */
+  open: { roomId: string; member: string; actions: string[] }[];
   /** The names the community's offers give its rooms, or a failed reading. */
   names: Record<string, { label: string; visibility?: string }> | "fail";
   /** Each room's own profile, as the member's VTA reads it, or a failed reading. */
@@ -136,6 +141,7 @@ function harness(over: Partial<RoomPageBackgroundDeps> = {}): Harness {
       { roomId: PRIVATE_ROOM, member: MEMBER },
       { roomId: COMMUNITY_ROOM, member: HOST, actions: ["admin"] },
     ],
+    open: [],
     names: {},
     profiles: {},
   };
@@ -150,6 +156,8 @@ function harness(over: Partial<RoomPageBackgroundDeps> = {}): Harness {
           return { ok: true, result: h.held.map((r) => ({ ...r, epoch: 3, earliestReadableEpoch: 1 })) };
         case "members":
           return { ok: true, result: h.members };
+        case "openRooms":
+          return { ok: true, result: h.open.filter((r) => op.members.includes(r.member)) };
         case "roomNames":
           return h.names === "fail" ? { ok: false, error: "offers: notAMember" } : { ok: true, result: h.names };
         case "roomProfiles":
@@ -162,7 +170,7 @@ function harness(over: Partial<RoomPageBackgroundDeps> = {}): Harness {
             ok: true,
             result: {
               roomId: op.roomId,
-              visibility: op.roomId === PRIVATE_ROOM ? "private" : "attributed",
+              visibility: op.roomId === PRIVATE_ROOM ? "private" : op.roomId === OPEN_ROOM ? "open" : "attributed",
               epoch: 3,
               member: op.member,
               limits: {},
@@ -196,6 +204,7 @@ test("a page that is not the community's portal gets nothing, and no prompt", as
   const h = harness();
   const res = await h.gates.handle("https://evil.example", { op: "choose", hostDid: HOST });
   assert.equal(res.ok, false);
+  assert.equal((res as { code?: string }).code, "originNotPermitted");
   assert.equal(h.prompts.length, 0);
   assert.ok(!h.asked.some((a) => a.op === "held"), "the member's rooms were not even listed");
 });
@@ -225,12 +234,159 @@ test("choose shares what the member ticks, checked with the host, and never a pr
   assert.deepEqual((again.result as { rooms: unknown[] }).rooms, []);
 });
 
+test("an open room the member is in is offered, shared, and listed as held — though the VTA never lists it", async () => {
+  const h = harness();
+  h.open = [{ roomId: OPEN_ROOM, member: MEMBER, actions: ["read"] }];
+  h.answer = { approved: true, selectedRooms: [as(OPEN_ROOM)] };
+  const res = await h.gates.handle(PORTAL, { op: "choose", hostDid: HOST, suggest: OPEN_ROOM });
+  assert.ok(res.ok);
+  const view = h.prompts[0] as RoomShareConsentView;
+  const row = view.rooms.find((r) => r.roomId === OPEN_ROOM);
+  assert.ok(row, "offered in the share window");
+  assert.equal(row.member, MEMBER);
+  assert.ok(row.ticked, "the room the page suggested is ticked");
+  assert.ok(h.asked.some((a) => a.op === "openRooms" && (a.members as string[]).includes(MEMBER)));
+  assert.ok(!h.asked.some((a) => a.op === "openRooms" && (a.members as string[]).includes(HOST)), "never as the community");
+
+  const { rooms, refused } = res.result as {
+    rooms: { roomId: string; member: string; held: boolean; epoch?: number }[];
+    refused: unknown[];
+  };
+  assert.deepEqual(refused, []);
+  const shared = rooms.find((r) => r.roomId === OPEN_ROOM);
+  assert.ok(shared);
+  assert.equal(shared.held, true);
+  assert.equal(shared.epoch, undefined, "an open room has no epoch to report");
+
+  // A removal stops it counting at once: the record is read each time, never kept.
+  h.open = [];
+  const list = await h.gates.handle(PORTAL, { op: "list", hostDid: HOST });
+  assert.ok(list.ok);
+  const after = (list.result as { rooms: { roomId: string; held: boolean }[] }).rooms;
+  assert.equal(after.find((r) => r.roomId === OPEN_ROOM)?.held, false);
+});
+
+test("the community's record is asked about open rooms only for shares the VTA's listing does not name", async () => {
+  const h = harness();
+  h.answer = { approved: true, selectedRooms: [as(ROOM)] };
+  await h.gates.handle(PORTAL, { op: "choose", hostDid: HOST });
+  h.asked.length = 0;
+  await h.gates.handle(PORTAL, { op: "list", hostDid: HOST });
+  assert.ok(!h.asked.some((a) => a.op === "openRooms"));
+});
+
+test("admittedOpenRooms: admitted, open, as the member asked about", () => {
+  const base = { host: HOST, label: "x", validUntil: "2030-01-01T00:00:00Z", offeredAt: "2026-01-01T00:00:00Z" };
+  assert.deepEqual(
+    admittedOpenRooms(
+      [
+        { ...base, roomId: OPEN_ROOM, visibility: "open", state: "admitted", actions: ["read"] },
+        { ...base, roomId: ROOM, visibility: "attributed", state: "admitted", actions: ["read"] },
+        { ...base, roomId: OTHER_ROOM, visibility: "open", state: "offered", actions: ["read"] },
+        { ...base, roomId: PRIVATE_ROOM, visibility: "open", state: "removed", actions: ["read"] },
+      ],
+      MEMBER,
+    ),
+    [{ roomId: OPEN_ROOM, member: MEMBER, actions: ["read"] }],
+  );
+});
+
+test("the offscreen open-room reading: each member's record, as that member; one failing costs only its own", async () => {
+  const actedAs: string[] = [];
+  const open = await runRoomsPageOp(
+    {
+      agent: async () => ({
+        holderDid: "did:key:zWallet",
+        sender: {
+          async send<Res>(envelope: { type: string; payload: { document: Record<string, unknown> } }) {
+            const doc = structuredClone(envelope.payload.document);
+            actedAs.push(String(doc.issuer));
+            if (doc.issuer === MEMBER_2) throw new Error("rooms/keys/act:issuerNotPrincipal");
+            doc.proof = { type: "DataIntegrityProof" };
+            return { principal: doc.issuer, document: doc } as Res;
+          },
+        } as never,
+      }),
+      portal: async () => ({ portalOrigin: PORTAL, endpoint: `${PORTAL}/v1/trust-tasks` }),
+      completed: () => ({
+        async sendCompleted<Res>() {
+          return {
+            items: [
+              { roomId: OPEN_ROOM, host: HOST, label: "Public", visibility: "open", state: "admitted", actions: ["read"] },
+              { roomId: ROOM, host: HOST, label: "Board pack", visibility: "attributed", state: "admitted", actions: ["read"] },
+            ],
+          } as Res;
+        },
+      }),
+    },
+    { vtaDid: VTA },
+    { op: "openRooms", hostDid: HOST, members: [MEMBER, MEMBER_2, MEMBER] },
+  );
+  assert.deepEqual(open, [{ roomId: OPEN_ROOM, member: MEMBER, actions: ["read"] }]);
+  assert.deepEqual(actedAs, [MEMBER, MEMBER_2], "each member once");
+});
+
+test("a note for an open room is confirmed with the room said to be open, then written", async () => {
+  const h = harness();
+  h.open = [{ roomId: OPEN_ROOM, member: MEMBER, actions: ["read", "write"] }];
+  h.answer = { approved: true, selectedRooms: [as(OPEN_ROOM)] };
+  await h.gates.handle(PORTAL, { op: "choose", hostDid: HOST });
+  const res = await h.gates.handle(PORTAL, { op: "putNote", hostDid: HOST, roomId: OPEN_ROOM, title: "Hello", body: "World" });
+  assert.ok(res.ok);
+  const view = h.prompts.at(-1) as RoomWriteConsentView;
+  assert.equal(view.kind, "write");
+  assert.equal(view.visibility, "open");
+  assert.ok(h.asked.some((a) => a.op === "putNote" && a.roomId === OPEN_ROOM && a.member === MEMBER));
+});
+
+test("the offscreen note for an open room goes in the clear, as the member, with no seal", async () => {
+  const sent: Record<string, unknown>[] = [];
+  const out = await runRoomsPageOp(
+    {
+      agent: async () => ({
+        holderDid: "did:key:zWallet",
+        sender: {
+          async send<Res>(envelope: { type: string; payload: { document: Record<string, unknown> } }) {
+            if (!envelope.type.includes("rooms/keys/act/")) throw new Error(`unexpected ${envelope.type}`);
+            const doc = structuredClone(envelope.payload.document);
+            doc.proof = { type: "DataIntegrityProof" };
+            return { principal: doc.issuer, document: doc } as Res;
+          },
+        } as never,
+      }),
+      portal: async () => ({ portalOrigin: PORTAL, endpoint: `${PORTAL}/v1/trust-tasks` }),
+      completed: () => ({
+        async sendCompleted<Res>(doc: Record<string, unknown>) {
+          sent.push(doc);
+          const type = String(doc.type);
+          const payload = doc.payload as { roomId: string; key?: string };
+          if (type.includes("rooms/info/")) {
+            return { roomId: payload.roomId, visibility: "open", epoch: 1, limits: {}, usage: {} } as Res;
+          }
+          if (type.includes("rooms/records/put/")) return { key: payload.key, version: 1 } as Res;
+          throw new Error(`unexpected ${type}`);
+        },
+      }),
+    },
+    { vtaDid: VTA },
+    { op: "putNote", hostDid: HOST, roomId: OPEN_ROOM, member: MEMBER, title: "Hello", body: "World", tags: ["t"] },
+  );
+  const put = sent.find((d) => String(d.type).includes("rooms/records/put/"))!;
+  assert.ok(put, "a put reached the community");
+  assert.equal(put.issuer, MEMBER, "as the member");
+  const payload = put.payload as { key: string; cleartext?: unknown; sealed?: unknown };
+  assert.deepEqual(payload.cleartext, { body: "World", title: "Hello", tags: ["t"] });
+  assert.equal(payload.sealed, undefined);
+  assert.deepEqual(out, { key: payload.key, version: 1 });
+});
+
 test("list never prompts, and reads need a share", async () => {
   const h = harness();
   const list = await h.gates.handle(PORTAL, { op: "list", hostDid: HOST });
   assert.deepEqual(list, { ok: true, result: { rooms: [] } });
   const read = await h.gates.handle(PORTAL, { op: "read", hostDid: HOST, roomId: ROOM, key: "k" });
   assert.equal(read.ok, false);
+  assert.equal((read as { code?: string }).code, "notShared");
   assert.ok(!h.asked.some((a) => a.op === "read"));
 
   h.answer = { approved: true, selectedRooms: [as(ROOM)] };
@@ -248,7 +404,7 @@ test("every note is confirmed, showing who signs and what is written", async () 
 
   h.answer = { approved: false };
   const denied = await h.gates.handle(PORTAL, { op: "putNote", hostDid: HOST, roomId: ROOM, title: "Pricing", body: "Hold." });
-  assert.deepEqual(denied, { ok: false, error: "the member declined to add this note" });
+  assert.deepEqual(denied, { ok: false, error: "the member declined to add this note", code: "declined" });
   assert.ok(!h.asked.some((a) => a.op === "putNote"), "nothing was written");
   const view = h.prompts.at(-1) as RoomWriteConsentView;
   assert.equal(view.kind, "write");
@@ -306,9 +462,11 @@ test("a download's bytes reach the page only after the whole file verified", asy
   inner.receive({ kind: "progress", stage: "downloading", done: 1, total: 2 });
   assert.ok(!page.posted.some((m) => (m as { kind: string }).kind === "data"), "nothing provisional is posted");
   inner.receive({ kind: "provisional", data: "BBBB" });
-  inner.receive({ kind: "got", file: { name: "a.pdf", size: 6 }, author: MEMBER, version: 2 });
+  inner.receive({ kind: "got", file: { name: "a.pdf", size: 6 }, author: MEMBER, signed: false, version: 2 });
   const kinds = page.posted.map((m) => (m as { kind: string }).kind);
   assert.deepEqual(kinds, ["progress", "got", "data", "data", "done"]);
+  const got = page.posted.find((m) => (m as { kind: string }).kind === "got") as { signed?: boolean };
+  assert.equal(got.signed, false, "the page is told an open room's record is not signed");
   assert.equal(page.connected, false);
 });
 
@@ -319,18 +477,22 @@ test("a download that fails releases nothing to the page", async () => {
   page.receive({ kind: "get", hostDid: HOST, roomId: ROOM, key: "k" });
   await settle();
   h.inner[0]!.receive({ kind: "provisional", data: "AAAA" });
-  h.inner[0]!.receive({ kind: "failed", error: "chunk 1 does not match the manifest" });
-  assert.deepEqual(page.posted.map((m) => (m as { kind: string }).kind), ["failed"]);
+  h.inner[0]!.receive({ kind: "failed", error: "chunk 1 does not match the manifest", code: "hostMisbehaved" });
+  assert.deepEqual(page.posted, [{ kind: "failed", error: "chunk 1 does not match the manifest", code: "hostMisbehaved" }]);
 });
 
 test("a file from a room not shared, or another origin, is refused before the offscreen document is asked", async () => {
   const h = await sharedHarness();
-  for (const [origin, roomId] of [["https://evil.example", ROOM], [PORTAL, OTHER_ROOM]] as const) {
+  for (const [origin, roomId, code] of [
+    ["https://evil.example", ROOM, "originNotPermitted"],
+    [PORTAL, OTHER_ROOM, "notShared"],
+  ] as const) {
     const page = new FakePort();
     h.gates.servePort(page, origin);
     page.receive({ kind: "get", hostDid: HOST, roomId, key: "k" });
     await settle();
     assert.equal((page.posted[0] as { kind: string }).kind, "failed");
+    assert.equal((page.posted[0] as { code?: string }).code, code);
   }
   assert.equal(h.inner.length, 0);
 });
@@ -363,6 +525,18 @@ test("a declined upload opens no transfer, and data sent early is refused", asyn
   await settle();
   assert.equal(h.inner.length, 0);
   assert.equal((page.posted[0] as { kind: string }).kind, "failed");
+  // The early data is what is refused first: bytes before the wallet is ready.
+  assert.equal((page.posted[0] as { code?: string }).code, "invalidCall");
+});
+
+test("a declined upload is declined", async () => {
+  const h = await sharedHarness();
+  h.answer = { approved: false };
+  const page = new FakePort();
+  h.gates.servePort(page, PORTAL);
+  page.receive({ kind: "put", hostDid: HOST, roomId: ROOM, name: "a", size: 1 });
+  await settle();
+  assert.deepEqual(page.posted, [{ kind: "failed", error: "the member declined to add this file", code: "declined" }]);
 });
 
 // ── What a record looks like to a page ──────────────────────────────────────
@@ -393,6 +567,110 @@ test("a retracted record is its tombstone, and an open room's cleartext says it 
   assert.equal(open.sealed, false);
   assert.equal(open.title, "Hello");
   assert.ok(!("extra" in open));
+});
+
+test("an open room's file reaches the page as its name, size and type — never its key", async () => {
+  const view = await readView(ROOM, "k", {
+    key: "k", version: 2, status: "active", updatedAt: "x", verification: {},
+    cleartext: {
+      title: "Brochure",
+      body: "",
+      file: { name: "b.pdf", size: 42, mediaType: "application/pdf", blobRef: "zBlob", fileKey: "K".repeat(43) },
+    },
+  });
+  assert.deepEqual(view.file, { name: "b.pdf", size: 42, mediaType: "application/pdf" });
+  assert.ok(!JSON.stringify(view).includes("K".repeat(43)), "the key stays with the wallet");
+});
+
+// trust-tasks-tf #1027: what a record is and where it sits reach the page; a
+// record past its `validUntil`, or whose author cannot be verified, reaches it
+// with nothing of its content.
+test("a record's kind, reply, writtenAt and editedAt reach the page with its body", async () => {
+  const author = signingIdentityFromSecret(new Uint8Array(32).fill(4));
+  const body = {
+    roomId: ROOM, key: "k", version: 2, author: author.did, kind: "message", body: "Yes",
+    inReplyTo: { key: "q", version: 1 }, writtenAt: "2026-11-01T09:00:00Z", editedAt: "2026-11-01T09:05:00Z",
+  };
+  const plaintext = Buffer.from(await signRecordBody(body, author)).toString("base64url");
+  const view = await readView(ROOM, "k", {
+    key: "k", version: 2, updatedAt: "2026-11-01T09:05:00Z", createdAt: "2026-11-01T09:00:00Z",
+    bodyStoredAt: "2026-11-01T09:05:00Z", plaintext, verification: {},
+  });
+  assert.equal(view.kind, "message");
+  assert.deepEqual(view.inReplyTo, { key: "q", version: 1 });
+  assert.equal(view.writtenAt, "2026-11-01T09:00:00Z");
+  assert.equal(view.editedAt, "2026-11-01T09:05:00Z");
+  assert.equal(view.createdAt, "2026-11-01T09:00:00Z");
+  const open = await readView(ROOM, "k", {
+    key: "k", version: 1, verification: {}, cleartext: { body: "hi", kind: "reaction", inReplyTo: { key: "q" } },
+  });
+  assert.equal(open.kind, "reaction");
+  assert.deepEqual(open.inReplyTo, { key: "q" });
+});
+
+test("a record past its validUntil reaches the page as expired, with nothing of it", async () => {
+  const author = signingIdentityFromSecret(new Uint8Array(32).fill(4));
+  const body = { roomId: ROOM, key: "k", version: 2, author: author.did, title: "Old", body: "Stale", validUntil: "2026-01-01T00:00:00Z" };
+  const plaintext = Buffer.from(await signRecordBody(body, author)).toString("base64url");
+  const view = await readView(ROOM, "k", { key: "k", version: 2, plaintext, verification: {} });
+  assert.equal(view.expired, true);
+  assert.equal(view.title, undefined);
+  assert.equal(view.body, undefined);
+  const open = await readView(ROOM, "k", { key: "k", version: 1, verification: {}, cleartext: { body: "x", validUntil: "2026-01-01T00:00:00Z" } });
+  assert.equal(open.expired, true);
+  assert.equal(open.body, undefined);
+});
+
+test("a record whose author's DID does not resolve reaches the page as a placeholder, not a failure", async () => {
+  const doc = { roomId: ROOM, key: "k", version: 2, author: "did:webvh:QmGone:people.example", body: "Hidden" };
+  const signer = { ...signingIdentityFromSecret(new Uint8Array(32).fill(4)), did: doc.author, kid: `${doc.author}#key-1` };
+  const { signTrustTask } = await import("@openvtc/pnm-core/trust-tasks");
+  await signTrustTask({ envelope: doc, signing: signer, proofPurpose: "assertionMethod" });
+  const view = await readView(
+    ROOM,
+    "k",
+    { key: "k", version: 2, plaintext: Buffer.from(JSON.stringify(doc)).toString("base64url"), verification: {} },
+    {
+      resolveDid: async () => {
+        throw new Error("not found");
+      },
+    },
+  );
+  assert.equal(view.authorUnverified, true);
+  assert.equal(view.body, undefined);
+});
+
+test("a sealed record is checked against its author's document as of bodyStoredAt", async () => {
+  const author = "did:webvh:QmAuthor:people.example.org";
+  const then = signingIdentityFromSecret(new Uint8Array(32).fill(5));
+  const now = signingIdentityFromSecret(new Uint8Array(32).fill(6));
+  const documentWith = (key: { kid: string }) => ({
+    id: author,
+    verificationMethod: [{ id: `${author}#key-1`, type: "Multikey", controller: author, publicKeyMultibase: key.kid.split("#")[1] }],
+    assertionMethod: [`${author}#key-1`],
+  });
+  const doc = { roomId: ROOM, key: "k", version: 2, author, body: "Before the rotation" };
+  const { signTrustTask } = await import("@openvtc/pnm-core/trust-tasks");
+  await signTrustTask({ envelope: doc, signing: { ...then, did: author, kid: `${author}#key-1` }, proofPurpose: "assertionMethod" });
+  const read = {
+    key: "k", version: 2, bodyStoredAt: "2026-10-01T00:00:00Z", verification: {},
+    plaintext: Buffer.from(JSON.stringify(doc)).toString("base64url"),
+  };
+  const asked: Array<[string, string]> = [];
+  const view = await readView(ROOM, "k", read, {
+    resolveDid: async () => documentWith(now),
+    resolveDidAt: async (did, at) => {
+      asked.push([did, at]);
+      return documentWith(then);
+    },
+  });
+  assert.equal(view.body, "Before the rotation");
+  assert.deepEqual(asked, [[author, "2026-10-01T00:00:00Z"]]);
+  // History that says the author had no document then is a refusal, not a placeholder.
+  await assert.rejects(
+    readView(ROOM, "k", read, { resolveDid: async () => documentWith(then), resolveDidAt: async () => null }),
+    /signature does not hold/,
+  );
 });
 
 test("liveGrants drops other communities", () => {

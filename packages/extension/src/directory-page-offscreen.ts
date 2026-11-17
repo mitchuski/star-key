@@ -1,7 +1,7 @@
 /// <reference types="chrome" />
 
-// The work behind a page's `window.vtaWallet.directory.publishCard` — the
-// offscreen document's half.
+// The work behind a page's `window.vtaWallet.directory.publishCard` and
+// `presentCredential` — the offscreen document's half.
 //
 // The background has already checked that the page is the community's portal
 // and which of the member's identities it is for (`directory-page.ts`). This
@@ -10,33 +10,64 @@
 // approved it in the wallet's window — has their agent sign it as their DID
 // (`keys/sign-document`) and sends it to the community (`card/publish`).
 //
+// For `presentCredential` it reads what the named fields ask of a credential
+// (`fields/list`, as the member) and the member's credentials that answer it
+// (`vault/credentials/query`), and — once the person chose one — has their agent
+// present it to the community, bound to the `card/present` document that
+// carries it (`vault/credentials/present`), and sends that document.
+//
 // Every document to the community is the member's, signed by their agent as
 // the vault entry they sign in with; every reply is checked against the
 // community's verified DID document. Nothing the agent returns is sent on
 // unless it is exactly what was asked for, with a proof added.
 
-import { CONTACT_METHODS, vaultSignTrustTask, type TrustTaskSender } from "@openvtc/pnm-core";
+import {
+  CONTACT_METHODS,
+  CRED_PRESENT_WOULD_OVER_DISCLOSE,
+  annotateContact,
+  credVaultPresent,
+  credVaultQuery,
+  deleteList,
+  linkContact,
+  listAllAnnotated,
+  listLists,
+  putList,
+  vaultSignTrustTask,
+  type TrustTaskSender,
+} from "@openvtc/pnm-core";
 import {
   OobRefusedError,
   agentSignCard,
   assertSignedAsSent,
+  buildCardPresent,
   buildCardPublish,
   buildCardShow,
   buildExternalCard,
   buildFieldsList,
+  credentialAskFor,
   describeExternalCard,
   memberSigningKey,
   postCommunityTask,
   publishedStateOf,
   resolveCommunityDocument,
   selectSignInServices,
+  verifiedValuesOf,
   verifyDomainLinkage,
   type DirectoryCard,
   type FieldDefinition,
   type OobDocument,
 } from "@openvtc/pnm-core/vtc";
 
-import type { OffscreenDirectoryPageOp, PagePublishedCardView } from "./bridge-protocol.js";
+import type {
+  OffscreenDirectoryPageOp,
+  PageEntryMark,
+  PageMarkList,
+  PageMarksView,
+  PagePublishedCardView,
+  PageVerifiedFieldsView,
+  PreparedPresent,
+} from "./bridge-protocol.js";
+import { PageRefusal, trustTaskLocalCode } from "./page-error.js";
 
 /** A `didSelfIssued` vault entry, as much of one as this needs. */
 export interface DirectoryIdentity {
@@ -66,6 +97,9 @@ export interface DirectoryPageDeps {
   /** The member DID's current document, for a DID that is not a `did:key`.
    *  Defaults to resolving and verifying it as a contact DID is. */
   memberDocument?(did: string): Promise<Record<string, unknown> | null>;
+  /** The VTA context the member's identity `did` lives in — where their own
+   *  contacts and marks are kept. */
+  contextOf?(vtaDid: string, restBaseUrl: string | undefined, did: string): Promise<string | null>;
   /** The fetch the community is reached with. */
   fetch?: typeof fetch;
   now?(): number;
@@ -123,7 +157,48 @@ function refusalWords(e: unknown, community: string): Error {
     signatureInvalid: `${community} couldn't verify your signature on the card. Nothing was published.`,
     notMember: `${community} doesn't count you as an active member.`,
   };
-  return new Error(said[local] ?? `${community} didn't publish your card (${e.code}).`);
+  return new PageRefusal(said[local] ?? `${community} didn't publish your card (${e.code}).`, trustTaskLocalCode(e.code) ?? "unclassified");
+}
+
+/** The trust-task-error code and details an agent or community refusal carries. */
+function refusalCode(e: unknown): { code: string; details?: Record<string, unknown> } | null {
+  if (e instanceof OobRefusedError) return { code: e.code };
+  const payload = (e as { details?: unknown } | null)?.details as
+    | { code?: unknown; details?: Record<string, unknown> }
+    | undefined;
+  return typeof payload?.code === "string"
+    ? { code: payload.code, ...(payload.details ? { details: payload.details } : {}) }
+    : null;
+}
+
+/** What the agent said about a presentation, in the person's words. */
+function presentRefusalWords(e: unknown): Error {
+  const code = refusalCode(e)?.code;
+  const said: Record<string, string> = {
+    "vault/credentials/present:notFound":
+      "Your agent no longer holds that credential, or not the key it is presented with. Nothing was presented.",
+    "vault/credentials/present:notPresentable":
+      "That credential has expired, been revoked or been put away, so it can't be presented.",
+    "vault/credentials/present:claimNotHeld": "That credential doesn't carry what these fields ask for.",
+    "vault/credentials/present:formatUnsupported": "Your agent can't present a credential of that kind here.",
+  };
+  if (code && said[code]) return new PageRefusal(said[code], trustTaskLocalCode(code) ?? "unclassified");
+  return e instanceof Error ? e : new Error(String(e));
+}
+
+/** What the community said about a presentation, in the person's words. */
+function cardPresentRefusalWords(e: unknown, community: string): Error {
+  if (!(e instanceof OobRefusedError)) return e instanceof Error ? e : new Error(String(e));
+  const local = e.code.slice(e.code.lastIndexOf(":") + 1);
+  const said: Record<string, string> = {
+    notMember: `${community} doesn't count you as an active member.`,
+    fieldUnknown: `${community}'s directory no longer has one of those fields.`,
+    fieldNotWritable: `${community}'s directory doesn't fill one of those fields from a credential.`,
+    presentationInvalid: `${community} couldn't verify the credential as yours. Nothing was added to your card.`,
+    issuerNotAccepted: `${community} doesn't accept that credential's issuer for one of those fields.`,
+    claimMissing: `The credential doesn't show what one of those fields reads.`,
+  };
+  return new PageRefusal(said[local] ?? `${community} didn't add the credential to your card (${e.code}).`, trustTaskLocalCode(e.code) ?? "unclassified");
 }
 
 /** Run one directory operation. Throws with a message fit for the page. */
@@ -142,8 +217,12 @@ export async function runDirectoryPageOp(
   if (op.op === "members") return entries.map((e) => e.principalDid as string);
 
   const entry = entries.find((e) => e.principalDid === op.member);
-  if (!entry) throw new Error("The wallet holds no such identity for this community.");
+  if (!entry) throw new PageRefusal("The wallet holds no such identity for this community.", "identityUnknown");
   const name = entry.label?.trim() || "This community";
+  if (op.op === "communityName") return name;
+  if (op.op === "marks" || op.op === "mark" || op.op === "putList" || op.op === "deleteList") {
+    return runMarksOp(deps, vta, op);
+  }
   const verified = await community(op.hostDid);
   const sendOpts = {
     vtcDid: op.hostDid,
@@ -166,6 +245,89 @@ export async function runDirectoryPageOp(
     const reply = await postCommunityTask<P>(signed, sendOpts, label, "authentication");
     return reply.doc.payload as P;
   };
+
+  if (op.op === "preparePresent") {
+    let fields: FieldDefinition[];
+    try {
+      ({ fields } = await asMember<{ fields: FieldDefinition[] }>(
+        buildFieldsList(op.member, op.hostDid),
+        "vtc/directory/fields/list",
+      ));
+    } catch (e) {
+      throw refusalWords(e, name);
+    }
+    const asked = credentialAskFor(fields, op.fields);
+    if (!asked.ok) throw new PageRefusal(asked.error, "invalidCall");
+    const { ask } = asked;
+    // Only credentials the agent would present as the member: the community
+    // accepts a presentation only from its member, so one bound to another
+    // key (a separate SD-JWT holder key) would be refused after the member
+    // chose it.
+    const held = await credVaultQuery(sender, {
+      holder,
+      service,
+      type: ask.credentialType,
+      status: "valid",
+      subjectDid: op.member,
+    });
+    const candidates = held
+      .filter((c) => !c.lifecycle || c.lifecycle === "active")
+      .filter((c) => !ask.issuers || (c.issuerDid !== undefined && ask.issuers.includes(c.issuerDid)))
+      .map((c) => ({
+        id: c.id,
+        ...(c.issuerDid ? { issuerDid: c.issuerDid } : {}),
+        types: [...c.types],
+        ...(c.validUntil ? { validUntil: c.validUntil } : {}),
+      }));
+    if (candidates.length === 0) {
+      throw new PageRefusal(
+        ask.issuers
+          ? `Your wallet holds no ${ask.credentialType} from an issuer ${name} accepts for ${ask.fields.map((f) => f.label).join(", ")}.`
+          : `Your wallet holds no ${ask.credentialType} to verify ${ask.fields.map((f) => f.label).join(", ")} with.`,
+        "credentialNotHeld",
+      );
+    }
+    const prepared: PreparedPresent = { communityName: name, fields: ask.fields, claims: ask.claims, candidates };
+    return prepared;
+  }
+
+  if (op.op === "present") {
+    // The document's id is the presentation's nonce, so it exists first; a
+    // retry after a refusal is a fresh document and a fresh nonce.
+    const id = globalThis.crypto.randomUUID();
+    let presentation: Record<string, unknown> | string;
+    try {
+      const res = await credVaultPresent(sender, {
+        holder,
+        service,
+        id: op.credentialId,
+        audience: op.hostDid,
+        nonce: id,
+        claims: op.claims,
+        purpose: `Verified fields on my card in ${name}'s member directory`,
+      });
+      presentation = res.presentation as Record<string, unknown> | string;
+    } catch (e) {
+      const refused = refusalCode(e);
+      if (refused?.code === CRED_PRESENT_WOULD_OVER_DISCLOSE) {
+        const undisclosed = refused.details?.undisclosed;
+        if (Array.isArray(undisclosed) && undisclosed.every((c) => typeof c === "string") && undisclosed.length > 0) {
+          return { undisclosed: undisclosed as string[] };
+        }
+      }
+      throw presentRefusalWords(e);
+    }
+    try {
+      const answer = await asMember<unknown>(
+        buildCardPresent(id, op.member, op.hostDid, op.fields, presentation),
+        "vtc/directory/card/present",
+      );
+      const view: PageVerifiedFieldsView = verifiedValuesOf(answer) as PageVerifiedFieldsView;
+      return view;
+    } catch (e) {
+      throw cardPresentRefusalWords(e, name);
+    }
+  }
 
   if (op.op === "prepare") {
     try {
@@ -212,5 +374,109 @@ export async function runDirectoryPageOp(
     return view;
   } catch (e) {
     throw refusalWords(e, name);
+  }
+}
+
+// ─── The member's own marks ─────────────────────────────────────────────────
+//
+// Stars, petnames and lists, kept by the member's own agent
+// (`persona/contact/*/1.1`, `persona/contact/lists/*/1.0`). Nothing here talks
+// to the community: every call is to the member's agent, in the context their
+// identity at the community lives in, and only contacts linked to this
+// community's directory are read back.
+
+type MarksOp = Extract<OffscreenDirectoryPageOp, { op: "marks" | "mark" | "putList" | "deleteList" }>;
+
+function listView(l: {
+  listId: string;
+  name: string;
+  colour?: string;
+  order: number;
+  contactCount: number;
+}): PageMarkList {
+  return {
+    listId: l.listId,
+    name: l.name,
+    order: l.order,
+    contactCount: l.contactCount,
+    ...(l.colour ? { colour: l.colour } : {}),
+  };
+}
+
+async function runMarksOp(
+  deps: DirectoryPageDeps,
+  vta: { vtaDid: string; restBaseUrl?: string },
+  op: MarksOp,
+): Promise<PageMarksView | PageEntryMark | PageMarkList | { deleted: boolean }> {
+  const contextId = await (deps.contextOf ?? (async () => null))(vta.vtaDid, vta.restBaseUrl, op.member);
+  if (!contextId) {
+    throw new PageRefusal(
+      "Your agent doesn't hold the identity you use at this community, so it has nowhere to keep your marks.",
+      "identityUnknown",
+    );
+  }
+  const { sender, holder, service } = await deps.agent(vta.vtaDid, vta.restBaseUrl);
+  const caller = { holder, service, contextId };
+
+  // The contacts linked to this community's directory, by entry. One contact
+  // per entry: the member's own (`knownByPersona` = their identity here) wins
+  // over one another of their personas keeps.
+  const linked = async () => {
+    const all = await listAllAnnotated(sender, { ...caller, directoryVtcDid: op.hostDid });
+    const byEntry = new Map<string, (typeof all)[number]>();
+    for (const c of all) {
+      const entryId = c.directoryRef?.entryId;
+      if (!entryId || c.directoryRef?.vtcDid !== op.hostDid) continue;
+      const held = byEntry.get(entryId);
+      if (!held || (held.knownByPersona !== op.member && c.knownByPersona === op.member)) byEntry.set(entryId, c);
+    }
+    return byEntry;
+  };
+  const markOf = (c: { starred: boolean; petname?: string; lists?: readonly string[] } | undefined): PageEntryMark => ({
+    starred: c?.starred ?? false,
+    ...(c?.petname ? { petname: c.petname } : {}),
+    ...(c?.lists && c.lists.length > 0 ? { lists: [...c.lists] } : {}),
+  });
+
+  switch (op.op) {
+    case "marks": {
+      const [byEntry, lists] = await Promise.all([linked(), listLists(sender, caller)]);
+      const entries: Record<string, PageEntryMark> = {};
+      for (const [entryId, c] of byEntry) entries[entryId] = markOf(c);
+      return { entries, lists: lists.lists.map(listView) };
+    }
+    case "mark": {
+      const change = {
+        ...(op.starred !== undefined ? { starred: op.starred } : {}),
+        ...(op.petname !== undefined ? { petname: op.petname } : {}),
+        ...(op.removePetname ? { removePetname: true as const } : {}),
+        ...(op.lists !== undefined ? { lists: op.lists } : {}),
+      };
+      const held = (await linked()).get(op.entryId);
+      if (held) {
+        await annotateContact(sender, { ...caller, contactId: held.contactId, change });
+      } else {
+        await linkContact(sender, {
+          ...caller,
+          knownByPersona: op.member,
+          directoryRef: { vtcDid: op.hostDid, entryId: op.entryId },
+          change,
+        });
+      }
+      return markOf((await linked()).get(op.entryId));
+    }
+    case "putList": {
+      const res = await putList(sender, {
+        ...caller,
+        ...(op.listId !== undefined ? { listId: op.listId } : {}),
+        ...(op.name !== undefined ? { name: op.name } : {}),
+        ...(op.colour !== undefined ? { colour: op.colour } : {}),
+      });
+      return listView(res.list);
+    }
+    case "deleteList": {
+      const res = await deleteList(sender, { ...caller, listId: op.listId });
+      return { deleted: res.existed };
+    }
   }
 }

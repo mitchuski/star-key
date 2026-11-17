@@ -16,9 +16,12 @@
 // testable against a fake community, and keeps the one place the wire shapes
 // live small.
 //
-// TODO: replace with generated trust-tasks types. Every `Oob*` type below is a
-// local copy of base design §10 plus contract C5, because the
-// `dtgwg-trust-tasks-tf` bindings for `auth/oob/*` are not published yet.
+// The wire shapes are the generated `auth/oob/*` modules (`../specs/`), one
+// version each: claim 0.2, identify 0.1, prove 0.3, grant 0.3, respond 0.3,
+// cancel 0.1 — what the did-hosting control plane, vtc-service and the VTA's
+// `vault/sign-trust-task` all serve. The `Oob*` names below alias them.
+
+import { sameReference, stripScidSrc } from "@openvtc/vti-didcomm-js";
 
 import { resolveContactDocument, type ContactMethodRegistry } from "../did/methods.js";
 import { generateSigningIdentity, type SigningIdentity } from "../siop/self-issued.js";
@@ -26,37 +29,38 @@ import { signTrustTask } from "../trust-tasks/sign.js";
 import { verifyTrustTaskProof } from "../trust-tasks/verify.js";
 import { jcsCanonicalize, sha256, base58btcEncode } from "../trust-tasks/canonical.js";
 import { meetsHostRules, type ContactRoute, type TriggerLinkReason } from "../links/trigger-link.js";
+import {
+  TYPE_URI as OOB_CLAIM,
+  type Response as ClaimResponse,
+  type Service as OobServiceShape,
+} from "../specs/auth/oob/claim/0.2/payload.js";
+import { TYPE_URI as OOB_IDENTIFY, type Payload as IdentifyPayload } from "../specs/auth/oob/identify/0.1/payload.js";
+import {
+  TYPE_URI as OOB_PROVE,
+  type Response as ProveResponse,
+  type Requester,
+  type SameNetwork,
+} from "../specs/auth/oob/prove/0.3/payload.js";
+import { TYPE_URI as OOB_GRANT, type Payload as GrantPayload } from "../specs/auth/oob/grant/0.3/payload.js";
+import { TYPE_URI as OOB_RESPOND, type Response as RespondResponse } from "../specs/auth/oob/respond/0.3/payload.js";
+import { TYPE_URI as OOB_CANCEL } from "../specs/auth/oob/cancel/0.1/payload.js";
 import { isTrustTaskErrorType } from "../vta/protocol.js";
 import { TRUST_TASK_HTTPS_SERVICE_TYPE, trustTaskUrl } from "../vta/endpoint.js";
 import { withFetchTimeout, isFetchTimeout } from "../http/timeout-fetch.js";
 
 // ── Type URIs (contract C5) ──────────────────────────────────────────────────
 
-const OOB = "https://trusttasks.org/spec/auth/oob";
-
-/** TODO: replace with generated trust-tasks types. */
 export const OOB_TYPES = {
-  claim: `${OOB}/claim/0.1`,
-  prove: `${OOB}/prove/0.1`,
-  identify: `${OOB}/identify/0.1`,
-  respond: `${OOB}/respond/0.1`,
-  grant: `${OOB}/grant/0.1`,
-  cancel: `${OOB}/cancel/0.1`,
-  // 0.2: step 2 may offer `signingScope`, which the grant copies to let the
-  // website's browser key sign those task families as the member for the
-  // session (auth/oob/grant/0.2). Everything else is 0.1's.
-  prove02: `${OOB}/prove/0.2`,
-  respond02: `${OOB}/respond/0.2`,
-  grant02: `${OOB}/grant/0.2`,
+  claim: OOB_CLAIM,
+  prove: OOB_PROVE,
+  identify: OOB_IDENTIFY,
+  respond: OOB_RESPOND,
+  grant: OOB_GRANT,
+  cancel: OOB_CANCEL,
 } as const;
 
-/** Which `prove` / `grant` / `respond` this exchange uses. 0.2 is tried first;
- *  a community that predates it refuses `prove/0.2` as an unsupported type and
- *  the wallet proves at 0.1, which delegates nothing. */
-export type OobVersion = "0.1" | "0.2";
-
 /** Families a wallet never delegates signing for, whatever a service offers
- *  (auth/oob/grant/0.2, wallet item 5): signing in, access control, consent. */
+ *  (auth/oob/grant/0.3, wallet item 5): signing in, access control, consent. */
 export const UNDELEGABLE_FAMILIES = ["auth", "acl", "consent", "task-consent", "confirm"] as const;
 
 /** A task-family slug prefix, as `SigningScope` admits one. */
@@ -65,29 +69,17 @@ const FAMILY = /^[a-z][a-z0-9-]*(\/[a-z][a-z0-9-]*)*$/;
 const responseType = (type: string) => `${type}#response`;
 
 // ── Payloads (base design §10, contract C5) ──────────────────────────────────
-// TODO: replace with generated trust-tasks types
 
 /** The community as it names itself in step 1. */
-export interface OobService {
-  did: string;
-  name: string;
-}
+export type OobService = OobServiceShape;
 
-/** Step 1, the signed reply to `claim`. Nothing about the starter. */
-export interface OobStep1 {
-  requestId: string;
-  service: OobService;
-  origin: string;
-  purpose: "login";
-  /** Integer epoch seconds (contract C9). */
-  decisionDeadline: number;
-  /** Framework extension member. A VTC puts the session audience here
-   *  ([`OOB_SESSION_EXT`]); anything else is carried unread. */
-  ext?: Record<string, unknown>;
-}
+/** Step 1, the signed reply to `claim`. Nothing about the starter. A VTC puts
+ *  the session audience in `ext` ([`OOB_SESSION_EXT`]); anything else there
+ *  is carried unread. */
+export type OobStep1 = ClaimResponse;
 
 /** The `ext` namespace in which a VTC says which session a sign-in asks for.
- *  `auth/oob/0.1`'s `purpose` is a closed enum (`login`), so the operator
+ *  `auth/oob`'s `purpose` is a closed enum (`login`), so the operator
  *  console's sign-in is told apart here instead. The VTC signs it into step 1
  *  and repeats it in step 2, so the grant's `contextDigest` covers it. */
 export const OOB_SESSION_EXT = "org.openvtc.session";
@@ -110,54 +102,23 @@ export function sessionAudienceOf(step: { ext?: unknown }): OobSessionAudience |
 }
 
 /** Whether the browser that asked is on the network the approver is on
- *  (base design §10, contract C9). TODO: replace with generated trust-tasks
- *  types. */
-export type OobSameNetwork = boolean | "unknown";
+ *  (base design §10, contract C9). */
+export type OobSameNetwork = SameNetwork;
 
-export interface OobRequester {
-  /** City and country, or `"unknown"`. */
-  location: string;
-  browser: string;
-  os: string;
-  createdAt: string;
-  sameNetwork: OobSameNetwork;
-}
+export type OobRequester = Requester;
 
-/** Step 2, the signed reply to `prove`: step 1 plus the requester. */
-export interface OobStep2 extends OobStep1 {
-  sessionKey: string;
-  requester: OobRequester;
-  identifiedAs: string;
-  /** 0.2: the task families the service would let the browser key sign as
-   *  the member, for this session. Absent: no signing is delegated. */
-  signingScope?: string[];
-}
+/** Step 2, the signed reply to `prove`: step 1 plus the requester, the session
+ *  key and — optionally — the task families the service would let the browser
+ *  key sign as the member for this session. */
+export type OobStep2 = ProveResponse;
 
-export interface OobIdentifyPayload {
-  requestId: string;
-  approverKey: string;
-  /** The two digits the member typed. */
-  enteredNumber: string;
-}
+export type OobIdentifyPayload = IdentifyPayload;
 
-export type OobDecision = "approve" | "decline";
+export type OobDecision = GrantPayload["decision"];
 
-export interface OobGrantPayload {
-  requestId: string;
-  decision: OobDecision;
-  sessionKey: string;
-  approverKey: string;
-  origin: string;
-  contextDigest: string;
-  /** Integer epoch seconds (contract C9). */
-  notAfter: number;
-  /** 0.2: step 2's `signingScope`, copied unchanged. */
-  signingScope?: string[];
-}
+export type OobGrantPayload = GrantPayload;
 
-export interface OobRespondResult {
-  status: string;
-}
+export type OobRespondResult = RespondResponse;
 
 /** A Trust-Task document as this module builds and reads it. */
 export interface OobDocument<P = unknown> {
@@ -402,10 +363,8 @@ export function buildProve(
   vtcDid: string,
   identify: OobDocument,
   requestId: string,
-  version: OobVersion = "0.1",
 ): OobDocument<{ identify: OobDocument }> {
-  const type = version === "0.2" ? OOB_TYPES.prove02 : OOB_TYPES.prove;
-  return { ...envelope(type, kA.did, vtcDid, { identify }), parentThreadId: requestId };
+  return { ...envelope(OOB_TYPES.prove, kA.did, vtcDid, { identify }), parentThreadId: requestId };
 }
 
 /** `auth/oob/grant`, unsigned. The VTA signs it (for `assertionMethod`) only
@@ -414,12 +373,8 @@ export function buildGrant(
   memberDid: string,
   vtcDid: string,
   payload: OobGrantPayload,
-  version: OobVersion = "0.1",
 ): OobDocument<OobGrantPayload> {
-  if (version === "0.1" && payload.signingScope !== undefined) {
-    throw new OobReplyInvalidError("a 0.1 grant cannot delegate signing");
-  }
-  return envelope(version === "0.2" ? OOB_TYPES.grant02 : OOB_TYPES.grant, memberDid, vtcDid, payload);
+  return envelope(OOB_TYPES.grant, memberDid, vtcDid, payload);
 }
 
 /** `auth/oob/respond`. Carries the handle as `parentThreadId` as well (C9:
@@ -429,10 +384,8 @@ export function buildRespond(
   vtcDid: string,
   grant: OobDocument,
   requestId: string,
-  version: OobVersion = "0.1",
 ): OobDocument<{ grant: OobDocument }> {
-  const type = version === "0.2" ? OOB_TYPES.respond02 : OOB_TYPES.respond;
-  return { ...envelope(type, kA.did, vtcDid, { grant }), parentThreadId: requestId };
+  return { ...envelope(OOB_TYPES.respond, kA.did, vtcDid, { grant }), parentThreadId: requestId };
 }
 
 export function buildCancel(kA: SigningIdentity, vtcDid: string, requestId: string): OobDocument<{ requestId: string }> {
@@ -498,8 +451,11 @@ export interface OobSenderOptions {
    *  `selectSignInServices` composes it. */
   trustTaskEndpoint: string;
   fetch?: typeof fetch;
-  /** Waits out a `429` before the retry (tests pass an instant one). */
+  /** Waits out a `429` or an `indeterminate` before the resend (tests pass an
+   *  instant one). */
   sleep?: (ms: number) => Promise<void>;
+  /** The clock a refusal's `retryAfter` and the document's `expiresAt` are read against. */
+  now?: () => number;
 }
 
 /** How many times a document the community's rate limiter refused is sent
@@ -512,6 +468,30 @@ function retryAfterMs(res: Response): number {
   const secs = Number(res.headers.get("retry-after"));
   const ms = Number.isFinite(secs) && secs > 0 ? secs * 1000 : 2000;
   return Math.min(ms, RATE_LIMIT_MAX_WAIT_MS);
+}
+
+/** How many times a document the community answered with the framework's
+ *  retryable `indeterminate` is sent again, and the longest single wait (ms).
+ *  `indeterminate` says a check could not be completed — an issuer's DID
+ *  document or a status list the community could not obtain — and that nothing
+ *  was recorded, so the **same** document goes again, with backoff, while it is
+ *  unexpired (SPEC §8.3; tickets/issue/0.3 and show/0.6, VTI-VOT-018). This is
+ *  the one place that resends a document to the community, as for a `429`;
+ *  nothing above it retries. */
+export const INDETERMINATE_RETRIES = 3;
+export const INDETERMINATE_MAX_WAIT_MS = 10_000;
+
+/** The wait before resending after an `indeterminate`: the refusal's
+ *  `retryAfter` where it names one, else 2 s doubling, capped. */
+function indeterminateWaitMs(payload: { retryAfter?: unknown }, resent: number, now: number): number {
+  const after = typeof payload.retryAfter === "string" ? Date.parse(payload.retryAfter) - now : Number.NaN;
+  const ms = Number.isFinite(after) && after > 0 ? after : 2000 * 2 ** resent;
+  return Math.min(ms, INDETERMINATE_MAX_WAIT_MS);
+}
+
+/** Whether a refusal is the framework's retryable `indeterminate`. */
+function isIndeterminate(payload: { code?: unknown; retryable?: unknown } | undefined): boolean {
+  return payload?.code === "indeterminate" && payload.retryable === true;
 }
 
 export interface OobReply<P> {
@@ -568,8 +548,11 @@ export async function postCommunityTask<P>(
   }
   const fetchFn = withFetchTimeout(opts.fetch);
   const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+  const now = opts.now ?? Date.now;
+  const expiresAt = typeof doc.expiresAt === "string" ? Date.parse(doc.expiresAt) : Number.NaN;
   let res: Response;
-  for (let attempt = 0; ; attempt++) {
+  let reply: OobDocument<P> & { payload: P };
+  for (let limited = 0, resent = 0; ; ) {
     try {
       res = await fetchFn(opts.trustTaskEndpoint, {
         method: "POST",
@@ -586,18 +569,31 @@ export async function postCommunityTask<P>(
     // the same document goes again once the wait it names is over. The person
     // and the page share one address with the wallet; a busy minute there is
     // not a reason to end their sign-in.
-    if (res.status !== 429 || attempt >= RATE_LIMIT_RETRIES) break;
-    await sleep(retryAfterMs(res));
-  }
-  let reply: OobDocument<P> & { payload: P };
-  try {
-    reply = (await res.json()) as OobDocument<P> & { payload: P };
-  } catch {
-    throw new OobRefusedError(`http-${res.status}`, `${label}: the community answered ${res.status} with no document`);
-  }
-  if (isTrustTaskErrorType(reply?.type)) {
-    const code = (reply.payload as { code?: unknown } | undefined)?.code;
-    throw new OobRefusedError(typeof code === "string" ? code : "taskFailed", `${label}: refused (${String(code)})`);
+    if (res.status === 429 && limited < RATE_LIMIT_RETRIES) {
+      limited++;
+      await sleep(retryAfterMs(res));
+      continue;
+    }
+    try {
+      reply = (await res.json()) as OobDocument<P> & { payload: P };
+    } catch {
+      throw new OobRefusedError(`http-${res.status}`, `${label}: the community answered ${res.status} with no document`);
+    }
+    if (isTrustTaskErrorType(reply?.type)) {
+      const refusal = reply.payload as { code?: unknown; retryable?: unknown; retryAfter?: unknown } | undefined;
+      if (isIndeterminate(refusal) && resent < INDETERMINATE_RETRIES) {
+        const wait = indeterminateWaitMs(refusal!, resent, now());
+        // A document past its expiry would be refused for that, not checked again.
+        if (!(Number.isFinite(expiresAt) && now() + wait >= expiresAt)) {
+          resent++;
+          await sleep(wait);
+          continue;
+        }
+      }
+      const code = refusal?.code;
+      throw new OobRefusedError(typeof code === "string" ? code : "taskFailed", `${label}: refused (${String(code)})`);
+    }
+    break;
   }
   if (!res.ok) throw new OobRefusedError(`http-${res.status}`, `${label}: the community answered ${res.status}`);
   if (reply?.type !== responseType(doc.type)) {
@@ -625,7 +621,7 @@ export async function assertSignedByCommunity(
   const result = await verifyTrustTaskProof(reply as unknown as Record<string, unknown>, {
     expectedProofPurpose: purpose,
     resolveDid: async (did) => {
-      if (did !== vtcDid) throw new Error(`reply signed by ${did}, not the community`);
+      if (stripScidSrc(did) !== vtcDid) throw new Error(`reply signed by ${did}, not the community`);
       return vtcDocument;
     },
   });
@@ -638,7 +634,7 @@ export async function assertSignedByCommunity(
   const fragment = vm.slice(vm.indexOf("#"));
   const ok = listed.some((m) => {
     const id = typeof m === "string" ? m : (m as { id?: unknown })?.id;
-    return typeof id === "string" && (id === vm || id === fragment);
+    return typeof id === "string" && (sameReference(id, vm) || id === fragment);
   });
   if (!ok) throw new OobReplyInvalidError(`${label}: the signing key is not one of the community's ${purpose} keys`);
 }
@@ -666,22 +662,27 @@ export function checkStep1(step1: OobStep1, want: Step1Expectations): OobStep1 {
   if (step1.purpose !== "login") bad("a purpose other than login");
   if (step1.origin !== want.portalOrigin) bad("an origin the community's document does not list");
   if (sessionAudienceOf(step1) === undefined) bad("a session this wallet does not know");
-  const deadline = deadlineMs(step1.decisionDeadline);
+  const deadline = deadlineMs(step1.decisionClosesAt);
   if (deadline === undefined) bad("no decision deadline");
   if (deadline! <= want.now) bad("the decision deadline has passed");
   return step1;
 }
 
-/** A deadline as epoch milliseconds. Contract C9: integer epoch seconds
- *  only; anything else (RFC 3339 included) is `undefined`. */
+/** `decisionClosesAt` as epoch milliseconds: an RFC 3339 date-time with an
+ *  explicit offset (claim 0.2, prove 0.3), else `undefined`. A bare number —
+ *  the epoch seconds `decisionDeadline` carried before — is not one. */
 export function deadlineMs(value: unknown): number | undefined {
-  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value * 1000 : undefined;
+  if (typeof value !== "string" || !RFC3339.test(value)) return undefined;
+  const ms = Date.parse(value);
+  return Number.isFinite(ms) ? ms : undefined;
 }
+
+const RFC3339 = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/i;
 
 /** Step 2 must repeat step 1 unchanged, carry a `did:key` session key, and
  *  name the identity the member chose. */
 export function checkStep2(step2: OobStep2, step1: OobStep1, memberDid: string): OobStep2 {
-  const bad = (what: string) => {
+  const bad: (what: string) => never = (what) => {
     throw new OobReplyInvalidError(`step 2: ${what}`);
   };
   if (!step2 || typeof step2 !== "object") bad("no payload");
@@ -690,7 +691,7 @@ export function checkStep2(step2: OobStep2, step1: OobStep1, memberDid: string):
     service: s.service,
     origin: s.origin,
     purpose: s.purpose,
-    decisionDeadline: s.decisionDeadline,
+    decisionClosesAt: s.decisionClosesAt,
   });
   if (jcsCanonicalize(repeated(step2)) !== jcsCanonicalize(repeated(step1))) bad("it does not repeat step 1");
   // The audience the member approves is step 2's (the grant's
@@ -701,7 +702,9 @@ export function checkStep2(step2: OobStep2, step1: OobStep1, memberDid: string):
   }
   if (step2.identifiedAs !== memberDid) bad("a different identity");
   if (step2.signingScope !== undefined) {
-    const scope = step2.signingScope;
+    // Checked as what arrived, not as the schema's 1-to-8 tuple: this is the
+    // check that makes that type true.
+    const scope: unknown = step2.signingScope;
     if (!Array.isArray(scope) || scope.length === 0 || scope.length > 8 || new Set(scope).size !== scope.length) bad("a malformed signing scope");
     for (const f of scope) {
       if (typeof f !== "string" || !FAMILY.test(f)) bad("a malformed signing scope");

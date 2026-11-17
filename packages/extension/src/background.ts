@@ -15,7 +15,6 @@ import {
   pageTaskRefusal,
 } from "./page-task-policy.js";
 import {
-  APPROVE_RESPONSE_0_6,
   ISSUED_STATEMENT_TTL_MS,
   approverResponseRefusal,
   approverResponseStatementId,
@@ -24,6 +23,7 @@ import {
   decisionStatementId,
   decisionSummaryText,
   isApproverSignedDecision,
+  isApproverSignedResponse,
   pageApproverAudienceRefusal,
   type ApproverConsentRequest,
   type IssuedApproverStatement,
@@ -52,10 +52,21 @@ import { RoomPageGates, type PortLike } from "./room-page-background.js";
 import {
   DIRECTORY_CONSENT_PREFIX,
   DirectoryPageGates,
-  type DirectoryPublishConsentView,
+  MARKS_GRANT_PREFIX,
+  type DirectoryConsentView,
+  type MarksGrant,
 } from "./directory-page.js";
 import { MembershipPageGates } from "./membership-page.js";
 import { readAgreements } from "./agreements-store.js";
+import { GIT_CONSENT_PREFIX, GitPageGates, type GitConsentView } from "./git-page.js";
+import {
+  ELECTION_CONSENT_PREFIX,
+  ELECTION_PROGRESS_PREFIX,
+  ElectionsPageGates,
+  type ElectionConsentView,
+  type RememberedVote,
+} from "./elections-page.js";
+import { readCarriedHold } from "./star-hold-carried.js";
 import { RoomOffers, RoomOffersRefusal } from "./room-offers-background.js";
 import type { RoomOfferConsentView } from "./room-offers-policy.js";
 import {
@@ -167,6 +178,9 @@ import {
   RUNTIME_ROOM_FILES_PREPARE,
   RUNTIME_ROOMS_PAGE,
   RUNTIME_ROOM_OFFERS,
+  RUNTIME_NOTIFIED_ELECTION,
+  type RuntimeNotifiedElectionRequest,
+  type RuntimeNotifiedElectionResponse,
   OFFSCREEN_ROOM_OFFERS,
   type OffscreenRoomOffersResponse,
   type RuntimeRoomOffersRequest,
@@ -181,6 +195,14 @@ import {
   type OffscreenDirectoryPageResponse,
   type RuntimeDirectoryPageRequest,
   type RuntimeMembershipPageRequest,
+  RUNTIME_GIT_PAGE,
+  OFFSCREEN_GIT_PAGE,
+  type OffscreenGitPageResponse,
+  type RuntimeGitPageRequest,
+  RUNTIME_ELECTIONS_PAGE,
+  OFFSCREEN_ELECTIONS_PAGE,
+  type OffscreenElectionsPageResponse,
+  type RuntimeElectionsPageRequest,
   OFFSCREEN_ROOM_HOST_ENDPOINT,
   ROOM_FILES_PORT,
   type RuntimeRoomFilesPrepareRequest,
@@ -329,6 +351,7 @@ import {
   type RuntimeJoinCommunityRequest,
   type RuntimeJoinCommunityResponse,
 } from "./bridge-protocol.js";
+import { pageFailure } from "./page-error.js";
 import { failureLogFields } from "./sign-in-failure.js";
 import { communityDidFromText } from "./community-did.js";
 
@@ -900,7 +923,7 @@ const roomOffers = new RoomOffers({
       ...(vta.restBaseUrl ? { restBaseUrl: vta.restBaseUrl } : {}),
       params,
     })) as OffscreenRoomOffersResponse | undefined;
-    return reply ?? { ok: false, error: "the offscreen document did not answer" };
+    return reply ?? { ok: false, error: "the offscreen document did not answer", code: "walletUnavailable" };
   },
   canReach: (url) => hasOriginPermission(url),
   prompt: requestRoomConsent,
@@ -920,7 +943,7 @@ const roomPageGates = new RoomPageGates({
   offers: roomOffers,
   async active() {
     const active = await readActiveConnection();
-    if (!active.ok) return { ok: false, error: active.error };
+    if (!active.ok) return { ok: false, error: active.error, code: "notConnected" };
     return {
       ok: true,
       vta: { vtaDid: active.conn.vtaDid, ...(active.conn.restBaseUrl ? { restBaseUrl: active.conn.restBaseUrl } : {}) },
@@ -935,7 +958,7 @@ const roomPageGates = new RoomPageGates({
       ...(vta.restBaseUrl ? { restBaseUrl: vta.restBaseUrl } : {}),
       params,
     })) as OffscreenRoomsPageResponse | undefined;
-    return reply ?? { ok: false, error: "the offscreen document did not answer" };
+    return reply ?? { ok: false, error: "the offscreen document did not answer", code: "walletUnavailable" };
   },
   canReach: (url) => hasOriginPermission(url),
   async loadGrants(origin, vtaDid) {
@@ -970,22 +993,27 @@ const roomPageGates = new RoomPageGates({
 // one of the wallet's identities there, and the person approves every value in
 // the wallet's own window — are `directory-page.ts`; this wires them up.
 
-/** Raise the publish prompt and wait. Closed or unopened is a denial. */
-async function requestDirectoryConsent(view: DirectoryPublishConsentView): Promise<{ approved: boolean }> {
+/** Raise a directory prompt — publish, marks access, a credential to present —
+ *  and wait. Closed or unopened is a denial. */
+async function requestDirectoryConsent(
+  view: DirectoryConsentView,
+): Promise<{ approved: boolean; selectedCredential?: string }> {
   const consentId = crypto.randomUUID();
   await chrome.storage.session.set({ [`${DIRECTORY_CONSENT_PREFIX}${consentId}`]: view });
   const url = `${chrome.runtime.getURL("confirm.html")}?cid=${consentId}&kind=directory`;
   const bounds = await consentWindowBounds(620);
   return new Promise((resolve) => {
     let settled = false;
-    const settle = (approved: boolean) => {
+    const settle = (approved: boolean, selectedCredential?: string) => {
       if (settled) return;
       settled = true;
       pendingConsents.delete(consentId);
       void chrome.storage.session.remove(`${DIRECTORY_CONSENT_PREFIX}${consentId}`);
-      resolve({ approved });
+      resolve(approved ? { approved: true, ...(selectedCredential ? { selectedCredential } : {}) } : { approved: false });
     };
-    pendingConsents.set(consentId, (approved) => settle(approved));
+    pendingConsents.set(consentId, (approved, _remember, _prf, _did, _rooms, selectedCredential) =>
+      settle(approved, selectedCredential),
+    );
     openConsentWindow({ url, bounds, deny: () => settle(false), tag: "[pnm directory]", what: "directory window" });
   });
 }
@@ -993,7 +1021,7 @@ async function requestDirectoryConsent(view: DirectoryPublishConsentView): Promi
 const directoryPageGates = new DirectoryPageGates({
   async active() {
     const active = await readActiveConnection();
-    if (!active.ok) return { ok: false, error: active.error };
+    if (!active.ok) return { ok: false, error: active.error, code: "notConnected" };
     return {
       ok: true,
       vta: { vtaDid: active.conn.vtaDid, ...(active.conn.restBaseUrl ? { restBaseUrl: active.conn.restBaseUrl } : {}) },
@@ -1008,10 +1036,197 @@ const directoryPageGates = new DirectoryPageGates({
       ...(vta.restBaseUrl ? { restBaseUrl: vta.restBaseUrl } : {}),
       params,
     })) as OffscreenDirectoryPageResponse | undefined;
-    return reply ?? { ok: false, error: "the offscreen document did not answer" };
+    return reply ?? { ok: false, error: "the offscreen document did not answer", code: "walletUnavailable" };
   },
   canReach: (url) => hasOriginPermission(url),
   prompt: requestDirectoryConsent,
+  // The member's leave for a community's portal to show their marks: asked
+  // once, kept until they withdraw it (manager → People).
+  async marksGrant(hostDid) {
+    const key = `${MARKS_GRANT_PREFIX}${hostDid}`;
+    const got = (await chrome.storage.local.get(key)) as Record<string, unknown>;
+    return (got[key] as MarksGrant | undefined) ?? null;
+  },
+  async saveMarksGrant(grant) {
+    await chrome.storage.local.set({ [`${MARKS_GRANT_PREFIX}${grant.hostDid}`]: grant });
+  },
+  now: () => Date.now(),
+});
+
+// ── A page's `window.vtaWallet.git` ─────────────────────────────────────────
+//
+// Linking or unlinking the member's forge account from the community's portal.
+// The gates — the page is the portal by the community's DID document, the
+// member is one of the wallet's identities there, and the person approves in
+// the wallet's own window — are `git-page.ts`; this wires them up.
+
+/** Raise a git prompt and wait. Closed or unopened is a denial. */
+async function requestGitConsent(view: GitConsentView): Promise<{ approved: boolean }> {
+  const consentId = crypto.randomUUID();
+  await chrome.storage.session.set({ [`${GIT_CONSENT_PREFIX}${consentId}`]: view });
+  const url = `${chrome.runtime.getURL("confirm.html")}?cid=${consentId}&kind=git`;
+  const bounds = await consentWindowBounds(view.kind === "authorise" ? 460 : 520);
+  return new Promise((resolve) => {
+    let settled = false;
+    const settle = (approved: boolean) => {
+      if (settled) return;
+      settled = true;
+      pendingConsents.delete(consentId);
+      void chrome.storage.session.remove(`${GIT_CONSENT_PREFIX}${consentId}`);
+      resolve({ approved });
+    };
+    pendingConsents.set(consentId, (approved) => settle(approved));
+    openConsentWindow({ url, bounds, deny: () => settle(false), tag: "[pnm git]", what: "git window" });
+  });
+}
+
+const gitPageGates = new GitPageGates({
+  async active() {
+    const active = await readActiveConnection();
+    if (!active.ok) return { ok: false, error: active.error, code: "notConnected" };
+    return {
+      ok: true,
+      vta: { vtaDid: active.conn.vtaDid, ...(active.conn.restBaseUrl ? { restBaseUrl: active.conn.restBaseUrl } : {}) },
+    };
+  },
+  async offscreen(vta, params) {
+    await ensureOffscreenDocument();
+    const reply = (await chrome.runtime.sendMessage({
+      target: OFFSCREEN_TARGET,
+      type: OFFSCREEN_GIT_PAGE,
+      vtaDid: vta.vtaDid,
+      ...(vta.restBaseUrl ? { restBaseUrl: vta.restBaseUrl } : {}),
+      params,
+    })) as OffscreenGitPageResponse | undefined;
+    return reply ?? { ok: false, error: "the offscreen document did not answer", code: "walletUnavailable" };
+  },
+  canReach: (url) => hasOriginPermission(url),
+  prompt: requestGitConsent,
+  async openForge(url) {
+    await chrome.tabs.create({ url });
+  },
+  now: () => Date.now(),
+});
+
+// ── A page's `window.vtaWallet.elections` ───────────────────────────────────
+//
+// A member's elections from the community's portal: list, show, take a ticket,
+// vote. The gates — the page is the portal by the community's DID document, the
+// member is one of the wallet's identities there, a ticket or a ballot is
+// decided in the wallet's own window, and the page never sees a choice — are
+// `elections-page.ts`; this wires them up.
+
+/** Election windows still on screen, by consent id. A ballot window stays open
+ *  after its decision to show the cast's progress; it leaves this set when it
+ *  closes, and its progress key goes with it. */
+const openElectionWindows = new Set<string>();
+
+/** Raise an election window and wait for its decision. Closed or unopened is a
+ *  denial. A ballot window may stay open after deciding (`consent-result.ts`
+ *  `keepOpen`): its closing later settles nothing — the consent is settled — and
+ *  only ends its progress, never the cast. */
+async function requestElectionConsent(
+  view: ElectionConsentView,
+): Promise<{ approved: boolean; ballot?: unknown; window?: string }> {
+  const consentId = crypto.randomUUID();
+  await chrome.storage.session.set({ [`${ELECTION_CONSENT_PREFIX}${consentId}`]: view });
+  const url = `${chrome.runtime.getURL("confirm.html")}?cid=${consentId}&kind=election`;
+  const bounds = await consentWindowBounds(view.kind === "cast" || view.kind === "check" ? 460 : 640);
+  openElectionWindows.add(consentId);
+  return new Promise((resolve) => {
+    let settled = false;
+    const settle = (approved: boolean, ballot?: unknown) => {
+      if (settled) return;
+      settled = true;
+      pendingConsents.delete(consentId);
+      void chrome.storage.session.remove(`${ELECTION_CONSENT_PREFIX}${consentId}`);
+      resolve(approved && ballot !== undefined ? { approved, ballot, window: consentId } : { approved });
+    };
+    pendingConsents.set(consentId, (approved, _remember, _prf, _did, _rooms, _credential, ballot) => settle(approved, ballot));
+    openConsentWindow({
+      url,
+      bounds,
+      // Called when the window is gone (or never opened), settled or not.
+      deny: () => {
+        openElectionWindows.delete(consentId);
+        void chrome.storage.session.remove(`${ELECTION_PROGRESS_PREFIX}${consentId}`);
+        settle(false);
+      },
+      tag: "[pnm elections]",
+      what: "election window",
+    });
+  });
+}
+
+/** `chrome.storage.local` key prefix for when this wallet took a ticket. A
+ *  time, never a choice: it lets the ballot window warn a vote straight after. */
+const ELECTION_TICKET_PREFIX = "election-ticket:";
+
+/** `chrome.storage.local` key prefix for a vote this wallet cast: when, and the
+ *  ballot box's outcome and board entry — never a choice. Only the wallet's own
+ *  ballot window reads it; the page is never told. */
+const ELECTION_VOTE_PREFIX = "election-vote:";
+
+/** `chrome.storage.local` key prefix for the party a member chose to present
+ *  their membership of, to read an election put to that party's members
+ *  (VTI-VOT-015, VTI-VOT-016). The party's DID only — never the credential: the
+ *  community learnt the membership when it was first presented, so later reads
+ *  of the same election present it without asking again. */
+const ELECTION_DISCLOSED_PREFIX = "election-disclosed:";
+
+const electionsPageGates = new ElectionsPageGates({
+  async active() {
+    const active = await readActiveConnection();
+    if (!active.ok) return { ok: false, error: active.error, code: "notConnected" };
+    return {
+      ok: true,
+      vta: { vtaDid: active.conn.vtaDid, ...(active.conn.restBaseUrl ? { restBaseUrl: active.conn.restBaseUrl } : {}) },
+    };
+  },
+  async offscreen(vta, params) {
+    await ensureOffscreenDocument();
+    const reply = (await chrome.runtime.sendMessage({
+      target: OFFSCREEN_TARGET,
+      type: OFFSCREEN_ELECTIONS_PAGE,
+      vtaDid: vta.vtaDid,
+      ...(vta.restBaseUrl ? { restBaseUrl: vta.restBaseUrl } : {}),
+      params,
+    })) as OffscreenElectionsPageResponse | undefined;
+    return reply ?? { ok: false, error: "the offscreen document did not answer", code: "walletUnavailable" };
+  },
+  canReach: (url) => hasOriginPermission(url),
+  prompt: requestElectionConsent,
+  async ticketTakenAt(key) {
+    const k = `${ELECTION_TICKET_PREFIX}${key}`;
+    const v = (await chrome.storage.local.get(k))[k];
+    return typeof v === "number" ? v : undefined;
+  },
+  async rememberTicket(key, at) {
+    await chrome.storage.local.set({ [`${ELECTION_TICKET_PREFIX}${key}`]: at });
+  },
+  async progress(window, state) {
+    if (!openElectionWindows.has(window)) return false;
+    await chrome.storage.session.set({ [`${ELECTION_PROGRESS_PREFIX}${window}`]: state });
+    return true;
+  },
+  async votedAt(key) {
+    const k = `${ELECTION_VOTE_PREFIX}${key}`;
+    const v = (await chrome.storage.local.get(k))[k] as Partial<RememberedVote> | undefined;
+    return v && typeof v.at === "number" && typeof v.status === "string"
+      ? { at: v.at, status: v.status, ...(typeof v.leafIndex === "number" ? { leafIndex: v.leafIndex } : {}) }
+      : undefined;
+  },
+  async rememberVote(key, vote) {
+    await chrome.storage.local.set({ [`${ELECTION_VOTE_PREFIX}${key}`]: vote });
+  },
+  async disclosedFor(key) {
+    const k = `${ELECTION_DISCLOSED_PREFIX}${key}`;
+    const v = (await chrome.storage.local.get(k))[k];
+    return typeof v === "string" ? v : undefined;
+  },
+  async rememberDisclosure(key, memberOf) {
+    await chrome.storage.local.set({ [`${ELECTION_DISCLOSED_PREFIX}${key}`]: memberOf });
+  },
   now: () => Date.now(),
 });
 
@@ -1038,6 +1253,7 @@ const membershipPageGates = new MembershipPageGates({
     return reply ?? { ok: false, error: "the offscreen document did not answer" };
   },
   agreements: (vtaDid) => readAgreements(vtaDid),
+  hold: () => readCarriedHold(),
   now: () => Date.now(),
 });
 
@@ -2306,7 +2522,7 @@ async function handleDeriveSigningKeyId(
  * expiry)`, rememberable only for tasks the VTA classifies `sideEffects: none`.
  * Until those exist, ask.
  */
-/** `https://trusttasks.org/spec/webvh/dids/update/1.0` → `webvh/dids/update`.
+/** `https://trusttasks.org/spec/vta/webvh/dids/update/1.1` → `vta/webvh/dids/update`.
  *  A readable short label for prompt copy; falls back to the full URI. */
 function taskLabel(typeUri: string): string {
   const m = /\/spec\/(.+)\/[\d.]+$/.exec(typeUri);
@@ -2507,7 +2723,7 @@ async function handleSignTrustTask(
 ): Promise<RuntimeSignTrustTaskResponse> {
   const active = await readActiveConnection();
   if (!active.ok) return { ok: false, error: active.error };
-  if ((req.params.envelope as { type?: unknown } | undefined)?.type === APPROVE_RESPONSE_0_6) {
+  if (isApproverSignedResponse(req.params.envelope)) {
     return handleSignApproverResponse(req, active.conn.vtaDid, active.conn.restBaseUrl);
   }
   if (isApproverSignedDecision(req.params.envelope)) {
@@ -2830,7 +3046,7 @@ async function handleSignApproverDecision(
   })) as RuntimeSignTrustTaskResponse;
 }
 
-// The approve-response 0.6 around a statement `approveStepUp` just issued. It
+// The approve-response 0.7 around a statement `approveStepUp` just issued. It
 // is the ceremony's second half, so it is signed without a second prompt — the
 // human approved this operation on the approver prompt a moment ago — but only
 // when it carries that statement unchanged, for the same origin, relying party,
@@ -3562,7 +3778,7 @@ const SIGN_IN_FLOW_PREFIX = "sign-in-flow:";
  *  or pasted (`RUNTIME_JOIN_COMMUNITY`). Both are the worker's own record; the
  *  window names only the flow id. */
 type SignInFlowRecord =
-  | { link: string; origin: string }
+  | { link: string; origin: string; intent?: "join" }
   | { joinDid: string; joinSource: RuntimeJoinCommunityRequest["source"] };
 
 /**
@@ -3610,7 +3826,11 @@ async function handleTriggerLink(msg: RuntimeTriggerLinkRequest, tabId: number |
     return;
   }
   const flowId = crypto.randomUUID();
-  const record: SignInFlowRecord = { link: msg.link, origin: msg.origin };
+  const record: SignInFlowRecord = {
+    link: msg.link,
+    origin: msg.origin,
+    ...(msg.intent === "join" ? { intent: "join" as const } : {}),
+  };
   await chrome.storage.session.set({ [`${SIGN_IN_FLOW_PREFIX}${flowId}`]: record });
   const url = `${chrome.runtime.getURL("confirm.html")}?kind=sign-in&flow=${flowId}`;
   const bounds = await consentWindowBounds(660, 560);
@@ -3709,11 +3929,17 @@ async function handleSignInStep(msg: RuntimeSignInStepRequest): Promise<RuntimeS
     flowId,
     vtaDid: active.conn.vtaDid,
     ...(active.conn.restBaseUrl ? { restBaseUrl: active.conn.restBaseUrl } : {}),
-    // From the worker's own record, on the first step only.
+    // From the worker's own record, on the first step only — with what the
+    // page's origin is pinned to, so the flow can show a changed pairing (M5).
     ...(msg.step !== "prepare"
       ? {}
       : "link" in record
-        ? { link: record.link, origin: record.origin }
+        ? {
+            link: record.link,
+            origin: record.origin,
+            ...(await signInPinnedDid(record.origin)),
+            ...(record.intent ? { intent: record.intent } : {}),
+          }
         : { joinDid: record.joinDid, joinSource: record.joinSource }),
   } as OffscreenSignInStepRequest;
   const res = (await chrome.runtime.sendMessage(forward)) as RuntimeSignInStepResponse;
@@ -3722,6 +3948,9 @@ async function handleSignInStep(msg: RuntimeSignInStepRequest): Promise<RuntimeS
   // link, the origin, a key or a message body (VTI-LNK-073).
   if (res?.ok && res.result.kind === "failed") {
     console.warn("[pnm sign-in] step failed", failureLogFields(msg.step, res.result));
+  }
+  if (res.ok && res.result.kind === "done" && res.result.decision === "approve") {
+    await pinSignInOrigin(record);
   }
   if (res.ok && (res.result.kind === "done" || res.result.kind === "refused" ||
       res.result.kind === "not-member" ||
@@ -3733,6 +3962,37 @@ async function handleSignInStep(msg: RuntimeSignInStepRequest): Promise<RuntimeS
     await chrome.storage.session.remove(key);
   }
   return res;
+}
+
+/** The relying party a sign-in flow's page origin is pinned to, for `prepare`;
+ *  nothing when the click carried no origin or the origin has no pin. */
+async function signInPinnedDid(origin: string | undefined): Promise<{ pinnedDid?: string }> {
+  if (!origin) return {};
+  const pin = await readOriginPin(origin);
+  return pin ? { pinnedDid: pin.rpDid } : {};
+}
+
+/**
+ * An approved trigger-link sign-in pins the page's origin to the community it
+ * signed in to, as the page-bridge logins pin theirs on approval (`origin-pin.ts`,
+ * M5). The pin is what the page's later `signTrustTask` is bound to
+ * (`pageSignBindingRefusal`): without it, a console that signed its operator in
+ * this way could never enrol a signing key, since nothing but a login seeds a
+ * pin (#377).
+ *
+ * The pairing is the one the flow verified: `record.origin` is the browser's
+ * word for where the click came from, the flow refused unless that is the
+ * portal the community's own DID document names (VTI-LNK-105), and the link's
+ * `from` is the community it signed in to. Parsed with `now: 0`, as
+ * `handleTriggerLinkNumber` does — the flow has already judged expiry, and a
+ * link that lapsed while the person approved still names the community.
+ */
+async function pinSignInOrigin(record: SignInFlowRecord): Promise<void> {
+  // A join by DID (Star Key) has no link and no page origin to pin.
+  if (!("link" in record) || !record.origin) return;
+  const parsed = parseTriggerLink(record.link, { now: 0 });
+  if (!parsed.ok) return;
+  await pinOrigin(record.origin, parsed.link.from.value);
 }
 
 
@@ -3796,7 +4056,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       console.warn(
         `[background] rejecting page-facing ${msgType} with no browser-attested origin`,
       );
-      sendResponse({ ok: false, error: "no attested origin" });
+      sendResponse({ ok: false, error: "no attested origin", code: "originNotPermitted" });
       return false;
     }
     (message as { origin?: string }).origin = attested;
@@ -3867,7 +4127,27 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     directoryPageGates
       .handle(req.origin, req.params)
       .then(sendResponse)
-      .catch((e: unknown) => sendResponse({ ok: false, error: e instanceof Error ? e.message : String(e) }));
+      .catch((e: unknown) => sendResponse(pageFailure(e)));
+    return true; // async sendResponse
+  }
+
+  if (msgType === RUNTIME_GIT_PAGE) {
+    const req = message as RuntimeGitPageRequest;
+    // `origin` was overwritten above with the browser-attested one.
+    gitPageGates
+      .handle(req.origin, req.params)
+      .then(sendResponse)
+      .catch((e: unknown) => sendResponse(pageFailure(e)));
+    return true; // async sendResponse
+  }
+
+  if (msgType === RUNTIME_ELECTIONS_PAGE) {
+    const req = message as RuntimeElectionsPageRequest;
+    // `origin` was overwritten above with the browser-attested one.
+    electionsPageGates
+      .handle(req.origin, req.params)
+      .then(sendResponse)
+      .catch((e: unknown) => sendResponse(pageFailure(e)));
     return true; // async sendResponse
   }
 
@@ -3887,7 +4167,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     roomPageGates
       .handle(req.origin, req.params)
       .then(sendResponse)
-      .catch((e: unknown) => sendResponse({ ok: false, error: e instanceof Error ? e.message : String(e) }));
+      .catch((e: unknown) => sendResponse(pageFailure(e)));
     return true; // async sendResponse
   }
 
@@ -4149,6 +4429,27 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       .catch((e: unknown) =>
         sendResponse({ ok: false, error: e instanceof Error ? e.message : String(e) }),
       );
+    return true; // async sendResponse
+  }
+
+  if ((message as { type?: string })?.type === RUNTIME_NOTIFIED_ELECTION) {
+    // Console only: the wallet's own notifications view. A portal reaches its
+    // community's elections, notified ones included, through
+    // `window.vtaWallet.elections`, whose gates hold it to that community.
+    if (!isExtensionPageSender(sender)) {
+      console.warn(`[background] rejecting ${RUNTIME_NOTIFIED_ELECTION} from non-extension sender url=${sender.url}`);
+      sendResponse({ ok: false, error: "notified elections are not page-reachable" } satisfies RuntimeNotifiedElectionResponse);
+      return false;
+    }
+    const { params } = message as RuntimeNotifiedElectionRequest;
+    if (!params || typeof params.contextId !== "string" || typeof params.recordId !== "string") {
+      sendResponse({ ok: false, error: "name the notification by its context and record" } satisfies RuntimeNotifiedElectionResponse);
+      return false;
+    }
+    electionsPageGates
+      .openNotified({ contextId: params.contextId, recordId: params.recordId, present: params.present === true })
+      .then(sendResponse)
+      .catch((e: unknown) => sendResponse({ ok: false, error: e instanceof Error ? e.message : String(e) }));
     return true; // async sendResponse
   }
 

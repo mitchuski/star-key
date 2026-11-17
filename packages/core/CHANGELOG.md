@@ -10,6 +10,124 @@ For history before this file, see `git log` on `packages/core`.
 
 ### Added
 
+- **Checking a vote after close** (VTI-VOT-053). `pcsVoterReceiptsList`
+  (`vta/pcs/voter/receipts/list/0.1`) reads the receipts the member's VTA
+  keeps for an election and its ballot box; `fetchInclusion` asks the ballot
+  box, from the wallet's own connection and unsigned, for a cast's
+  `voting/board/inclusion` proof, with the receipt's token, and asks nothing
+  for a head too small to hold the cast; `closingCheckpoint` picks the head
+  the community kept at close from a `show` or a tombstone; and
+  `pcsVoterReceipt` takes that checkpoint and proof as `evidence`.
+  `pcsVoterRead` signs a `tombstone` read
+  (`vtc/elections/tombstones/show/0.1`, VTI-BRD-009) through
+  `vta/pcs/voter/read/0.7`, which every read now uses: the lock pins one
+  version of a task, so `list` and `show` move from 0.6 too, and the wallet
+  needs a VTA that serves read 0.7. `voting/board/inclusion/0.1` is pinned.
+
+- **The reading rules for a room's records** (`SealedRecordBody` at
+  `rooms/_shared/0.2`, trust-tasks-tf #1027). `verifyRecordBody` accepts
+  `kind`, `inReplyTo`, `writtenAt` and `editedAt` with the schema's shapes, and
+  a profile's `recordMembers`. It checks the author's proof against the DID
+  document as it stood at the host's `bodyStoredAt` where `resolveDidAt` can
+  resolve it then; otherwise it uses the current document, and a proof that
+  fails there, or an author whose DID does not resolve, comes back as a
+  placeholder (`RecordBodyError.placeholder`, kinds `authorUnverifiable` and
+  `authorUnresolvable`) rather than a refusal. A `did:key` document cannot
+  change, so a proof that fails against it is refused. The new
+  `assembleRoomRecords` (`rooms/record-view`) turns verified records into what
+  a reader shows: notes and messages by `kind`; replies marked when their
+  target is not available; reactions counted once per author, value and
+  target, with values normalised to NFC and VS15/VS16 removed; withdrawn
+  messages; tombstones placed by the version held; ordering by `writtenAt`,
+  with implausible and backdated (more than 24 hours) claims ordered by
+  `createdAt`; `editedAt`; and records past `validUntil` hidden. Also new:
+  `roomsKeysReadMany`, a batch read of up to 32 keys a request
+  (`rooms/keys/read/0.2`).
+
+- **A DID document as it stood at an instant** (`@openvtc/pnm-core/did`).
+  `resolveDidDocumentAt(did, at)` resolves a `did:webvh` or `did:scid:vh:1`
+  with `versionTime` after the same host guard as a current resolution; it
+  answers `null` where the DID's history holds no document at `at`
+  (`E_DID_VERSION_NOT_FOUND`, matched on the code) and `undefined` for a method
+  without history. `memoResolveDidDocumentAt()` answers each DID and instant
+  once, for one render or batch: a historical resolution re-fetches and
+  re-verifies the whole log. Requires `@openvtc/vti-didcomm-js` ^0.14.0.
+
+- **`@openvtc/pnm-core/notifications`: the principal's held notifications**
+  (VTI-NTF-050 – 056). `notificationsList` / `notificationsListAll`,
+  `notificationsShow` (the delivering document as received) and
+  `notificationsDismiss`; `notificationsDeposit` hands a notify or relay a
+  client received for a persona DID to its VTA unchanged (VTI-NTF-054), with
+  `inboundNotificationOf` to recognise one and `notificationReceiptOf` for the
+  receipt its sender is answered with; `notifiedElectionOf` reduces a held
+  notification of the kind `election` to what VTI-NTF-063 lets an agent show
+  before it is opened. Pins `notifications/{notify,relay}/0.1` and
+  `vta/notifications/{list,show,dismiss,deposit}/0.1`; `task-surface.json`
+  resynced from vta-sdk 0.79.0.
+
+- **`webvhDidUpdate` speaks `vta/webvh/dids/update/1.1`** and takes
+  `scidAlsoKnownAs`: `true` lists the log's `did:scid:vh:1:<scid>?src=<source>`
+  DID URL in `alsoKnownAs` for its current location, `false` removes every
+  did:scid entry for its SCID (sent explicitly, never dropped as silence). The
+  agent derives the DID URL; the response reports it as `scidDidUrl`, beside
+  `scidAlsoKnownAs`. Pins `vta/webvh/dids/update/1.1` in place of 1.0.
+
+- **Files in open rooms.** `putRoomFile` seals an open room's file under a key
+  minted for it alone and writes `rooms/records/put/0.4`, the manifest and its
+  `fileKey` in `cleartext.file`; `getRoomFile` opens it with that key, refusing
+  an open manifest without one and a sealed one with one. `RoomFileGot.signed`
+  says whether the author signed the record — false on an open room. The
+  `openRoom` refusal is gone from `RoomFileError`.
+- **`putCleartextAsMember` takes a `file`** — its manifest and `blobRef` —
+  and writes it at `rooms/records/put/0.4`, naming exactly that blob.
+- **`roomsKeysAct` completes `rooms/records/put/0.4` at `rooms/keys/act/0.9`**,
+  the one type 0.8's table lacks (`actVersionFor`); every other request stays at
+  0.8. Pins `rooms/keys/act/0.9` and `rooms/records/put/0.4`.
+
+- **`putCleartextAsMember` writes a whole open-room note.** It takes the
+  cleartext's `description` and `tags`, and always sends a `body` — required by
+  `rooms/records/put/0.3` — empty when the note has none.
+
+- **did:scid contacts and DIDs, used natively.** A trigger link's `_from` may
+  be a `did:scid:vh:1:<scid>?src=<host>[/<path>]` DID URL: it is host-named
+  (route A, VTI-LNK-119), shown as its `src` host and path (VTI-LNK-050),
+  resolved through that DID URL with the `src` host guarded like a did:webvh
+  host (`assertResolvableScidHost`), and recorded and addressed as the bare
+  `did:scid:vh:1:<scid>` (`contactIdentity`, `didIdentity`). A bare did:scid
+  `_from` names no host and is `from-not-allowed`; another did:scid format is
+  `unsupported-vid`. `verifyDid` and `deriveSigningKeyId` take did:scid
+  (`DidMethod` gains `"scid"`, `didScidDomain`). Needs `@openvtc/vti-didcomm-js`
+  with did:scid support.
+- `SCID_CONTACT_POLICY`, `SCID_CONTACT_METHOD`; a contact policy may say
+  `supports(did)` (false is `unsupported-vid`), and a host-named contact whose
+  `hostPath` names no host has no route.
+
+### Changed
+
+- **Room record bodies are checked against the author's DID document as of
+  `bodyStoredAt`.** The file engine, and the wallet's records pane and page
+  bridge, pass `resolveDidAt` to `verifyRecordBody`, so for a `did:webvh` or
+  `did:scid:vh:1` author a proof that fails as of the host's `bodyStoredAt` is
+  refused (`signature`), and a proof made before a key rotation still reads.
+  `ResolveDidAt` may answer `null` — the author had no document then — which
+  is refused as `signature`, as is a throw carrying
+  `code: "E_DID_VERSION_NOT_FOUND"`. The placeholder stays where
+  `bodyStoredAt` is absent or the method keeps no history.
+  `RoomFileContext.resolveDidAt` lets a caller share one memo across files.
+
+- Rooms reads move to the versions that carry the host's `createdAt`,
+  `createdBy` and `bodyStoredAt`: `rooms/keys/browse/0.4`, `rooms/keys/read/0.2`,
+  `rooms/records/list/0.6` and `rooms/records/get/0.3`, with every request made
+  as the member completed by `rooms/keys/act/0.11`. The pins replace
+  browse/0.3, read/0.1, list/0.5, get/0.2 and act/0.10. `task-surface.json` is
+  resynced from vta-sdk 0.81.0.
+
+- `verifyTrustTaskProof` attributes a proof to its verification method's DID
+  without a did:scid `src` (`signer` is the identity) and matches the key and
+  its relationship by DID and fragment, ignoring that `src`. A community's
+  reply signed under `did:scid:…?src=…#key` is checked against the community's
+  identity the same way.
+
 - **`@openvtc/pnm-core/rooms/files`** — room files, for a wallet's offscreen
   document (it names `rooms/keys/file-key`, so a console must not import it).
   The host's blob tasks (`rooms/blobs/*`, `rooms/info`, `rooms/records/{get,put}/0.2`,
@@ -35,6 +153,13 @@ For history before this file, see `git log` on `packages/core`.
   whose `details.code` is the report's descriptor, instead of a parse error.
 
 ### Changed
+
+- **TSP 1.0 (breaking on the wire).** Requires `@openvtc/vti-tsp-js` ^0.4.0,
+  which speaks TSP 1.0 (`YTSP-BAA`) and refuses the Rev 2 and Rev 3 drafts as
+  `E_TSP_REVISION`. The TSP channel and inbound path therefore cannot exchange
+  messages with a VTA on `affinidi-tsp` 0.2.x or earlier; the VTA moves to
+  `affinidi-tsp` 0.3 (`affinidi-messaging-sdk` 0.39) in the same cutover.
+  `unpack` no longer takes the sender's X25519 key, which only Rev 2 used.
 
 - **What the executors push and reply is verified under `authentication`.**
   `verifyTrustTaskProof` with `expectedProofPurpose` now also requires the
@@ -105,6 +230,16 @@ For history before this file, see `git log` on `packages/core`.
   set should send, carrying any additive grant through.
 
 ### Fixed
+
+- **`verifyRecordBody` accepts every member of the released `SealedRecordBody`**
+  (`rooms/_shared/0.2`): `basis`, `confidence`, `evidence`, `validFor`,
+  `validUntil` and `roomProfile` beside the earlier nine, each checked against
+  the shape the schema gives it, and a profile record carrying a record's
+  members refused. Previously a body carrying any of them was refused as
+  malformed. `signRecordBody` writes them. The verifier now lives in
+  `rooms/record-body` and is exported from `@openvtc/pnm-core/rooms` (still
+  re-exported from `rooms/files`), with `RECORD_BODY_MEMBERS`, and
+  `readSealedVersion` gives the version a `rooms/keys/read` body was sealed at.
 
 - **A relayed task outlasts the VTA.** Tasks the VTA answers by waiting on a
   third party — `vta/webvh/dids/create` and the other server-managed did:webvh

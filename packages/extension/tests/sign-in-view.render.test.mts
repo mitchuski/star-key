@@ -184,6 +184,74 @@ test("one identity and the page's number: straight from the code to the review",
   await screen.unmount();
 });
 
+test("one identity, but the page was pinned to another community: the screen is shown, with the warning", async () => {
+  const { steps, send } = script({
+    ...RESULTS,
+    prepare: {
+      ...(RESULTS.prepare as Extract<SignInStepResult, { kind: "confirm" }>),
+      identities: [{ entryId: "e1", did: "did:web:alice.example", label: "Alice" }],
+      changedFromDid: "did:webvh:QmOther:members.example.org",
+    },
+  });
+  const screen = await render(
+    h(SignInView, { flowId: "f", send, uv: ENROLLED_UV, close: () => {} }),
+  );
+  await screen.settle();
+  assert.deepEqual(steps, [{ step: "prepare" }], "no claim goes out on its own");
+  assert.ok(screen.container.querySelector('[data-testid="continue"]'), "the person continues, or not");
+  assert.ok(screen.container.querySelector('[data-testid="changed-from"]'));
+  assert.match(screen.text(), /signed you in to a different community before/);
+  await screen.unmount();
+});
+
+test("one identity that was already a member: the screen says so, and waits for the person", async () => {
+  const { steps, send } = script({
+    ...RESULTS,
+    prepare: {
+      ...(RESULTS.prepare as Extract<SignInStepResult, { kind: "confirm" }>),
+      identities: [{ entryId: "e1", did: "did:web:alice.example", label: "Alice" }],
+      alreadyMember: true,
+    },
+  });
+  const screen = await render(
+    h(SignInView, { flowId: "f", send, uv: ENROLLED_UV, close: () => {} }),
+  );
+  await screen.settle();
+  assert.deepEqual(steps, [{ step: "prepare" }], "no claim goes out on its own");
+  assert.ok(screen.container.querySelector('[data-testid="already-member"]'));
+  assert.match(screen.text(), /already a member of Example Community, so no request was sent/);
+  await screen.unmount();
+});
+
+test("a member's code from the join page: the screen waits, and offers joining with a new identity", async () => {
+  const { steps, send } = script({
+    ...RESULTS,
+    prepare: {
+      ...(RESULTS.prepare as Extract<SignInStepResult, { kind: "confirm" }>),
+      identities: [{ entryId: "e1", did: "did:web:alice.example", label: "Alice" }],
+      joinOffered: true,
+    },
+    "join-new": {
+      kind: "join-apply",
+      host: "members.example.org",
+      portalOrigin: PORTAL,
+      admission: "review",
+      attributes: [],
+      identities: [],
+      newIdentity: { contextId: "vtc-members-example-org-2", servers: [{ id: "host-1" }] },
+    } as SignInStepResult,
+  });
+  const screen = await render(
+    h(SignInView, { flowId: "f", send, uv: ENROLLED_UV, close: () => {} }),
+  );
+  await screen.settle();
+  assert.deepEqual(steps, [{ step: "prepare" }], "no claim goes out on its own");
+  assert.match(screen.text(), /already a member of Example Community/);
+  await screen.click(screen.container.querySelector('[data-testid="join-new"]')!);
+  assert.deepEqual(steps[1], { step: "join-new" });
+  await screen.unmount();
+});
+
 test("one identity, no number from the page: the number screen, without the identity screen", async () => {
   const { steps, send } = script({
     ...RESULTS,
@@ -890,6 +958,56 @@ test("an unknown community: join offer, what it asks, the request, and Request s
   assert.match(screen.text(), /Request sent/);
   assert.match(screen.text(), /You can sign in once members\.example\.org approves it/);
   assert.equal(steps.length, 3, "nothing else is sent");
+  await screen.unmount();
+});
+
+test("a new identity is offered first and preselected, and the request asks the agent to make it", async () => {
+  const { steps, send } = script({
+    ...VTC_JOIN,
+    "join-manifest": {
+      ...(VTC_JOIN["join-manifest"] as Extract<SignInStepResult, { kind: "join-apply" }>),
+      attributes: [],
+      newIdentity: { contextId: "vtc-members-example-org", servers: [{ id: "host-1" }, { id: "host-2", label: "Backup" }] },
+    },
+  });
+  const screen = await render(h(SignInView, { flowId: "f", send, allowOrigins: async () => true, close: () => {} }));
+  await screen.settle();
+  await screen.click(screen.container.querySelector('[data-testid="join-manifest"]')!);
+  const radios = screen.container.querySelectorAll<HTMLInputElement>('input[name="applicant"]');
+  assert.equal(radios.length, 3);
+  assert.equal(radios[0]!.checked, true, "the new identity is the default");
+  assert.match(screen.container.querySelector('[data-testid="new-identity"]')!.textContent!, /A new identity for members\.example\.org.*vtc-members-example-org/);
+  const server = screen.container.querySelector<HTMLSelectElement>('[data-testid="new-identity-server"]')!;
+  assert.equal(server.value, "host-1");
+  server.value = "host-2";
+  server.dispatchEvent(new Event("change", { bubbles: true }));
+  await screen.settle();
+  assert.match(screen.text(), /Once an administrator approves it, sign in/);
+  await screen.click(screen.container.querySelector('[data-testid="join-submit"]')!);
+  assert.deepEqual(steps[2], {
+    step: "join-submit",
+    newIdentity: { serverId: "host-2" },
+    attributes: [],
+    registryConsent: false,
+  });
+  await screen.unmount();
+});
+
+test("with no hosting server, the new identity is shown but can't be chosen", async () => {
+  const { send } = script({
+    ...VTC_JOIN,
+    "join-manifest": {
+      ...(VTC_JOIN["join-manifest"] as Extract<SignInStepResult, { kind: "join-apply" }>),
+      newIdentity: { contextId: "vtc-members-example-org", servers: [] },
+    },
+  });
+  const screen = await render(h(SignInView, { flowId: "f", send, allowOrigins: async () => true, close: () => {} }));
+  await screen.settle();
+  await screen.click(screen.container.querySelector('[data-testid="join-manifest"]')!);
+  const radios = screen.container.querySelectorAll<HTMLInputElement>('input[name="applicant"]');
+  assert.equal(radios[0]!.disabled, true);
+  assert.equal(radios[0]!.checked, false);
+  assert.match(screen.text(), /no DID hosting server/);
   await screen.unmount();
 });
 

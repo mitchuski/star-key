@@ -7,24 +7,39 @@
 // value in place while the screen says it was cleared.
 //
 // **A context's list says which entries were granted in it.** `acl/list`
-// filtered by scope rightly returns agent-wide entries too, and shown as one
-// list under the context's name those read as granted there.
+// filtered by context `actingIn` rightly returns agent-wide entries too, and
+// shown as one list under the context's name those read as granted there.
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { agent, h, render, PARTIES } from "./harness/dom.mjs";
-import { AccessPane, aclEditToSend, partitionByContext } from "../src/manager/panes/access.js";
+import { AccessPane, aclEditToSend, grantEntry, partitionByContext } from "../src/manager/panes/access.js";
 
-const LIST = "acl/list/0.1";
-const UPDATE = "acl/update/0.1";
+const LIST = "acl/list/0.3";
+const UPDATE = "acl/update/0.2";
+const GRANT = "acl/grant/0.2";
 
-const SCOPED = { subject: "did:key:zScoped", role: "initiator", scopes: ["browser-plugin"] };
-const GLOBAL = { subject: "did:key:zGlobal", role: "admin", label: "Browser Plugin" };
+/** Every 0.2 entry states its act, key and capability scopes. */
+const REACH = { keys: { scope: "all" }, capabilities: { scope: "ceiling" } };
+const SCOPED = {
+  subject: "did:key:zScoped",
+  role: "initiator",
+  act: { scope: "contexts", contexts: ["browser-plugin"] },
+  ...REACH,
+};
+const GLOBAL = {
+  subject: "did:key:zGlobal",
+  role: "admin",
+  label: "Browser Plugin",
+  act: { scope: "all" },
+  ...REACH,
+};
 
 const mount = async (entries: unknown[], contextId: string | null) => {
   const a = agent({
     [LIST]: { entries },
     [UPDATE]: (p: { subject: string }) => ({ entry: { subject: p.subject, role: "admin" } }),
+    [GRANT]: (p: { entry: unknown }) => ({ entry: p.entry }),
   });
   const screen = await render(
     h(AccessPane, { parties: PARTIES, authority: null, contextId } as never),
@@ -61,9 +76,13 @@ test("a field that was empty and stays empty is omitted, not nulled", () => {
 
 // ── partitionByContext ─────────────────────────────────────────────────────
 
-test("membership comes from the entry's scopes, not the filter that returned it", () => {
+test("membership comes from the entry's act scope, not the filter that returned it", () => {
   const { granted, inherited } = partitionByContext(
-    [SCOPED, GLOBAL, { subject: "did:key:zOther", role: "reader", scopes: ["parent"] }] as never,
+    [
+      SCOPED,
+      GLOBAL,
+      { subject: "did:key:zOther", role: "reader", act: { scope: "contexts", contexts: ["parent"] }, ...REACH },
+    ] as never,
     "browser-plugin",
   );
   assert.deepEqual(granted.map((e) => e.subject), ["did:key:zScoped"]);
@@ -81,6 +100,19 @@ test("a selected context separates what was granted in it from what reaches it",
   // Scoped entry sits above the heading for the outside group; global below it.
   assert.ok(text.indexOf("zScoped") < text.indexOf("From outside"));
   assert.ok(text.indexOf("zGlobal") > text.indexOf("From outside"));
+});
+
+test("a selected context is asked for actingIn — acl/list/0.3 has no default direction", async () => {
+  const { a } = await mount([SCOPED], "browser-plugin");
+  assert.deepEqual(a.of(LIST)[0]!.payload, { context: "browser-plugin", direction: "actingIn" });
+});
+
+test("act all and act none are both said, and neither reads as the other", async () => {
+  const NOWHERE = { ...SCOPED, subject: "did:key:zNowhere", role: "reader", act: { scope: "none" } };
+  const { screen } = await mount([GLOBAL, NOWHERE], null);
+  const text = screen.text();
+  assert.match(text, /everywhere/);
+  assert.match(text, /nowhere/);
 });
 
 test("a context with only agent-wide entries says nobody was granted in it", async () => {
@@ -138,4 +170,65 @@ test("clearing an expiry warns that it becomes a standing grant", async () => {
   await screen.click(screen.button("Edit…"));
   await screen.type(inputs(screen)[1]!, "");
   assert.match(screen.text(), /Clearing the expiry makes this a standing grant/);
+});
+
+// ── Granting ───────────────────────────────────────────────────────────────
+//
+// An unscoped grant on a role the agent holds `all` for only on `admin` is
+// refused (`invalidActScope`), and the form must not answer that by deriving
+// `none` from the role. "Approve only" is the explicit way to say nowhere: the
+// least-privilege approver, with the approve scope where act would have been.
+
+test("an act grant reaches the selected context and approves nothing", () => {
+  assert.deepEqual(
+    grantEntry({ subject: "did:key:zA", role: "initiator", contextId: "demo", reach: "act" }),
+    {
+      subject: "did:key:zA",
+      role: "initiator",
+      act: { scope: "contexts", contexts: ["demo"] },
+      approve: { scope: "none" },
+      keys: { scope: "all" },
+      capabilities: { scope: "ceiling" },
+    },
+  );
+});
+
+test("an approve-only grant acts nowhere and approves where act would have reached", () => {
+  assert.deepEqual(
+    grantEntry({ subject: "did:key:zA", role: "reader", contextId: null, reach: "approve" }),
+    {
+      subject: "did:key:zA",
+      role: "reader",
+      act: { scope: "none" },
+      approve: { scope: "all" },
+      approveCapabilities: { scope: "ceiling" },
+      keys: { scope: "none" },
+      capabilities: { scope: "none" },
+    },
+  );
+  const scoped = grantEntry({ subject: "s", role: "r", contextId: "demo", reach: "approve" });
+  assert.deepEqual(scoped.approve, { scope: "contexts", contexts: ["demo"] });
+});
+
+test("choosing approve only sends an entry that acts nowhere", async () => {
+  const { a, screen } = await mount([], "demo");
+  const field = (placeholder: string) =>
+    screen.all("input").find((i) => i.getAttribute("placeholder")?.startsWith(placeholder))!;
+  await screen.type(field("did:key"), "did:key:zApprover");
+  const [role] = screen.all("label").filter((l) => /^ROLE/.test(l.textContent ?? ""));
+  await screen.type(role!.querySelector("input")!, "reader");
+  const approveOnly = screen
+    .all("label")
+    .find((l) => /^Approve only/.test(l.textContent ?? ""))!
+    .querySelector("input")!;
+  await screen.click(approveOnly);
+  assert.match(screen.text(), /able to approve changes at this agent within that context/);
+  await screen.click(screen.button("Grant access"));
+  await screen.settle();
+  const sent = a.of(GRANT);
+  assert.equal(sent.length, 1);
+  const entry = (sent[0]!.payload as { entry: Record<string, unknown> }).entry;
+  assert.deepEqual(entry.act, { scope: "none" });
+  assert.deepEqual(entry.approve, { scope: "contexts", contexts: ["demo"] });
+  assert.deepEqual(entry.capabilities, { scope: "none" });
 });

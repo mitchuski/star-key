@@ -32,10 +32,13 @@ import type {
   RoomsPageOp,
   RuntimeRoomsPageResponse,
 } from "./bridge-protocol.js";
+import { PageRefusal, forwardedCode, pageFailure, type PageErrorCode } from "./page-error.js";
 import {
   excerpt,
   liveGrants,
   mergeRoomNames,
+  storedRoomState,
+  type RoomOwnerState,
   portalRefusal,
   roomFilesPageOpenRefusal,
   roomGrant,
@@ -51,11 +54,12 @@ import {
   type RoomWriteConsentView,
 } from "./room-page-policy.js";
 
-/** One entry of the VTA's listing, as the offscreen document reports it. */
+/** One entry of the VTA's listing, as the offscreen document reports it — or an
+ *  open room the member is in (`openRooms`), which has no epoch. */
 interface HeldEntry {
   roomId: string;
-  epoch: number;
-  earliestReadableEpoch: number;
+  epoch?: number;
+  earliestReadableEpoch?: number;
   member?: string;
   context?: string;
   actions?: string[];
@@ -76,7 +80,7 @@ export interface PortLike {
 }
 
 export interface RoomPageBackgroundDeps {
-  active(): Promise<{ ok: true; vta: ActiveVta } | { ok: false; error: string }>;
+  active(): Promise<{ ok: true; vta: ActiveVta } | { ok: false; error: string; code?: PageErrorCode }>;
   offscreen(vta: ActiveVta, op: OffscreenRoomsPageOp): Promise<OffscreenRoomsPageResponse>;
   /** Whether the wallet holds a host permission for `url`'s origin. */
   canReach(url: string): Promise<boolean>;
@@ -100,6 +104,10 @@ type RoomNames = Record<
   {
     label: string;
     visibility?: string;
+    /** The room's own state, from the community's record (`vtc/rooms/memberships/list/0.2`). */
+    roomState?: RoomOwnerState;
+    roomAccess?: "readOnly" | "noAccess";
+    purgeAt?: string;
     labelSource?: "profile" | "community";
     description?: string;
     profileStale?: boolean;
@@ -126,7 +134,14 @@ export interface PortalOffers {
   }): Promise<unknown>;
 }
 
-class RoomPageRefusal extends Error {}
+/** A refusal of this channel, always with its page code (`page-error.ts`). */
+class RoomPageRefusal extends PageRefusal {}
+
+/** A transfer's failure frame for the page: the message and its code. */
+function failedOf(e: unknown): { error: string; code: PageErrorCode } {
+  const { error, code } = pageFailure(e);
+  return { error, code };
+}
 
 export class RoomPageGates {
   private readonly portals = new Map<string, { portalOrigin: string; endpoint: string; at: number }>();
@@ -147,7 +162,7 @@ export class RoomPageGates {
     const hit = this.portals.get(hostDid);
     if (hit && now - hit.at < PORTAL_CACHE_MS) return hit;
     const res = await this.deps.offscreen(vta, { op: "portal", hostDid });
-    if (!res.ok) throw new RoomPageRefusal(res.error);
+    if (!res.ok) throw new RoomPageRefusal(res.error, forwardedCode(res.code));
     const got = res.result as { portalOrigin: string; endpoint: string };
     this.portals.set(hostDid, { ...got, at: now });
     return got;
@@ -160,14 +175,15 @@ export class RoomPageGates {
     opts: { needReach: boolean },
   ): Promise<{ vta: ActiveVta; endpoint: string }> {
     const active = await this.deps.active();
-    if (!active.ok) throw new RoomPageRefusal(active.error);
+    if (!active.ok) throw new RoomPageRefusal(active.error, active.code ?? "notConnected");
     const { portalOrigin, endpoint } = await this.portal(active.vta, hostDid);
     const refusal = portalRefusal(origin, hostDid, portalOrigin);
-    if (refusal) throw new RoomPageRefusal(refusal);
+    if (refusal) throw new RoomPageRefusal(refusal, "originNotPermitted");
     if (opts.needReach && !(await this.deps.canReach(endpoint))) {
       throw new RoomPageRefusal(
         `The wallet may not reach ${new URL(endpoint).origin} yet. Share a room again (rooms.choose) and ` +
           `allow it there, or allow it from the wallet's popup.`,
+        "hostPermissionRequired",
       );
     }
     return { vta: active.vta, endpoint };
@@ -177,13 +193,13 @@ export class RoomPageGates {
   private async granted(origin: string, hostDid: string, vta: ActiveVta, roomId: string): Promise<string> {
     const grants = await this.deps.loadGrants(origin, vta.vtaDid);
     const r = roomGrant(grants, { origin, hostDid, vtaDid: vta.vtaDid }, roomId, this.deps.now());
-    if (!r.ok) throw new RoomPageRefusal(r.error);
+    if (!r.ok) throw new RoomPageRefusal(r.error, "notShared");
     return r.grant.member;
   }
 
   private async offscreen(vta: ActiveVta, op: OffscreenRoomsPageOp): Promise<unknown> {
     const res = await this.deps.offscreen(vta, op);
-    if (!res.ok) throw new RoomPageRefusal(res.error);
+    if (!res.ok) throw new RoomPageRefusal(res.error, forwardedCode(res.code));
     return res.result;
   }
 
@@ -191,10 +207,10 @@ export class RoomPageGates {
   async handle(origin: string, raw: unknown): Promise<RuntimeRoomsPageResponse> {
     try {
       const malformed = roomsPageParamsRefusal(raw);
-      if (malformed) return { ok: false, error: malformed };
+      if (malformed) return { ok: false, error: malformed, code: "invalidCall" };
       return { ok: true, result: await this.run(origin, raw as RoomsPageOp) };
     } catch (e) {
-      return { ok: false, error: e instanceof Error ? e.message : String(e) };
+      return pageFailure(e);
     }
   }
 
@@ -239,14 +255,14 @@ export class RoomPageGates {
       case "acceptOffer": {
         // The community's own offers, to the identities the member uses here by
         // the wallet's record — never the community's DID, never the page's word.
-        if (!this.deps.offers) throw new RoomPageRefusal("this wallet does not handle room offers");
+        if (!this.deps.offers) throw new RoomPageRefusal("this wallet does not handle room offers", "invalidCall");
         const { vta } = await this.atPortal(origin, p.hostDid, { needReach: false });
         const members = ((await this.offscreen(vta, { op: "members", hostDid: p.hostDid })) as string[]).filter(
           (m) => m !== p.hostDid,
         );
         if (p.op === "offers") return this.deps.offers.forPortal(vta, p.hostDid, members);
         if (p.member !== undefined && !members.includes(p.member)) {
-          throw new RoomPageRefusal(`${p.member} is not an identity you use at this community`);
+          throw new RoomPageRefusal(`${p.member} is not an identity you use at this community`, "identityUnknown");
         }
         // The member decides in the wallet's own window; the page only asked.
         return this.deps.offers.accept({
@@ -276,7 +292,7 @@ export class RoomPageGates {
           visibility: info.visibility,
           what: { note: true, title: p.title, excerpt: excerpt(p.body), bodyChars: [...(p.body ?? "")].length },
         });
-        if (!decision.approved) throw new RoomPageRefusal("the member declined to add this note");
+        if (!decision.approved) throw new RoomPageRefusal("the member declined to add this note", "declined");
         return this.offscreen(vta, {
           op: "putNote",
           hostDid: p.hostDid,
@@ -331,7 +347,7 @@ export class RoomPageGates {
     return Object.fromEntries(
       Object.entries(names).map(([roomId, n]) => [
         roomId,
-        { label: n.label, ...(n.visibility !== undefined ? { visibility: n.visibility } : {}) },
+        { label: n.label, ...(n.visibility !== undefined ? { visibility: n.visibility } : {}), ...storedRoomState(n as unknown as Record<string, unknown>) },
       ]),
     );
   }
@@ -387,6 +403,21 @@ export class RoomPageGates {
     return withProfiles(offered, profiles);
   }
 
+  /**
+   * The open rooms of `hostDid` that `members` are in (`openRooms`), read now —
+   * never kept, so a removal stops counting at once. Never throws: a reading that
+   * failed offers no open room.
+   */
+  private async openRooms(vta: ActiveVta, hostDid: string, members: readonly string[]): Promise<HeldEntry[]> {
+    if (members.length === 0) return [];
+    try {
+      const res = await this.deps.offscreen(vta, { op: "openRooms", hostDid, members: [...members] });
+      return res.ok && Array.isArray(res.result) ? (res.result as HeldEntry[]) : [];
+    } catch {
+      return [];
+    }
+  }
+
   /** The live shares for this origin and community, joined with what the VTA still holds. */
   private async views(origin: string, hostDid: string, vta: ActiveVta): Promise<PageRoomView[]> {
     const grants = liveGrants(
@@ -395,7 +426,11 @@ export class RoomPageGates {
       this.deps.now(),
     );
     if (grants.length === 0) return [];
-    const held = (await this.offscreen(vta, { op: "held" })) as HeldEntry[];
+    const listed = (await this.offscreen(vta, { op: "held" })) as HeldEntry[];
+    // An open room is never listed: only the community's record says the member
+    // is in it, asked only about shares the listing does not name.
+    const unlisted = grants.filter((g) => !listed.some((h) => h.roomId === g.roomId && h.member === g.member));
+    const held = [...listed, ...(await this.openRooms(vta, hostDid, [...new Set(unlisted.map((g) => g.member))]))];
     const names = await this.displayNames(
       vta,
       hostDid,
@@ -410,7 +445,8 @@ export class RoomPageGates {
         roomId: g.roomId,
         member: g.member,
         held: h !== undefined,
-        ...(h ? { epoch: h.epoch, earliestReadableEpoch: h.earliestReadableEpoch } : {}),
+        ...(h?.epoch !== undefined ? { epoch: h.epoch } : {}),
+        ...(h?.earliestReadableEpoch !== undefined ? { earliestReadableEpoch: h.earliestReadableEpoch } : {}),
         sharedAt: new Date(g.grantedAt).toISOString(),
         expiresAt: new Date(g.expiresAt).toISOString(),
         ...(names[g.roomId] ? names[g.roomId] : {}),
@@ -427,11 +463,13 @@ export class RoomPageGates {
     const at = { origin, hostDid, vtaDid: vta.vtaDid };
     const now = this.deps.now();
     const grants = await this.deps.loadGrants(origin, vta.vtaDid);
-    const held = (await this.offscreen(vta, { op: "held" })) as HeldEntry[];
+    const listed = (await this.offscreen(vta, { op: "held" })) as HeldEntry[];
     // Who the member is at this community, by the wallet's own record — the
     // page's word only picks among these, never adds to them.
     const members = (await this.offscreen(vta, { op: "members", hostDid })) as string[];
     const usable = members.filter((m) => m !== hostDid);
+    // Beside the listing, the open rooms the member is in, which it never names.
+    const held = [...listed, ...(await this.openRooms(vta, hostDid, usable))];
     const names = await this.displayNames(
       vta,
       hostDid,
@@ -463,7 +501,7 @@ export class RoomPageGates {
 
     // Only rows the window offered: a selection naming anything else is ignored.
     const picked = selectedShares(rows, decision.selectedRooms ?? []);
-    if (!picked.ok) throw new RoomPageRefusal(picked.error);
+    if (!picked.ok) throw new RoomPageRefusal(picked.error, "invalidCall");
     const refused: { roomId: string; reason: string }[] = [];
     const ok: { roomId: string; member: string }[] = [];
     for (const share of picked.shares) {
@@ -532,21 +570,21 @@ export class RoomPageGates {
           inner = port;
         }, (u) => {
           upload = u;
-        }).catch((e: unknown) => finish({ kind: "failed", error: e instanceof Error ? e.message : String(e) }));
+        }).catch((e: unknown) => finish({ kind: "failed", ...failedOf(e) }));
         return;
       }
       // After the open, only an upload's data and end are taken, and only once
       // the member confirmed it.
       const m = raw as { kind?: unknown; data?: unknown };
-      if (!upload?.ready || !inner) return finish({ kind: "failed", error: "send the file only after the wallet is ready" });
+      if (!upload?.ready || !inner) return finish({ kind: "failed", error: "send the file only after the wallet is ready", code: "invalidCall" });
       if (m.kind === "data" && typeof m.data === "string") {
         upload.sent += Math.floor((m.data.length * 3) / 4);
-        if (upload.sent > upload.size + 2) return finish({ kind: "failed", error: "more bytes than the file was declared to hold" });
+        if (upload.sent > upload.size + 2) return finish({ kind: "failed", error: "more bytes than the file was declared to hold", code: "invalidCall" });
         inner.postMessage({ kind: "data", data: m.data });
       } else if (m.kind === "end") {
         inner.postMessage({ kind: "end" });
       } else {
-        finish({ kind: "failed", error: "a transfer takes data, then end" });
+        finish({ kind: "failed", error: "a transfer takes data, then end", code: "invalidCall" });
       }
     });
   }
@@ -560,7 +598,7 @@ export class RoomPageGates {
     setUpload: (u: { size: number; sent: number; ready: boolean }) => void,
   ): Promise<void> {
     const malformed = roomFilesPageOpenRefusal(raw);
-    if (malformed) return finish({ kind: "failed", error: malformed });
+    if (malformed) return finish({ kind: "failed", error: malformed, code: "invalidCall" });
     const o = raw as RoomFilesPageOpen;
     let vta: ActiveVta;
     let member: string;
@@ -568,7 +606,7 @@ export class RoomPageGates {
       ({ vta } = await this.atPortal(origin, o.hostDid, { needReach: true }));
       member = await this.granted(origin, o.hostDid, vta, o.roomId);
     } catch (e) {
-      return finish({ kind: "failed", error: e instanceof Error ? e.message : String(e) });
+      return finish({ kind: "failed", ...failedOf(e) });
     }
     const target = {
       vtaDid: vta.vtaDid,
@@ -600,7 +638,7 @@ export class RoomPageGates {
           ...(o.title !== undefined ? { title: o.title } : {}),
         },
       });
-      if (!decision.approved) return finish({ kind: "failed", error: "the member declined to add this file" });
+      if (!decision.approved) return finish({ kind: "failed", error: "the member declined to add this file", code: "declined" });
     }
 
     const inner = await this.deps.openTransfer();
@@ -626,6 +664,7 @@ export class RoomPageGates {
             kind: "got",
             file: m.file,
             author: m.author,
+            signed: m.signed,
             version: m.version,
             ...(m.title !== undefined ? { title: m.title } : {}),
             ...(m.description !== undefined ? { description: m.description } : {}),
@@ -642,13 +681,13 @@ export class RoomPageGates {
         case "failed":
           ended = true;
           held.length = 0;
-          finish({ kind: "failed", error: m.error });
+          finish({ kind: "failed", error: m.error, code: forwardedCode(m.code) });
           return;
       }
     });
     inner.onDisconnect.addListener(() => {
       held.length = 0;
-      if (!ended && !got) finish({ kind: "failed", error: "the wallet's transfer ended before it finished" });
+      if (!ended && !got) finish({ kind: "failed", error: "the wallet's transfer ended before it finished", code: "walletUnavailable" });
     });
 
     const begin: RoomFilesOpen =
@@ -694,6 +733,8 @@ export function withProfiles(
       out[roomId] = {
         label: p.name,
         ...(had?.visibility !== undefined ? { visibility: had.visibility } : {}),
+        // The room's state is the community's, whatever the room calls itself.
+        ...(had ? storedRoomState(had as unknown as Record<string, unknown>) : {}),
         labelSource: "profile",
         ...(p.description !== undefined ? { description: p.description } : {}),
         ...facts,

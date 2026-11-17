@@ -1,5 +1,5 @@
-// Acting in a room **as the member** — `rooms/keys/act/0.1` and
-// `rooms/keys/seal/0.2` with `signAsPrincipal`.
+// Acting in a room **as the member** — `rooms/keys/act` 0.11, and
+// `rooms/keys/seal/0.3` with `signAsPrincipal`.
 //
 // ## The member is the persona, never this wallet
 //
@@ -17,7 +17,7 @@
 //
 // The same holds for a sealed record's body: it is built without a proof, with
 // the persona as `author`, and the VTA signs it as the persona for
-// `assertionMethod` before sealing it (`rooms/keys/seal/0.2`, `signAsPrincipal`).
+// `assertionMethod` before sealing it (`rooms/keys/seal/0.3`, `signAsPrincipal`).
 //
 // ## Two recipients
 //
@@ -35,6 +35,14 @@ import { base64url } from "@openvtc/vti-didcomm-js";
 
 import type { SendOpts, TaskParty, TrustTaskSender } from "../vta/channel.js";
 import { buildTrustTask } from "../vta/trust-task.js";
+import { roomsKeysProfileRead } from "./profile.js";
+import {
+  isNameWithdrawal,
+  MEMBER_PROFILE_KIND,
+  memberNameRefusal,
+  memberNameRewriteDue,
+  memberNameWriteRefusal,
+} from "./member-name.js";
 
 import {
   TYPE_URI as KEYS_ACT,
@@ -42,42 +50,33 @@ import {
   type RoomsKeysActPayload,
   type RoomsKeysActResponsePayload,
   type UnsignedRoomRequest,
-} from "@openvtc/trust-tasks/rooms/keys/act/0.1/payload";
+} from "../specs/rooms/keys/act/0.11/payload.js";
 import {
-  TYPE_URI as KEYS_ACT_V5,
-  RESPONSE_TYPE_URI as KEYS_ACT_V5_RESPONSE,
-} from "@openvtc/trust-tasks/rooms/keys/act/0.5/payload";
-import {
-  TYPE_URI as KEYS_SEAL_V2,
-  RESPONSE_TYPE_URI as KEYS_SEAL_V2_RESPONSE,
-  type RoomsKeysSealPayload as RoomsKeysSealV2Payload,
-  type RoomsKeysSealResponsePayload as RoomsKeysSealV2ResponsePayload,
-} from "@openvtc/trust-tasks/rooms/keys/seal/0.2/payload";
+  TYPE_URI as KEYS_SEAL,
+  RESPONSE_TYPE_URI as KEYS_SEAL_RESPONSE,
+  type RoomsKeysSealPayload,
+  type RoomsKeysSealResponsePayload,
+} from "../specs/rooms/keys/seal/0.3/payload.js";
 import {
   TYPE_URI as INFO,
   RESPONSE_TYPE_URI as INFO_RESPONSE,
   type RoomsInfoResponsePayload,
-} from "@openvtc/trust-tasks/rooms/info/0.1/payload";
+} from "../specs/rooms/info/0.3/payload.js";
 import {
   TYPE_URI as RECORDS_LIST,
   RESPONSE_TYPE_URI as RECORDS_LIST_RESPONSE,
   type RoomsRecordsListResponsePayload,
-} from "@openvtc/trust-tasks/rooms/records/list/0.1/payload";
+} from "../specs/rooms/records/list/0.6/payload.js";
 import {
-  TYPE_URI as RECORDS_PUT_V1,
-  RESPONSE_TYPE_URI as RECORDS_PUT_V1_RESPONSE,
-  type RoomsRecordsPutResponsePayload as RoomsRecordsPutV1ResponsePayload,
-} from "@openvtc/trust-tasks/rooms/records/put/0.1/payload";
+  TYPE_URI as RECORDS_PUT,
+  RESPONSE_TYPE_URI as RECORDS_PUT_RESPONSE,
+  type RoomsRecordsPutResponsePayload,
+} from "../specs/rooms/records/put/0.5/payload.js";
 import {
   TYPE_URI as RECORDS_CURATE,
   RESPONSE_TYPE_URI as RECORDS_CURATE_RESPONSE,
   type RoomsRecordsCurateResponsePayload,
-} from "@openvtc/trust-tasks/rooms/records/curate/0.1/payload";
-import {
-  TYPE_URI as RECORDS_PUT_V2,
-  RESPONSE_TYPE_URI as RECORDS_PUT_V2_RESPONSE,
-  type RoomsRecordsPutResponsePayload as RoomsRecordsPutV2ResponsePayload,
-} from "@openvtc/trust-tasks/rooms/records/put/0.2/payload";
+} from "../specs/rooms/records/curate/0.1/payload.js";
 
 export type { RoomsInfoResponsePayload as RoomInfo, UnsignedRoomRequest };
 
@@ -146,22 +145,21 @@ export async function roomsKeysAct(
   sender: TrustTaskSender,
   parties: RoomsCaller,
   document: UnsignedRoomRequest,
-  /**
-   * `0.5` for a member's requests to a community about the rooms it offers them
-   * (`vtc/rooms/offers/*`, `vtc/rooms/memberships/list`), which only it completes;
-   * `0.1` — what every VTA serving rooms speaks — for the rest.
-   */
-  version: "0.1" | "0.5" = "0.1",
 ): Promise<{ principal: string; document: Record<string, unknown> }> {
+  // 0.11 completes every request this wallet makes as a member — the host-bound
+  // room requests (records at `rooms/records/put/0.5`, with or without a file,
+  // read at `rooms/records/get/0.3` and listed at `rooms/records/list/0.6`) and a
+  // member's requests to a community about the rooms it offers them
+  // (`vtc/rooms/offers/*`, `vtc/rooms/memberships/list/0.2`) alike. 0.11 is
+  // 0.10's table plus put/0.5, list/0.6 and get/0.3.
   const payload: RoomsKeysActPayload = { document };
-  const envelope = buildTrustTask(version === "0.5" ? KEYS_ACT_V5 : KEYS_ACT, payload, {
+  const envelope = buildTrustTask(KEYS_ACT, payload, {
     issuer: parties.holder.did,
     recipient: parties.service.did,
   });
-  // 0.5's request and response members are 0.1's; only the table grew.
   const res = await sender.send<RoomsKeysActResponsePayload>(envelope, {
-    expectedResponseType: version === "0.5" ? KEYS_ACT_V5_RESPONSE : KEYS_ACT_RESPONSE,
-    operationLabel: `rooms/keys/act/${version}`,
+    expectedResponseType: KEYS_ACT_RESPONSE,
+    operationLabel: "rooms/keys/act/0.11",
   });
   const completed = res.document as Record<string, unknown>;
   const principal = res.principal;
@@ -259,7 +257,7 @@ export async function actAndSend<Res>(
 
 /**
  * Seal a record body, signed by the VTA **as its author** — the member — first
- * (`rooms/keys/seal/0.2`, `signAsPrincipal`). `body` carries no proof; the VTA
+ * (`rooms/keys/seal/0.3`, `signAsPrincipal`). `body` carries no proof; the VTA
  * refuses one whose `author` is not a member it may act as.
  */
 export async function roomsKeysSealAsPrincipal(
@@ -267,21 +265,21 @@ export async function roomsKeysSealAsPrincipal(
   parties: RoomsCaller,
   params: { roomId: string; key: string; version: number; body: Record<string, unknown> },
   // `author` in the body names the member, so no `ext` member is needed here.
-): Promise<RoomsKeysSealV2ResponsePayload["sealed"]> {
-  const payload: RoomsKeysSealV2Payload = {
+): Promise<RoomsKeysSealResponsePayload["sealed"]> {
+  const payload: RoomsKeysSealPayload = {
     roomId: params.roomId,
     key: params.key,
     version: params.version,
     plaintext: base64url.encode(new TextEncoder().encode(JSON.stringify(params.body))),
     signAsPrincipal: true,
   };
-  const envelope = buildTrustTask(KEYS_SEAL_V2, payload, {
+  const envelope = buildTrustTask(KEYS_SEAL, payload, {
     issuer: parties.holder.did,
     recipient: parties.service.did,
   });
-  const res = await sender.send<RoomsKeysSealV2ResponsePayload>(envelope, {
-    expectedResponseType: KEYS_SEAL_V2_RESPONSE,
-    operationLabel: "rooms/keys/seal/0.2",
+  const res = await sender.send<RoomsKeysSealResponsePayload>(envelope, {
+    expectedResponseType: KEYS_SEAL_RESPONSE,
+    operationLabel: "rooms/keys/seal/0.3",
   });
   return res.sealed;
 }
@@ -325,6 +323,12 @@ export interface UnsignedRecordBody {
   tags?: string[];
   /** The file manifest, for a record that carries a file. */
   file?: Record<string, unknown>;
+  /** What the record is to a reader (`RecordKind`). Written only where the room's profile lists `kind`. */
+  kind?: string;
+  /** When the author wrote it (`RecordWrittenAt`). Written only where the room's profile lists `writtenAt`. */
+  writtenAt?: string;
+  /** When the author edited it (`RecordEditedAt`). Written only where the room's profile lists `editedAt`. */
+  editedAt?: string;
 }
 
 /** Thrown when a record landed at a version it was not sealed for, every time. */
@@ -383,12 +387,8 @@ export async function writeSealedAsMember(
       expectedVersion: expected,
       ...(blobRef !== undefined ? { blobs: [blobRef] } : {}),
     };
-    const put =
-      blobRef !== undefined
-        ? (await actAndSend<RoomsRecordsPutV2ResponsePayload>(room, RECORDS_PUT_V2, RECORDS_PUT_V2_RESPONSE, payload))
-            .reply
-        : (await actAndSend<RoomsRecordsPutV1ResponsePayload>(room, RECORDS_PUT_V1, RECORDS_PUT_V1_RESPONSE, payload))
-            .reply;
+    const put = (await actAndSend<RoomsRecordsPutResponsePayload>(room, RECORDS_PUT, RECORDS_PUT_RESPONSE, payload))
+      .reply;
     landed = put.version;
     if (landed === intended) return landed;
     expected = landed;
@@ -400,20 +400,52 @@ export async function writeSealedAsMember(
 /**
  * Put a record in the clear, as the member — for an `open` room, whose records
  * the host stores and reads. `replaces`, as for {@link writeSealedAsMember}.
+ * The cleartext's `body` is required by `rooms/records/put/0.5`, so a note with
+ * none is sent with an empty one.
+ *
+ * With `file` — its manifest, `fileKey` included — and the `blobRef` it
+ * describes, the record carries that file, naming exactly that blob, as its
+ * host requires.
  */
 export async function putCleartextAsMember(
   room: PersonaRoom,
-  params: { key: string; title?: string; body?: string; replaces?: number },
+  params: {
+    key: string;
+    title?: string;
+    body?: string;
+    description?: string;
+    tags?: string[];
+    /** `kind`, `writtenAt` and `editedAt` (`rooms/records/put/0.5`): only where the room's profile lists them. */
+    kind?: string;
+    writtenAt?: string;
+    editedAt?: string;
+    replaces?: number;
+    file?: { manifest: Record<string, unknown>; blobRef: string };
+  },
 ): Promise<number> {
-  const cleartext: Record<string, unknown> = {};
+  const cleartext: Record<string, unknown> = { body: params.body ?? "" };
+  if (params.kind !== undefined) cleartext.kind = params.kind;
   if (params.title !== undefined) cleartext.title = params.title;
-  if (params.body !== undefined) cleartext.body = params.body;
-  const { reply } = await actAndSend<RoomsRecordsPutV1ResponsePayload>(room, RECORDS_PUT_V1, RECORDS_PUT_V1_RESPONSE, {
+  if (params.writtenAt !== undefined) cleartext.writtenAt = params.writtenAt;
+  if (params.editedAt !== undefined) cleartext.editedAt = params.editedAt;
+  if (params.description !== undefined) cleartext.description = params.description;
+  if (params.tags !== undefined) cleartext.tags = params.tags;
+  const payload: Record<string, unknown> = {
     roomId: room.roomId,
     key: params.key,
     cleartext,
     expectedVersion: params.replaces ?? 0,
-  });
+  };
+  if (params.file) {
+    cleartext.file = params.file.manifest;
+    payload.blobs = [params.file.blobRef];
+  }
+  const { reply } = await actAndSend<RoomsRecordsPutResponsePayload>(
+    room,
+    RECORDS_PUT,
+    RECORDS_PUT_RESPONSE,
+    payload,
+  );
   return reply.version;
 }
 
@@ -463,12 +495,157 @@ function wireBody(body: UnsignedRecordBody & { version: number }): Record<string
     version: body.version,
     author: body.author,
   };
+  if (body.kind !== undefined) out.kind = body.kind;
   if (body.title !== undefined) out.title = body.title;
   if (body.description !== undefined) out.description = body.description;
   if (body.body !== undefined) out.body = body.body;
   if (body.tags !== undefined && body.tags.length > 0) out.tags = body.tags;
   if (body.file !== undefined) out.file = body.file;
+  if (body.writtenAt !== undefined) out.writtenAt = body.writtenAt;
+  if (body.editedAt !== undefined) out.editedAt = body.editedAt;
   return out;
+}
+
+/** The room's `recordMembers`, as its current profile states them, read through the member's VTA. `undefined`: none. */
+export async function roomRecordMembersAsMember(room: PersonaRoom): Promise<string[] | undefined> {
+  const read = await roomsKeysProfileRead(room.vta.sender, {
+    holder: room.holder,
+    service: { did: room.vta.did },
+    roomId: room.roomId,
+    host: room.host.did,
+    ...(room.member !== undefined ? { member: room.member } : {}),
+  });
+  if (read.status !== "found") return undefined;
+  const listed = (read.profile as { recordMembers?: unknown } | undefined)?.recordMembers;
+  return Array.isArray(listed) && listed.every((m) => typeof m === "string") ? listed : undefined;
+}
+
+/** Thrown when a write is refused before anything is sent: the room's profile does not permit it, or the value is not one the schema allows. */
+export class RecordWriteRefused extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "RecordWriteRefused";
+  }
+}
+
+/** A name record a member already holds in the room: the one a new name is written over. */
+export interface HeldMemberName {
+  author: string;
+  key: string;
+  version: number;
+}
+
+/**
+ * Write the member's own name in the room — a record of kind `memberProfile`
+ * with the name in `title` (rooms/_shared/0.3 `MemberProfileRecord`,
+ * trust-tasks-tf #1035). An empty name (or only white space) withdraws it.
+ *
+ * **Refused before anything is sent** unless the room's current profile lists
+ * both `kind` and `memberProfile` in `recordMembers` — a reader that predates the
+ * kind would show every member's name as a note — and unless `name` is a
+ * `MemberName`. The profile is read here, as the member, every time.
+ *
+ * The member keeps one name record: where `held` names one by the member, the
+ * name is a new version of it (`replaces` its version, so the host refuses the
+ * write if anything has replaced it since); otherwise a new one, create-only,
+ * so a retry after a lost answer cannot leave a second. Sealed and signed by
+ * the VTA as the member on `attributed` and `private`, in the clear on `open`
+ * (`rooms/records/put/0.5`) — as the room says, never assumed. `writtenAt`, and
+ * `editedAt` on a new version, are written where the profile lists them.
+ */
+export async function writeMemberNameAsMember(
+  room: PersonaRoom,
+  params: { name: string; held?: readonly HeldMemberName[]; now?: () => Date },
+): Promise<{ principal: string; key: string; version: number }> {
+  const bad = memberNameRefusal(params.name);
+  if (bad !== undefined) throw new RecordWriteRefused(`Not written: ${bad}.`);
+  const listed = await roomRecordMembersAsMember(room);
+  const refused = memberNameWriteRefusal(listed);
+  if (refused !== undefined) throw new RecordWriteRefused(refused);
+  const lists = (m: string) => listed!.includes(m);
+  const now = (params.now ?? (() => new Date()))().toISOString().replace(/\.\d{3}Z$/, "Z");
+
+  const { principal, info } = await roomInfoAsMember(room);
+  const mine = params.held?.find((h) => h.author === principal);
+  const key = mine?.key ?? opaqueRecordKey();
+  const times = {
+    ...(lists("writtenAt") ? { writtenAt: now } : {}),
+    ...(mine !== undefined && lists("editedAt") ? { editedAt: now } : {}),
+  };
+  const version =
+    info.visibility === "open"
+      ? await putCleartextAsMember(room, {
+          key,
+          kind: MEMBER_PROFILE_KIND,
+          title: params.name,
+          body: "",
+          ...times,
+          ...(mine !== undefined ? { replaces: mine.version } : {}),
+        })
+      : await writeSealedAsMember(
+          room,
+          { roomId: room.roomId, key, author: principal, kind: MEMBER_PROFILE_KIND, title: params.name, ...times },
+          undefined,
+          mine !== undefined ? { replaces: mine.version } : {},
+        );
+  return { principal, key, version };
+}
+
+/** The member's own name record, as rule 2 gives it from the records its client holds: what a rewrite near the head writes again. */
+export interface OwnMemberName {
+  key: string;
+  version: number;
+  /** The name rule 2 gives. A withdrawn (or refused, or retracted) name is never written again. */
+  name: string;
+  /** The version's own `writtenAt` and `editedAt`, kept unchanged by the rewrite. */
+  writtenAt?: string;
+  editedAt?: string;
+}
+
+/**
+ * After a write the host assigned `writeVersion`, write the member's name again
+ * where it has fallen more than `MEMBER_NAME_REWRITE_DISTANCE` (500) versions
+ * behind (*Near the room's head*, rooms/_shared/0.3 `MemberProfileRecord`,
+ * trust-tasks-tf #1038), so a reader that opens only recent pages still finds
+ * it. Answers the new version, or `undefined` when nothing was due.
+ *
+ * **Writing it again** is a new version of the same record — the same key, the
+ * name rule 2 gives (`own`, from the records the client holds, never a name a
+ * device remembers), `writtenAt` kept unchanged and no new `editedAt` (an
+ * earlier one stays as it is), since the name has not changed. It `replaces`
+ * the version read, so a concurrent change on another device wins and this
+ * writes nothing. The writer's gate applies as to any name: a room whose
+ * profile no longer lists `kind` and `memberProfile` gets nothing.
+ */
+export async function rewriteMemberNameAsMember(
+  room: PersonaRoom,
+  own: OwnMemberName | undefined,
+  writeVersion: number,
+): Promise<number | undefined> {
+  if (own === undefined || !memberNameRewriteDue(own, writeVersion)) return undefined;
+  if (isNameWithdrawal(own.name) || memberNameRefusal(own.name) !== undefined) return undefined;
+  const listed = await roomRecordMembersAsMember(room);
+  if (memberNameWriteRefusal(listed) !== undefined) return undefined;
+  const { principal, info } = await roomInfoAsMember(room);
+  const times = {
+    ...(own.writtenAt !== undefined ? { writtenAt: own.writtenAt } : {}),
+    ...(own.editedAt !== undefined ? { editedAt: own.editedAt } : {}),
+  };
+  return info.visibility === "open"
+    ? putCleartextAsMember(room, {
+        key: own.key,
+        kind: MEMBER_PROFILE_KIND,
+        title: own.name,
+        body: "",
+        ...times,
+        replaces: own.version,
+      })
+    : writeSealedAsMember(
+        room,
+        { roomId: room.roomId, key: own.key, author: principal, kind: MEMBER_PROFILE_KIND, title: own.name, ...times },
+        undefined,
+        { replaces: own.version },
+      );
 }
 
 /** An opaque record key, as a sealed tier requires: 16 random bytes. */

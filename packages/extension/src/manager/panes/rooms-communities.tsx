@@ -27,7 +27,7 @@ import { didHost } from "../../did-display.js";
 import { isActionable, type OfferView } from "../../room-offers-policy.js";
 import { Button, Did, Note, Pill } from "../../ui.js";
 import { c, t } from "../../theme.js";
-import { communityLanes, rowStage, type Lane, type LaneRow } from "../community-lanes.js";
+import { communityLanes, joinedOpen, rowStage, type Lane, type LaneRow } from "../community-lanes.js";
 import type { RoomEntry } from "../room-groups.js";
 import type { KnownRoomHost } from "../room-hosts.js";
 import { mostReadable } from "../room-groups.js";
@@ -167,6 +167,19 @@ function joinedStep(row: LaneRow): Step {
       ],
     };
   }
+  const open = joinedOpen(row);
+  if (open) {
+    return {
+      label: "Joined",
+      state: "done",
+      lines: [
+        open.actions.join(" · "),
+        <span title="An open room has no keys: your agent reads it with the credentials the community gave you">
+          open room — no keys to hold
+        </span>,
+      ],
+    };
+  }
   if (row.offers.some((o) => o.state === "needsReadmission")) {
     return { label: "Joined", state: "warn", lines: ["never — your agent did not join before the community stopped keeping the room's keys for you"] };
   }
@@ -224,9 +237,9 @@ function RoomRow({
   return (
     <div style={{ display: "grid", gap: 10, padding: "14px 0", borderTop: `1px solid ${c.lineSoft}` }}>
       <div style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
-        {entry ? (
+        {entry || joinedOpen(row) ? (
           <button
-            onClick={() => onOpen(entry.roomId)}
+            onClick={() => onOpen(row.roomId)}
             aria-label={`Open ${name} in your rooms`}
             style={{ all: "unset", cursor: "pointer", fontSize: t.base, fontWeight: 650, color: c.accent, wordBreak: "break-word" }}
           >
@@ -254,7 +267,7 @@ function RoomRow({
         })}
       </div>
       {(() => {
-        // What the community says the room is for (vtc/rooms/offers/list 0.2), as text only.
+        // What the community says the room is for (vtc/rooms/offers/list 0.4), as text only.
         const description = row.offers.find((o) => o.description)?.description;
         return description ? (
           <span

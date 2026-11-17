@@ -9,12 +9,15 @@
 //      the directory gate's).
 //
 // Then the answer is read, not made: the identities the wallet signs in with
-// at that community (the directory gate's `members` listing), and the
-// standing agreement the wallet holds with it. No prompt — the community
-// already knows these identities, since it admitted them, and a page that is
-// the community's own portal learns nothing it could not ask the community.
-// What goes back is a view; never a credential, a presentation or a signed
-// document; an error is a sentence.
+// at that community (the directory gate's `members` listing), the standing
+// agreement the wallet holds with it, and what the wallet carries of the
+// person's Star Hold — the root and the count the Hold pane was told to carry
+// (`star-hold-carried.ts`), which is the `holds{root,count}` slot a City Key
+// shows a community anyway. No prompt — the community already knows these
+// identities, since it admitted them, and a page that is the community's own
+// portal learns nothing it could not ask the community. What goes back is a
+// view; never a credential, a presentation, a Hold item or a signed document;
+// an error is a sentence.
 //
 // Written against injected dependencies, not `chrome.*`, so the gates are
 // tested as they run.
@@ -29,6 +32,7 @@ import type {
   RuntimeMembershipPageResponse,
 } from "./bridge-protocol.js";
 import { portalRefusal, type ActiveVta } from "./directory-page.js";
+import type { CarriedHold } from "./star-hold-carried.js";
 
 export interface MembershipPageDeps {
   active(): Promise<{ ok: true; vta: ActiveVta } | { ok: false; error: string }>;
@@ -36,6 +40,8 @@ export interface MembershipPageDeps {
   offscreen(vta: ActiveVta, op: OffscreenDirectoryPageOp): Promise<OffscreenDirectoryPageResponse>;
   /** This agent's agreements (`agreements-store.ts`). */
   agreements(vtaDid: string): Promise<Agreement[]>;
+  /** What the wallet carries of a Hold (`star-hold-carried.ts`), if anything. */
+  hold?(): Promise<CarriedHold | undefined>;
   now(): number;
 }
 
@@ -59,7 +65,12 @@ export function membershipPageParamsRefusal(raw: unknown): string | null {
 
 /** The view a portal is given, from the wallet's identities at the community
  *  and its agreements with it. Pure, so it is tested as it runs. */
-export function membershipView(hostDid: string, members: readonly string[], agreements: readonly Agreement[]): PageMembershipView {
+export function membershipView(
+  hostDid: string,
+  members: readonly string[],
+  agreements: readonly Agreement[],
+  hold?: CarriedHold | undefined,
+): PageMembershipView {
   const identities = [...new Set(members.filter((m) => m !== hostDid))];
   if (identities.length === 0) return { member: false };
   const standing = standingAgreements(agreements.filter((a) => a.counterparty === hostDid))[0];
@@ -67,6 +78,7 @@ export function membershipView(hostDid: string, members: readonly string[], agre
     member: true,
     identities,
     ...(standing ? { agreement: { code: standing.terms.code, status: standing.status, at: standing.reached.at } } : {}),
+    ...(hold ? { hold: { root: hold.root, count: hold.count, at: hold.at } } : {}),
   };
 }
 
@@ -114,6 +126,7 @@ export class MembershipPageGates {
     if (refusal) throw new MembershipPageRefusal(refusal);
     const members = (await this.offscreen(vta, { op: "members", hostDid: p.hostDid })) as string[];
     const agreements = await this.deps.agreements(vta.vtaDid).catch(() => [] as Agreement[]);
-    return membershipView(p.hostDid, members, agreements);
+    const hold = this.deps.hold ? await this.deps.hold().catch(() => undefined) : undefined;
+    return membershipView(p.hostDid, members, agreements, hold);
   }
 }

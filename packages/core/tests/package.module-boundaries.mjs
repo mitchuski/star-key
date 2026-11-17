@@ -29,7 +29,9 @@ const SRC = resolve(import.meta.dirname, "../src");
  * in one module, or the shared part belongs one layer down.
  */
 const LAYERS = [
-  ["util", "http", "links"], //  0 — no imports of their own
+  // `specs` is the tree `trust-tasks-gen-ts` writes from `trust-tasks.lock`:
+  // one module per pinned task, importing only `@openvtc/trust-tasks/runtime`.
+  ["util", "http", "links", "specs"], //  0 — no imports of their own
   ["did", "didcomm", "webauthn"], //  1 — identity + crypto primitives
   ["siop"], //                   2 — token formats
   // `trust-tasks` sits BELOW `vta` rather than beside it. The two were one
@@ -42,7 +44,7 @@ const LAYERS = [
   // loosening it — `trust-tasks` may no longer reach for a channel.
   ["trust-tasks"], //            3 — Trust-Task documents: sign, verify, validate
   ["vta"], //                    4 — the VTA protocol: channels, envelopes, auth
-  ["store", "app-state", "persona", "vault", "device", "provision", "rp-login", "onboarding", "admin", "credentials", "vtc", "did-hosting", "webvh", "rooms", "mediator"], // 5
+  ["store", "app-state", "persona", "vault", "device", "provision", "rp-login", "onboarding", "admin", "credentials", "vtc", "did-hosting", "webvh", "rooms", "mediator", "notifications"], // 5
   ["inbound"], //                6 — the running session, on top of everything
 ];
 

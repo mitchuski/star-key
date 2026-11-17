@@ -41,37 +41,43 @@ import {
   type VaultCredentialsQueryResponsePayload,
   type CredentialDescriptor,
   type CredentialStatus,
-} from "@openvtc/trust-tasks/vault/credentials/query/0.1/payload";
+} from "../specs/vault/credentials/query/0.1/payload.js";
 import {
   TYPE_URI as CRED_GET,
   RESPONSE_TYPE_URI as CRED_GET_RESPONSE,
   type VaultCredentialsGetResponsePayload,
-} from "@openvtc/trust-tasks/vault/credentials/get/0.1/payload";
+} from "../specs/vault/credentials/get/0.2/payload.js";
+import {
+  TYPE_URI as CRED_PRESENT,
+  RESPONSE_TYPE_URI as CRED_PRESENT_RESPONSE,
+  type Payload as VaultCredentialsPresentPayload,
+  type VaultCredentialsPresentResponsePayload,
+} from "../specs/vault/credentials/present/0.1/payload.js";
 import {
   TYPE_URI as CRED_RECEIVE,
   RESPONSE_TYPE_URI as CRED_RECEIVE_RESPONSE,
   type VaultCredentialsReceiveResponsePayload,
-} from "@openvtc/trust-tasks/vault/credentials/receive/0.1/payload";
+} from "../specs/vault/credentials/receive/0.1/payload.js";
 import {
   TYPE_URI as CRED_ARCHIVE,
   RESPONSE_TYPE_URI as CRED_ARCHIVE_RESPONSE,
-} from "@openvtc/trust-tasks/vault/credentials/archive/0.1/payload";
+} from "../specs/vault/credentials/archive/0.1/payload.js";
 import {
   TYPE_URI as CRED_UNARCHIVE,
   RESPONSE_TYPE_URI as CRED_UNARCHIVE_RESPONSE,
-} from "@openvtc/trust-tasks/vault/credentials/unarchive/0.1/payload";
+} from "../specs/vault/credentials/unarchive/0.1/payload.js";
 import {
   TYPE_URI as CRED_DELETE,
   RESPONSE_TYPE_URI as CRED_DELETE_RESPONSE,
-} from "@openvtc/trust-tasks/vault/credentials/delete/0.1/payload";
+} from "../specs/vault/credentials/delete/0.1/payload.js";
 import {
   TYPE_URI as CRED_RESTORE,
   RESPONSE_TYPE_URI as CRED_RESTORE_RESPONSE,
-} from "@openvtc/trust-tasks/vault/credentials/restore/0.1/payload";
+} from "../specs/vault/credentials/restore/0.1/payload.js";
 import {
   TYPE_URI as CRED_PURGE,
   RESPONSE_TYPE_URI as CRED_PURGE_RESPONSE,
-} from "@openvtc/trust-tasks/vault/credentials/purge/0.1/payload";
+} from "../specs/vault/credentials/purge/0.1/payload.js";
 
 export type { CredentialDescriptor, CredentialStatus };
 
@@ -104,6 +110,10 @@ export interface CredentialFilter {
 }
 
 export interface CredVaultQueryParams extends CredVaultCallerParams, CredentialFilter {
+  /** Only credentials whose subject — the identity the agent presents them as —
+   *  is this DID. Narrows the filter; does not satisfy it on its own, since one
+   *  identity's credentials can be the whole vault. */
+  subjectDid?: string;
   /** Also return archived credentials. A **modifier, not a filter** — it does
    *  not satisfy the at-least-one-filter requirement. */
   includeArchived?: boolean;
@@ -154,6 +164,7 @@ export async function credVaultQuery(
       ...(params.issuerDid ? { issuerDid: params.issuerDid } : {}),
       ...(params.purpose ? { purpose: params.purpose } : {}),
       ...(params.status ? { status: params.status } : {}),
+      ...(params.subjectDid ? { subjectDid: params.subjectDid } : {}),
       ...(params.includeArchived ? { includeArchived: true } : {}),
       ...(params.includeDeleted ? { includeDeleted: true } : {}),
     },
@@ -172,6 +183,18 @@ export interface CredVaultGetParams extends CredVaultCallerParams {
 }
 
 /**
+ * A stored credential's body, the way `vault/credentials/get/0.2` returns it
+ * and `receive` accepts it: `credential` for a format whose canonical form is a
+ * JSON object, `credentialBase64` (base64url, unpadded) for anything else — an
+ * SD-JWT's compact serialisation, an mdoc's CBOR. Exactly one is present, and
+ * `format` (an OpenID4VC format identifier) says which, so a reader never
+ * sniffs the body.
+ */
+export type StoredCredential =
+  | { format: string; credential: Record<string, unknown> }
+  | { format: string; credentialBase64: string };
+
+/**
  * Fetch one credential's full body, for presentation.
  *
  * The only call in this module that returns credential contents. An archived or
@@ -181,11 +204,15 @@ export interface CredVaultGetParams extends CredVaultCallerParams {
  * Hold the result no longer than the presentation it was fetched for. The agent
  * remains the record — only it sees a later revocation or lifecycle change, and
  * a cached body outlives both.
+ *
+ * The generated response type loses the schema's `oneOf`, so the exactly-one
+ * rule is checked here rather than trusted: a reply carrying both bodies, or
+ * neither, is refused instead of picking one.
  */
 export async function credVaultGet(
   sender: TrustTaskSender,
   params: CredVaultGetParams,
-): Promise<Record<string, unknown>> {
+): Promise<StoredCredential> {
   const envelope = buildTrustTask(
     CRED_GET,
     { id: params.id },
@@ -193,9 +220,75 @@ export async function credVaultGet(
   );
   const res = await sender.send<VaultCredentialsGetResponsePayload>(envelope, {
     expectedResponseType: CRED_GET_RESPONSE,
-    operationLabel: "vault/credentials/get/0.1",
+    operationLabel: "vault/credentials/get/0.2",
   });
-  return res.credential as Record<string, unknown>;
+  const { format, credential, credentialBase64 } = res as {
+    format?: unknown;
+    credential?: unknown;
+    credentialBase64?: unknown;
+  };
+  if (typeof format !== "string" || format.length === 0) {
+    throw new Error("vault/credentials/get/0.2: reply names no format");
+  }
+  const isObject = typeof credential === "object" && credential !== null && !Array.isArray(credential);
+  if (isObject && credentialBase64 === undefined) {
+    return { format, credential: credential as Record<string, unknown> };
+  }
+  if (typeof credentialBase64 === "string" && credential === undefined) {
+    return { format, credentialBase64 };
+  }
+  throw new Error("vault/credentials/get/0.2: reply must carry exactly one of credential or credentialBase64");
+}
+
+export interface CredVaultPresentParams extends CredVaultCallerParams {
+  /** Handle from a {@link CredentialDescriptor}. */
+  id: string;
+  /** The verifier the presentation is for — its DID, for a community. */
+  audience: string;
+  /** The verifier's nonce. For a task that carries the presentation in its
+   *  own request, that request document's `id`. Never reused. */
+  nonce: string;
+  /** The subject claims to disclose, by name. */
+  claims: string[];
+  /** Why, in the holder's words; kept with the agent's record of it. */
+  purpose?: string;
+}
+
+/** Error code: every presentation of the credential discloses claims the
+ *  request does not name; `details.undisclosed` lists them. */
+export const CRED_PRESENT_WOULD_OVER_DISCLOSE = "vault/credentials/present:wouldOverDisclose";
+
+/**
+ * Have the agent present one stored credential to a verifier the caller
+ * names, bound to that verifier and its nonce, disclosing only `claims`.
+ *
+ * The agent signs as the credential's subject, so this is a disclosure to a
+ * third party under the subject's signature: the agent records it before it
+ * answers. The caller carries `presentation` to the verifier unchanged.
+ *
+ * A credential that cannot hide a claim `claims` leaves out is refused with
+ * {@link CRED_PRESENT_WOULD_OVER_DISCLOSE} rather than presented, so asking
+ * the person about the rest is the caller's to do.
+ */
+export async function credVaultPresent(
+  sender: TrustTaskSender,
+  params: CredVaultPresentParams,
+): Promise<VaultCredentialsPresentResponsePayload> {
+  const payload = {
+    id: params.id,
+    audience: params.audience,
+    nonce: params.nonce,
+    claims: params.claims,
+    ...(params.purpose ? { purpose: params.purpose } : {}),
+  } as VaultCredentialsPresentPayload;
+  const envelope = buildTrustTask(CRED_PRESENT, payload, {
+    issuer: params.holder.did,
+    recipient: params.service.did,
+  });
+  return sender.send<VaultCredentialsPresentResponsePayload>(envelope, {
+    expectedResponseType: CRED_PRESENT_RESPONSE,
+    operationLabel: "vault/credentials/present/0.1",
+  });
 }
 
 export interface CredVaultReceiveParams extends CredVaultCallerParams {

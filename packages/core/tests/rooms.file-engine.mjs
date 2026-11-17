@@ -36,10 +36,10 @@ const slug = (type) => type.replace("https://trusttasks.org/spec/", "");
 
 /** `rooms/keys/act`'s table, as much of it as these flows use. */
 const ACTION = {
-  "rooms/info/0.1": "read",
-  "rooms/records/list/0.1": "read",
-  "rooms/records/get/0.2": "read",
-  "rooms/records/put/0.2": "write",
+  "rooms/info/0.3": "read",
+  "rooms/records/list/0.6": "read",
+  "rooms/records/get/0.3": "read",
+  "rooms/records/put/0.5": "write",
   "rooms/blobs/upload/begin/0.2": "write",
   "rooms/blobs/get/0.2": "read",
   "rooms/blobs/chunk/0.1": "read",
@@ -64,7 +64,7 @@ function fakeVta() {
         asked.push(slug(envelope.type));
         assert.equal(envelope.issuer, SIGNER.did, "the wallet asks its own VTA");
         switch (slug(envelope.type)) {
-          case "rooms/keys/act/0.1": {
+          case "rooms/keys/act/0.11": {
             const doc = structuredClone(p.document);
             assert.equal(doc.proof, undefined, "act takes an unsigned document");
             assert.equal(doc.payload.presentation, undefined, "and no presentation");
@@ -78,12 +78,12 @@ function fakeVta() {
             await signTrustTask({ envelope: doc, signing: PERSONA, proofPurpose: "authentication" });
             return { principal: PERSONA.did, document: doc };
           }
-          case "rooms/keys/file-key/0.1":
+          case "rooms/keys/file-key/0.2":
             return { key: FILE_KEY, epoch: EPOCH };
           // A stand-in for the record AEAD: the version is bound in, so a body
           // sealed for one version does not open at another — the property the
           // re-seal loop exists for. The body is signed as its author, the persona.
-          case "rooms/keys/seal/0.2": {
+          case "rooms/keys/seal/0.3": {
             assert.equal(p.signAsPrincipal, true);
             const body = JSON.parse(Buffer.from(p.plaintext, "base64url").toString());
             assert.equal(body.author, PERSONA.did, "the body names the persona as its author");
@@ -91,7 +91,7 @@ function fakeVta() {
             await signTrustTask({ envelope: body, signing: PERSONA, proofPurpose: "assertionMethod" });
             return { sealed: { ciphertext: b64u(Buffer.from(JSON.stringify(body))), nonce: `v${p.version}`, epoch: EPOCH } };
           }
-          case "rooms/keys/open/0.1":
+          case "rooms/keys/open/0.2":
             if (p.sealed.nonce !== `v${p.version}`) throw new Error("sealed for another version");
             return { plaintext: p.sealed.ciphertext };
           default:
@@ -125,7 +125,7 @@ function fakeHost(opts = {}) {
     assert.equal(envelope.recipient, HOST_DID);
     assert.notEqual(envelope.issuer, SIGNER.did, "the wallet's own DID reaches no host");
     switch (s) {
-      case "rooms/info/0.1":
+      case "rooms/info/0.3":
         presented(p, "read");
         return {
           roomId: ROOM,
@@ -161,10 +161,10 @@ function fakeHost(opts = {}) {
         state.blobs.set(u.ref, u);
         return { blobRef: opts.commitAs ?? u.ref, size: u.manifest.size };
       }
-      case "rooms/records/list/0.1":
+      case "rooms/records/list/0.6":
         presented(p, "read");
         return { records: [], headVersion: state.version };
-      case "rooms/records/put/0.2": {
+      case "rooms/records/put/0.5": {
         presented(p, "write");
         // Another member's write lands between this one's seal and its put.
         if (state.racesLeft > 0) {
@@ -174,14 +174,36 @@ function fakeHost(opts = {}) {
         if (p.expectedVersion !== undefined && p.expectedVersion !== 0) {
           assert.equal(p.expectedVersion, state.records.get(p.key)?.version, "a rewrite names what landed");
         }
+        // Host item 12: an open record's blobs are exactly its file's.
+        if (p.cleartext) {
+          const file = p.cleartext.file;
+          assert.ok(file, "an open put here carries a file");
+          assert.deepEqual(p.blobs, [file.blobRef], "an open record names exactly its file's blob");
+          assert.match(file.fileKey, /^[A-Za-z0-9_-]{43}$/, "and carries its key");
+        }
         const version = ++state.version;
-        state.records.set(p.key, { version, sealed: p.sealed, blobs: p.blobs, author: envelope.issuer });
+        state.records.set(p.key, {
+          version,
+          ...(p.sealed ? { sealed: p.sealed } : {}),
+          ...(p.cleartext ? { cleartext: p.cleartext } : {}),
+          blobs: p.blobs,
+          author: envelope.issuer,
+        });
         return { key: p.key, version };
       }
-      case "rooms/records/get/0.2": {
+      case "rooms/records/get/0.3": {
         presented(p, "read");
         const r = state.records.get(p.key);
-        return { roomId: ROOM, key: p.key, version: r.version, author: r.author, sealed: r.sealed, blobs: r.blobs };
+        state.gets = [...(state.gets ?? []), slug(envelope.type)];
+        return {
+          roomId: ROOM,
+          key: p.key,
+          version: r.version,
+          author: opts.dropAuthor ? undefined : r.author,
+          ...(r.sealed ? { sealed: r.sealed } : {}),
+          ...(r.cleartext ? { cleartext: opts.rewriteCleartext?.(r.cleartext) ?? r.cleartext } : {}),
+          blobs: r.blobs,
+        };
       }
       case "rooms/blobs/get/0.2": {
         presented(p, "read");
@@ -315,13 +337,74 @@ test("the same file uploaded twice is stored once", async () => {
   assert.equal(chunkCalls(), before, "no chunk is sent for a blob the room holds");
 });
 
-test("an open room is refused before a file key is asked for", async () => {
+// An open room has no storage key: the file is sealed under a key minted for it
+// alone, which the record carries in the clear (`rooms/records/put/0.5`).
+test("an open room's file is sealed under its own key, written at put/0.4 through act/0.11, and comes back", async () => {
   const vta = fakeVta();
-  await assert.rejects(
-    putRoomFile(context(vta, fakeHost({ visibility: "open" })), { name: "a.txt", bytes: sample(10) }),
-    (e) => e instanceof RoomFileError && e.code === "openRoom",
+  const host = fakeHost({ visibility: "open" });
+  const bytes = sample();
+  const put = await putRoomFile(context(vta, host), {
+    name: "brochure.pdf",
+    mediaType: "application/pdf",
+    bytes,
+    title: "2026 brochure",
+    tags: ["public"],
+  });
+  assert.ok(!vta.asked.includes("rooms/keys/file-key/0.2"), "no key is asked of the VTA");
+  assert.ok(!vta.asked.includes("rooms/keys/seal/0.3"), "nothing is sealed as a record");
+  assert.ok(vta.asked.includes("rooms/keys/act/0.11"), "the record is completed at act/0.11");
+  assert.ok(host.asked.includes("rooms/records/put/0.5"));
+  const stored = host.records.get(put.key);
+  assert.equal(stored.cleartext.file.epoch, EPOCH, "written at the room's epoch");
+  assert.notEqual(stored.cleartext.file.fileKey, FILE_KEY);
+  assert.equal(stored.cleartext.title, "2026 brochure");
+
+  const { got, bytes: back } = await getAll(context(vta, host), put.key);
+  assert.deepEqual(new Uint8Array(back), bytes);
+  assert.equal(got.signed, false, "an open room's record is the host's word, not a signed body");
+  assert.equal(got.author, PERSONA.did);
+  assert.equal(got.file.name, "brochure.pdf");
+  assert.equal(got.file.fileKey, undefined, "the key is not handed back");
+  assert.equal(got.title, "2026 brochure");
+  assert.deepEqual(got.tags, ["public"]);
+  assert.equal(vta.asked.filter((s) => s === "rooms/keys/file-key/0.2").length, 0, "nor asked for to open it");
+});
+
+test("every request is completed at act/0.11", async () => {
+  const vta = fakeVta();
+  await putRoomFile(context(vta, fakeHost({ visibility: "open" })), { name: "a.txt", bytes: sample(10) });
+  assert.deepEqual(
+    vta.asked.filter((s) => s.startsWith("rooms/keys/act/")),
+    ["rooms/keys/act/0.11", "rooms/keys/act/0.11", "rooms/keys/act/0.11"],
+    "info, begin and the put/0.4 record",
   );
-  assert.ok(!vta.asked.includes("rooms/keys/file-key/0.1"));
+});
+
+test("an open room's file whose manifest carries no key is refused, never opened", async () => {
+  const vta = fakeVta();
+  const host = fakeHost({
+    visibility: "open",
+    rewriteCleartext: (c) => {
+      const { fileKey: _, ...file } = c.file;
+      return { ...c, file };
+    },
+  });
+  const put = await putRoomFile(context(vta, host), { name: "a.txt", bytes: sample(10) });
+  await assert.rejects(
+    getAll(context(vta, host), put.key),
+    (e) => e instanceof RoomFileError && e.code === "hostMisbehaved",
+  );
+  assert.ok(!vta.asked.includes("rooms/keys/file-key/0.2"), "no derived key is asked for in its place");
+});
+
+test("an open room's file under the wrong key does not verify", async () => {
+  const vta = fakeVta();
+  const host = fakeHost({
+    visibility: "open",
+    rewriteCleartext: (c) => ({ ...c, file: { ...c.file, fileKey: Buffer.alloc(32, 1).toString("base64url") } }),
+  });
+  const put = await putRoomFile(context(vta, host), { name: "a.txt", bytes: sample(10) });
+  await assert.rejects(getAll(context(vta, host), put.key));
 });
 
 test("a room that takes no files is refused before a file key is asked for", async () => {
@@ -330,7 +413,7 @@ test("a room that takes no files is refused before a file key is asked for", asy
     putRoomFile(context(vta, fakeHost({ filesEnabled: false })), { name: "a.txt", bytes: sample(10) }),
     (e) => e instanceof RoomFileError && e.code === "filesDisabled",
   );
-  assert.ok(!vta.asked.includes("rooms/keys/file-key/0.1"));
+  assert.ok(!vta.asked.includes("rooms/keys/file-key/0.2"));
 });
 
 test("a file over the in-memory ceiling is refused before anything is asked", async () => {
@@ -346,7 +429,7 @@ test("an upload that fails part way releases what begin reserved", async () => {
   const host = fakeHost({ failChunk: 1 });
   await assert.rejects(putRoomFile(context(fakeVta(), host), { name: "a.bin", bytes: sample() }), /connection reset/);
   assert.deepEqual(host.aborted, ["u1"]);
-  assert.ok(!host.asked.includes("rooms/records/put/0.2"), "no record names a blob that was never committed");
+  assert.ok(!host.asked.includes("rooms/records/put/0.5"), "no record names a blob that was never committed");
 });
 
 test("a host that commits some other blob is caught before the record is written", async () => {
@@ -355,7 +438,7 @@ test("a host that commits some other blob is caught before the record is written
     putRoomFile(context(fakeVta(), host), { name: "a.txt", bytes: sample(10) }),
     (e) => e instanceof RoomFileError && e.code === "hostMisbehaved",
   );
-  assert.ok(!host.asked.includes("rooms/records/put/0.2"));
+  assert.ok(!host.asked.includes("rooms/records/put/0.5"));
 });
 
 test("a chunk altered by the host is refused, and nothing is released", async () => {
@@ -403,7 +486,7 @@ test("a record that no longer names its blob is reported as released", async () 
   const put = await putRoomFile(context(vta, host), { name: "a.txt", bytes: sample(10) });
   const stripped = { sendCompleted: async (env) => {
     const r = await host.sender.sendCompleted(env);
-    return slug(env.type) === "rooms/records/get/0.2" ? { ...r, blobs: undefined } : r;
+    return slug(env.type).startsWith("rooms/records/get/") ? { ...r, blobs: undefined } : r;
   } };
   await assert.rejects(
     getRoomFile(context(vta, { ...host, sender: stripped }), put.key, () => undefined),
@@ -417,7 +500,7 @@ test("a body signed by someone other than the recorded author is refused before 
   const put = await putRoomFile(context(vta, host), { name: "a.txt", bytes: sample(10) });
   const misattributed = { sendCompleted: async (env) => {
     const r = await host.sender.sendCompleted(env);
-    return slug(env.type) === "rooms/records/get/0.2" ? { ...r, author: "did:key:zSomeoneElse" } : r;
+    return slug(env.type).startsWith("rooms/records/get/") ? { ...r, author: "did:key:zSomeoneElse" } : r;
   } };
   const asked = host.asked.length;
   await assert.rejects(getRoomFile(context(vta, { ...host, sender: misattributed }), put.key, () => undefined), /host recorded/);
@@ -462,7 +545,7 @@ function hostChannel(fetchImpl) {
 
 const request = () => ({
   id: crypto.randomUUID(),
-  type: "https://trusttasks.org/spec/rooms/info/0.1",
+  type: "https://trusttasks.org/spec/rooms/info/0.3",
   issuer: SIGNER.did,
   recipient: HOST_SIGNER.did,
   issuedAt: new Date().toISOString(),
@@ -471,7 +554,7 @@ const request = () => ({
 
 test("a room request is signed by the caller and carries no bearer", async () => {
   const f = stubFetch((doc) => signedReply(doc));
-  const got = await hostChannel(f.impl).send(request(), { expectedResponseType: "https://trusttasks.org/spec/rooms/info/0.1#response" });
+  const got = await hostChannel(f.impl).send(request(), { expectedResponseType: "https://trusttasks.org/spec/rooms/info/0.3#response" });
   assert.deepEqual(got, { roomId: ROOM });
   const { doc, init } = f.sent[0];
   assert.equal(doc.proof.verificationMethod.split("#")[0], SIGNER.did);
@@ -503,7 +586,7 @@ test("a completed document goes out unchanged, and its reply must be the host's,
   const doc = { ...request(), issuer: PERSONA_KEY.did };
   await signTrustTask({ envelope: doc, signing: PERSONA_KEY, proofPurpose: "authentication" });
   const before = JSON.stringify(doc);
-  await channel.sendCompleted(doc, { expectedResponseType: "https://trusttasks.org/spec/rooms/info/0.1#response" });
+  await channel.sendCompleted(doc, { expectedResponseType: "https://trusttasks.org/spec/rooms/info/0.3#response" });
   assert.equal(JSON.stringify(f.sent[0].doc), before, "sent exactly as the VTA completed it");
   await assert.rejects(channel.send(request()), /signs nothing/, "a channel with no key signs nothing");
 });
@@ -528,7 +611,7 @@ function curated(host, by, told) {
     sender: {
       sendCompleted: async (env) => {
         const r = await host.sender.sendCompleted(env);
-        if (slug(env.type) !== "rooms/records/get/0.2") return r;
+        if (!slug(env.type).startsWith("rooms/records/get/")) return r;
         return {
           ...r,
           version: r.version + by,
@@ -539,13 +622,73 @@ function curated(host, by, told) {
   };
 }
 
+/**
+ * The VTA, refusing `task` once with `unknownEpoch` and `reason` — as an agent
+ * that missed a commit, or holds nothing from before its member joined, does —
+ * until a `rooms/keys/read` of the record lets it repair from the host.
+ */
+function behindVta(vta, task, reason, reads) {
+  let repaired = false;
+  return {
+    ...vta,
+    sender: {
+      async send(envelope) {
+        const s = slug(envelope.type);
+        if (s.startsWith("rooms/keys/read/")) {
+          reads.push(structuredClone(envelope.payload));
+          repaired = true;
+          return {};
+        }
+        if (s === task && !repaired) {
+          const name = task.split("/")[2];
+          throw Object.assign(new Error(`the record is sealed under an epoch this agent does not hold (${reason})`), {
+            details: { code: `rooms/keys/${name}:unknownEpoch`, details: { reason } },
+          });
+        }
+        return vta.sender.send(envelope);
+      },
+    },
+  };
+}
+
+for (const [task, reason] of [
+  ["rooms/keys/open/0.2", "beyondChain"],
+  ["rooms/keys/open/0.2", "notDelivered"],
+  ["rooms/keys/file-key/0.2", "beyondChain"],
+  ["rooms/keys/file-key/0.2", "notDelivered"],
+]) {
+  test(`a file whose ${task.split("/")[2]} is refused ${reason} opens after one read lets the agent repair`, async () => {
+    const vta = fakeVta();
+    const host = fakeHost();
+    const put = await putRoomFile(context(vta, host), { name: "a.txt", bytes: sample(10) });
+    const reads = [];
+    const { got } = await getAll(context(behindVta(vta, task, reason, reads), host), put.key);
+    assert.equal(got.file.name, "a.txt");
+    assert.equal(reads.length, 1, "one read, naming the host, is the repair");
+    assert.equal(reads[0].host, HOST_DID);
+    assert.equal(reads[0].key, put.key);
+  });
+}
+
+test("a member removed from the room is not repaired: the refusal stands", async () => {
+  const vta = fakeVta();
+  const host = fakeHost();
+  const put = await putRoomFile(context(vta, host), { name: "a.txt", bytes: sample(10) });
+  const reads = [];
+  await assert.rejects(
+    getAll(context(behindVta(vta, "rooms/keys/open/0.2", "removed", reads), host), put.key),
+    /removed/,
+  );
+  assert.equal(reads.length, 0, "nothing to repair, so nothing asked");
+});
+
 /** The VTA, opening a body only where it was sealed — and, asked at a later version, searching back and saying where. */
 function searchingVta(vta, opened) {
   return {
     ...vta,
     sender: {
       async send(envelope) {
-        if (slug(envelope.type) !== "rooms/keys/open/0.1") return vta.sender.send(envelope);
+        if (slug(envelope.type) !== "rooms/keys/open/0.2") return vta.sender.send(envelope);
         const p = envelope.payload;
         opened.push(structuredClone(p));
         assert.equal(p.sealed.version, undefined, "keys/open takes no `version` in `sealed`");
@@ -585,7 +728,7 @@ test("a sealed-at version after the record's own is refused before anything is o
   const put = await putRoomFile(context(vta, host), { name: "a.txt", bytes: sample(10) });
   const lying = { ...host, sender: { sendCompleted: async (env) => {
     const r = await host.sender.sendCompleted(env);
-    return slug(env.type) === "rooms/records/get/0.2" ? { ...r, sealed: { ...r.sealed, version: r.version + 1 } } : r;
+    return slug(env.type).startsWith("rooms/records/get/") ? { ...r, sealed: { ...r.sealed, version: r.version + 1 } } : r;
   } } };
   const opened = [];
   await assert.rejects(
@@ -593,4 +736,15 @@ test("a sealed-at version after the record's own is refused before anything is o
     /not a version at or before the record's/,
   );
   assert.equal(opened.length, 0);
+});
+
+// get/0.3 carries the host's `bodyStoredAt`, which the author's signature is
+// checked against; act/0.11 is the version whose table completes it.
+test("a file is read at get/0.3 through act/0.11", async () => {
+  const vta = fakeVta();
+  const host = fakeHost();
+  const { key } = await putRoomFile(context(vta, host), { name: "a.txt", bytes: sample(10) });
+  await getRoomFile(context(vta, host), key, () => {});
+  assert.deepEqual(host.gets, ["rooms/records/get/0.3"]);
+  assert.ok(vta.asked.includes("rooms/keys/act/0.11"));
 });

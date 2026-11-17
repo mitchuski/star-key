@@ -15,26 +15,28 @@
 // persona (`@openvtc/pnm-core/rooms`'s `actAndSend`); the VTA's own reads
 // (`rooms/keys/{browse,read}`) go out as the persona too.
 
-import { CONTACT_METHODS, type TrustTaskSender } from "@openvtc/pnm-core";
+import { CONTACT_METHODS, resolveDidDocumentAt, type TrustTaskSender } from "@openvtc/pnm-core";
 import { resolveCommunityDocument, selectSignInServices, verifyDomainLinkage } from "@openvtc/pnm-core/vtc";
 import {
   communityRoomMemberships,
   opaqueRecordKey,
+  putCleartextAsMember,
   roomInfoAsMember,
   roomNamesFromOffers,
   type CommunityRoomName,
   roomsKeysBrowse,
   roomsKeysList,
   roomsKeysRead,
+  readSealedVersion,
   roomProfileView,
   roomsKeysProfileRead,
   writeSealedAsMember,
   type PersonaRoom,
 } from "@openvtc/pnm-core/rooms";
-import { RoomHostChannel, verifyRecordBody } from "@openvtc/pnm-core/rooms/files";
+import { RecordBodyError, RoomHostChannel, verifyRecordBody, type ResolveDidAt } from "@openvtc/pnm-core/rooms/files";
 import { base64url } from "@openvtc/vti-didcomm-js";
 
-import { membersAt } from "./room-page-policy.js";
+import { admittedOpenRooms, membersAt } from "./room-page-policy.js";
 import type {
   OffscreenRoomsPageOp,
   PageListingView,
@@ -118,7 +120,7 @@ export async function runRoomsPageOp(
   if (op.op === "roomNames") {
     // The community's own record, member by member: each read is signed as that
     // member, and one that fails (an identity with no rooms, a VTA without
-    // act 0.5) costs only its own names. The record lists a room for as long as
+    // act 0.11) costs only its own names. The record lists a room for as long as
     // the community keeps it — an accepted one too, long after its offer closed.
     const { endpoint } = await (deps.portal ?? ((d) => resolvePortal(d, now)))(op.hostDid);
     const community = {
@@ -140,6 +142,31 @@ export async function runRoomsPageOp(
       }
     }
     return names;
+  }
+
+  if (op.op === "openRooms") {
+    // The community's record, member by member, as `roomNames` reads it: an open
+    // room has no group, so only the record says the member is in it.
+    const { endpoint } = await (deps.portal ?? ((d) => resolvePortal(d, now)))(op.hostDid);
+    const community = {
+      did: op.hostDid,
+      sender: (deps.completed ?? ((hostDid, ep) => new RoomHostChannel({ hostDid, endpoint: ep })))(op.hostDid, endpoint),
+    };
+    const out: { roomId: string; member: string; actions: string[] }[] = [];
+    for (const member of new Set(op.members)) {
+      try {
+        const rooms = await communityRoomMemberships({
+          holder: { did: holderDid },
+          vta: { did: vta.vtaDid, sender },
+          community,
+          member,
+        });
+        out.push(...admittedOpenRooms(rooms, member));
+      } catch {
+        // Nothing from this member this time: its open rooms are not offered.
+      }
+    }
+    return out;
   }
 
   if (op.op === "roomProfiles") {
@@ -213,10 +240,19 @@ export async function runRoomsPageOp(
     case "putNote": {
       const r = await room(op.roomId, op.member);
       const { principal, info } = await roomInfoAsMember(r);
-      if (info.visibility === "open") {
-        throw new Error("this room is open: notes from the portal go in attributed rooms, whose records are sealed");
-      }
       const key = opaqueRecordKey();
+      if (info.visibility === "open") {
+        // An open room's records are cleartext the host stores and reads: no group
+        // to seal under, and the member's request is what says the note is theirs.
+        const version = await putCleartextAsMember(r, {
+          key,
+          title: op.title,
+          ...(op.body !== undefined ? { body: op.body } : {}),
+          ...(op.description !== undefined ? { description: op.description } : {}),
+          ...(op.tags !== undefined ? { tags: op.tags } : {}),
+        });
+        return { key, version };
+      }
       const version = await writeSealedAsMember(r, {
         roomId: op.roomId,
         key,
@@ -243,50 +279,112 @@ function summary(r: Record<string, unknown>): PageRecordSummary {
   if (typeof r.author === "string") out.author = r.author;
   if (typeof r.title === "string") out.title = r.title;
   if (typeof r.description === "string") out.description = r.description;
+  // `rooms/keys/browse/0.4` (`RecordMetadataV3`): what a page orders messages and judges `writtenAt` by.
+  if (typeof r.createdAt === "string") out.createdAt = r.createdAt;
+  if (typeof r.createdBy === "string") out.createdBy = r.createdBy;
+  if (typeof r.kind === "string") out.kind = r.kind;
   return out;
+}
+
+/** The members of a body that say what a record is and where it sits (trust-tasks-tf #1027), as a page sees them. */
+function threadMembers(m: {
+  kind?: unknown;
+  inReplyTo?: unknown;
+  writtenAt?: unknown;
+  editedAt?: unknown;
+}): Pick<PageRecordView, "kind" | "inReplyTo" | "writtenAt" | "editedAt"> {
+  const r = m.inReplyTo as { key?: unknown; version?: unknown } | undefined;
+  return {
+    ...(typeof m.kind === "string" ? { kind: m.kind } : {}),
+    ...(r && typeof r.key === "string"
+      ? { inReplyTo: { key: r.key, ...(typeof r.version === "number" ? { version: r.version } : {}) } }
+      : {}),
+    ...(typeof m.writtenAt === "string" ? { writtenAt: m.writtenAt } : {}),
+    ...(typeof m.editedAt === "string" ? { editedAt: m.editedAt } : {}),
+  };
+}
+
+/** Whether `validUntil` has passed: the record is then not presented (*Expiry*). */
+function hasExpired(validUntil: unknown, now: number): validUntil is string {
+  if (typeof validUntil !== "string") return false;
+  const t = Date.parse(validUntil);
+  return !Number.isNaN(t) && t <= now;
 }
 
 /**
  * One record as a page may see it. On a sealed room the body is verified —
- * signed by its author for `assertionMethod`, for this room, key and version,
- * and (on `attributed`) by the author the host recorded — before any of it is
- * put in the view. A body that fails is refused.
+ * signed by its author for `assertionMethod`, against the author's DID document
+ * as it stood at the host's `bodyStoredAt`, for this room, key and the version
+ * it was sealed at (`readSealedVersion`), and (on `attributed`) by the author
+ * the host recorded — before any of it is put in the view. A body that fails is
+ * refused, and so is one whose proof fails against the author's document as of
+ * `bodyStoredAt` where the method keeps that history (`resolveDidDocumentAt`).
+ * One whose author cannot be verified (*Which DID document*: no `bodyStoredAt`,
+ * or a method without history; *An author whose DID does not resolve*) is the
+ * placeholder `authorUnverified`, with nothing of it. A record past its `validUntil` is `expired`, with nothing of it
+ * either: a page building a listing shows it only when asked to.
  */
 export async function readView(
   roomId: string,
   key: string,
   read: {
-    key: string;
-    version: number;
+    key?: string;
+    version?: number;
     status?: string;
     updatedAt?: string;
+    createdAt?: string;
+    createdBy?: string;
+    bodyStoredAt?: string;
     author?: string;
     plaintext?: string;
     cleartext?: Record<string, unknown>;
-    verification: unknown;
+    verification?: unknown;
+    ext?: unknown;
   },
-  resolveDid?: (did: string) => Promise<Record<string, unknown>>,
+  resolvers: {
+    /** The author's current document. Defaults to the wallet's resolver. */
+    resolveDid?: (did: string) => Promise<Record<string, unknown>>;
+    /** The author's document as of `bodyStoredAt`. Defaults to `resolveDidDocumentAt`. */
+    resolveDidAt?: ResolveDidAt;
+  } = {},
+  now: number = Date.now(),
 ): Promise<PageRecordView> {
-  if (read.key !== key) throw new Error(`the agent answered for record ${read.key}, not ${key}`);
+  if (read.key !== key) throw new Error(`the agent answered for record ${String(read.key)}, not ${key}`);
+  if (read.version === undefined) throw new Error(`the agent answered for record ${key} without its version`);
   const base: PageRecordView = {
-    key: read.key,
+    key,
     version: read.version,
     status: read.status ?? "active",
     updatedAt: read.updatedAt ?? "",
     sealed: read.cleartext === undefined,
     verification: read.verification,
     ...(read.author !== undefined ? { author: read.author } : {}),
+    ...(read.createdAt !== undefined ? { createdAt: read.createdAt } : {}),
+    ...(read.createdBy !== undefined ? { createdBy: read.createdBy } : {}),
   };
   if (read.plaintext !== undefined) {
-    const body = await verifyRecordBody(
-      base64url.decode(read.plaintext),
-      { roomId, key, version: read.version },
-      read.author,
-      resolveDid ? { resolveDid } : {},
-    );
+    let body;
+    try {
+      body = await verifyRecordBody(
+        base64url.decode(read.plaintext),
+        // The version the body was sealed at: a curated record has moved past it.
+        { roomId, key, version: readSealedVersion({ version: read.version, ext: read.ext }) },
+        read.author,
+        {
+          ...(resolvers.resolveDid ? { resolveDid: resolvers.resolveDid } : {}),
+          resolveDidAt: resolvers.resolveDidAt ?? ((did, at) => resolveDidDocumentAt(did, at)),
+          ...(read.bodyStoredAt !== undefined ? { bodyStoredAt: read.bodyStoredAt } : {}),
+        },
+      );
+    } catch (e) {
+      if (e instanceof RecordBodyError && e.placeholder) return { ...base, authorUnverified: true };
+      throw e;
+    }
+    if (hasExpired(body.validUntil, now)) return { ...base, author: body.author, expired: true, validUntil: body.validUntil };
     return {
       ...base,
       author: body.author,
+      ...threadMembers(body),
       ...(body.title !== undefined ? { title: body.title } : {}),
       ...(body.description !== undefined ? { description: body.description } : {}),
       ...(body.body !== undefined ? { body: body.body } : {}),
@@ -304,17 +402,27 @@ export async function readView(
   }
   if (read.cleartext !== undefined) {
     const c = read.cleartext;
+    if (hasExpired(c.validUntil, now)) return { ...base, expired: true, validUntil: c.validUntil };
     const str = (v: unknown) => (typeof v === "string" ? v : undefined);
     const title = str(c.title);
     const description = str(c.description);
     const body = str(c.body);
     const tags = Array.isArray(c.tags) ? c.tags.filter((t): t is string => typeof t === "string") : undefined;
+    // An open room's file (`rooms/records/put/0.5`): what the page shows of it —
+    // never its `fileKey`, which stays with the wallet's file engine.
+    const f = c.file && typeof c.file === "object" ? (c.file as Record<string, unknown>) : undefined;
+    const file =
+      f && typeof f.name === "string" && typeof f.size === "number" && Number.isSafeInteger(f.size) && f.size >= 0
+        ? { name: f.name, size: f.size, ...(typeof f.mediaType === "string" ? { mediaType: f.mediaType } : {}) }
+        : undefined;
     return {
       ...base,
+      ...threadMembers(c),
       ...(title !== undefined ? { title } : {}),
       ...(description !== undefined ? { description } : {}),
       ...(body !== undefined ? { body } : {}),
       ...(tags !== undefined ? { tags } : {}),
+      ...(file !== undefined ? { file } : {}),
     };
   }
   // A retracted record: the tombstone is the answer.

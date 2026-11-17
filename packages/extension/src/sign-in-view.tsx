@@ -112,6 +112,10 @@ import { failureDetails } from "./sign-in-failure.js";
 import { UV_APPROVER_HELP } from "./sign-in-uv-messages.js";
 import { requestOriginPermissions } from "./host-permissions.js";
 
+/** The "Join as" choice for a new identity. Not a DID, so it can never be
+ *  sent as one. */
+const NEW_IDENTITY = "new-identity";
+
 /** The wallet passkey operations the window needs. Injected for tests. */
 export interface UvPasskeyOps {
   /** Whether the wallet has its passkey yet. */
@@ -764,6 +768,9 @@ export function SignInView({
   const [entryId, setEntryId] = useState("");
   const [identities, setIdentities] = useState<SignInIdentityView[]>([]);
   const [joinDid, setJoinDid] = useState("");
+  // The hosting server a new identity is published through, when `joinDid`
+  // is NEW_IDENTITY.
+  const [joinServer, setJoinServer] = useState("");
   const [answers, setAnswers] = useState<Record<string, string>>({});
   const [registryConsent, setRegistryConsent] = useState(false);
   // MyTerms: join under the agreement offered. On when one is offered; the
@@ -796,9 +803,14 @@ export function SignInView({
         setEntryId(res.result.identities[0]?.entryId ?? "");
         // One identity is no choice: clicking the code on the verified portal
         // was the person's go-ahead, so the claim goes out without a Continue
-        // (contract C3 step 6, as amended). With more than one, they pick.
+        // (contract C3 step 6, as amended). With more than one, they pick. A
+        // page that signed in to a different community before is shown either
+        // way: the warning is the point of the screen then (M5).
         const only =
-          res.result.identities.length === 1
+          res.result.identities.length === 1 &&
+          !res.result.changedFromDid &&
+          !res.result.alreadyMember &&
+          !res.result.joinOffered
             ? res.result.identities[0]!
             : undefined;
         if (only) {
@@ -815,11 +827,20 @@ export function SignInView({
         setTermsOn(res.result.terms?.status === "offered" && res.result.terms.enabled);
         // Preselect only an identity used nowhere else, and only when it is
         // the one choice: picking for the person would link communities.
+        const servers = res.result.newIdentity?.servers ?? [];
+        setJoinServer(servers[0]?.id ?? "");
+        // A new identity, when the agent can make one, is the one choice that
+        // links this community to nothing else, so it is preselected.
+        // Otherwise preselect only an identity used nowhere else, and only
+        // when it is the one choice: picking for the person would link
+        // communities.
         const fresh = res.result.identities.filter((i) => !i.usedAt?.length);
         setJoinDid(
-          res.result.identities.length === 1 && fresh.length === 1
-            ? fresh[0]!.did
-            : "",
+          servers.length > 0
+            ? NEW_IDENTITY
+            : res.result.identities.length === 1 && fresh.length === 1
+              ? fresh[0]!.did
+              : "",
         );
       }
       if (res.result.kind === "join-hosting") {
@@ -1297,23 +1318,37 @@ export function SignInView({
       const missing = screen.attributes.some(
         (a) => a.required && !(answers[a.type] ?? "").trim(),
       );
+      const attributes = screen.attributes
+        .map((a) => ({ type: a.type, value: (answers[a.type] ?? "").trim() }))
+        .filter((a) => a.value !== "");
       const send = () =>
-        void run({
-          step: "join-submit",
-          did: joinDid,
-          attributes: screen.attributes
-            .map((a) => ({ type: a.type, value: (answers[a.type] ?? "").trim() }))
-            .filter((a) => a.value !== ""),
-          registryConsent,
-          ...(screen.terms?.status === "offered" && termsOn ? { terms: { code: screen.terms.code } } : {}),
-        });
+        void run(
+          joinDid === NEW_IDENTITY
+            ? { step: "join-submit", newIdentity: { serverId: joinServer }, attributes, registryConsent, ...(screen.terms?.status === "offered" && termsOn ? { terms: { code: screen.terms.code } } : {}) }
+            : { step: "join-submit", did: joinDid, attributes, registryConsent, ...(screen.terms?.status === "offered" && termsOn ? { terms: { code: screen.terms.code } } : {}) },
+        );
+      const offer = screen.newIdentity;
+      const canMake = (offer?.servers.length ?? 0) > 0;
+      const choice = (on: boolean, enabled = true): CSSProperties => ({
+        display: "grid",
+        gridTemplateColumns: "auto minmax(0, 1fr)",
+        gap: "2px 10px",
+        alignItems: "start",
+        padding: "10px 12px",
+        borderRadius: radius.md,
+        border: `1px solid ${on ? c.accent : c.line}`,
+        background: on ? c.accentSoft : c.surface,
+        cursor: enabled ? "pointer" : "default",
+        opacity: enabled ? 1 : 0.6,
+        minWidth: 0,
+      });
       return (
         <Screen
           title={`Ask to join ${screen.host}`}
           primary={{
             label: "Send request",
             run: send,
-            disabled: busy || !joinDid || missing,
+            disabled: busy || !joinDid || missing || (joinDid === NEW_IDENTITY && !joinServer),
             testId: "join-submit",
           }}
           secondary={{
@@ -1402,11 +1437,15 @@ export function SignInView({
               )}
             </section>
           ) : null}
-          {screen.identities.length === 0 ? (
+          {screen.identities.length === 0 && !canMake ? (
             <Note tone="warn">
               <div data-testid="no-identities" style={wrap}>
-                Your agent hosts no identities yet, so there is nothing to join
-                as. Create one in the wallet and try again.
+                {offer
+                  ? "Your agent has no DID hosting server to publish a new identity through, " +
+                    "and hosts no identities yet. Add a hosting server in the wallet's manager " +
+                    "and try again."
+                  : "Your agent hosts no identities yet, so there is nothing to join as. " +
+                    "Create one in the wallet and try again."}
               </div>
             </Note>
           ) : (
@@ -1423,23 +1462,69 @@ export function SignInView({
               <legend style={{ ...microLabel, padding: 0, marginBottom: 8 }}>
                 Join as
               </legend>
+              {offer && (
+                <label data-testid="new-identity" style={choice(joinDid === NEW_IDENTITY, canMake)}>
+                  <input
+                    type="radio"
+                    name="applicant"
+                    value={NEW_IDENTITY}
+                    checked={joinDid === NEW_IDENTITY}
+                    disabled={!canMake}
+                    onChange={() => setJoinDid(NEW_IDENTITY)}
+                    style={{ accentColor: c.accent, margin: "3px 0 0", padding: 0 }}
+                  />
+                  <strong style={{ fontSize: t.sm, ...wrap }}>
+                    A new identity for {screen.host}
+                  </strong>
+                  <span />
+                  <span style={{ fontSize: t.xs, color: c.faint, ...wrap }}>
+                    {canMake ? (
+                      <>
+                        Recommended: nothing links it to your other identities.
+                        Your agent sets up the context{" "}
+                        <code style={{ fontFamily: font.mono }}>{offer.contextId}</code>{" "}
+                        and a new DID in it.
+                      </>
+                    ) : (
+                      "Your agent has no DID hosting server to publish one through. " +
+                      "Add one in the wallet's manager first."
+                    )}
+                  </span>
+                  {joinDid === NEW_IDENTITY && offer.servers.length > 1 && (
+                    <>
+                      <span />
+                      <select
+                        data-testid="new-identity-server"
+                        aria-label="Publish it through"
+                        value={joinServer}
+                        onChange={(e) => setJoinServer(e.target.value)}
+                        style={{
+                          font: "inherit",
+                          fontSize: t.sm,
+                          padding: "5px 8px",
+                          background: c.ground,
+                          color: c.text,
+                          border: `1px solid ${c.line}`,
+                          borderRadius: radius.md,
+                          minWidth: 0,
+                        }}
+                      >
+                        {offer.servers.map((sv) => (
+                          <option key={sv.id} value={sv.id}>
+                            {sv.label ? `${sv.label} (${sv.id})` : sv.id}
+                          </option>
+                        ))}
+                      </select>
+                    </>
+                  )}
+                </label>
+              )}
               {screen.identities.map((i) => {
                 const on = joinDid === i.did;
                 return (
                   <label
                     key={i.did}
-                    style={{
-                      display: "grid",
-                      gridTemplateColumns: "auto minmax(0, 1fr)",
-                      gap: "2px 10px",
-                      alignItems: "start",
-                      padding: "10px 12px",
-                      borderRadius: radius.md,
-                      border: `1px solid ${on ? c.accent : c.line}`,
-                      background: on ? c.accentSoft : c.surface,
-                      cursor: "pointer",
-                      minWidth: 0,
-                    }}
+                    style={choice(on)}
                   >
                     <input
                       type="radio"
@@ -1529,6 +1614,8 @@ export function SignInView({
           <p style={{ margin: 0, fontSize: t.sm, color: c.muted, ...wrap }}>
             Sending the request tells {screen.host} the identity you chose.
             Your wallet remembers {screen.host} for that identity.
+            {screen.admission === "review" &&
+              ` Once an administrator approves it, sign in at ${screen.host} with the same wallet.`}
           </p>
         </Screen>
       );
@@ -1656,9 +1743,52 @@ export function SignInView({
           }}
           secondary={declineToClose}
         >
+          {screen.joinOffered && (
+            <div role="status" data-testid="join-offered">
+              <Note tone="accent">
+                You're already a member of{" "}
+                <strong style={wrap}>{screen.communityName}</strong>. Sign in as the
+                identity below, or join again with a new identity of its own.
+              </Note>
+              <button
+                type="button"
+                data-testid="join-new"
+                disabled={busy}
+                onClick={() => void run({ step: "join-new" })}
+                style={{
+                  ...button("default"),
+                  marginTop: 8,
+                  fontSize: t.sm,
+                  padding: "5px 12px",
+                }}
+              >
+                Join with a new identity
+              </button>
+            </div>
+          )}
+          {screen.alreadyMember && (
+            <div role="status" data-testid="already-member">
+              <Note tone="accent">
+                You're already a member of{" "}
+                <strong style={wrap}>{screen.communityName}</strong>, so no request was
+                sent. Continue to sign in.
+              </Note>
+            </div>
+          )}
           <p style={{ margin: 0, color: c.muted }}>
             Nothing is sent to the community until you continue.
           </p>
+          {screen.changedFromDid && (
+            <div role="alert" data-testid="changed-from">
+              <Note tone="danger">
+                <strong>This site signed you in to a different community before.</strong>{" "}
+                Check that <strong style={wrap}>{screen.communityName}</strong> is the one you
+                expect before continuing.
+                <div style={{ ...microLabel, padding: 0, marginTop: 6 }}>Previously</div>
+                <ShortDid value={screen.changedFromDid} />
+              </Note>
+            </div>
+          )}
           <fieldset
             style={{
               border: "none",
@@ -2281,6 +2411,9 @@ function scopeLabel(family: string): string {
       return "the member directory (reading it, and editing your own card)";
     case "vtc/groups":
       return "community groups";
+    case "vtc/boards":
+      // Proposals and notes only: a ticket or a vote is never signed this way (VTI-BRD-051).
+      return "community boards (proposing ideas and leaving notes as you — never voting)";
     default:
       return family;
   }

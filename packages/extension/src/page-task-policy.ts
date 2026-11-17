@@ -98,6 +98,39 @@ const REFUSED: { prefix: string; why: string }[] = [
       "The community's record of which of its rooms the member is in is read by the wallet, as the member. " +
       "A community's own member portal lists it with window.vtaWallet.rooms.offers.",
   },
+  // The member's voter and vetter engine. `vote` and `vote-encrypted` take the
+  // member's ballot in their payload, so a page that drove one would hold the
+  // member's choices; `voter/register` asks for a ticket signed as the member;
+  // `voter/read` signs as the member to the community. A community's own
+  // portal asks through `window.vtaWallet.elections`, whose ballot is filled in
+  // the wallet's own window and never reaches the page.
+  {
+    prefix: "https://trusttasks.org/spec/vta/pcs/",
+    why:
+      "The member's voting and vetting engine holds their tickets, their ballots and their hidden vetting, and a " +
+      "generic prompt cannot say what a page would learn from them — a ballot in a page is a vote the page has " +
+      "seen. A community's own member portal lists elections, takes a ticket and opens the wallet's ballot with " +
+      "window.vtaWallet.elections.",
+  },
+  {
+    prefix: "https://trusttasks.org/spec/vtc/elections/",
+    why:
+      "A community's elections are read, and tickets taken, by the member's own agent signing as them. A " +
+      "community's own member portal uses window.vtaWallet.elections.",
+  },
+  // The member's held notifications (VTI-NTF-050). Each says that a party the
+  // member belongs to, or a community it belongs to, told them something exists
+  // — a list of them is a list of the member's relationships, which is exactly
+  // what VTI-NTF-023 keeps from a sender. A deposit is the client's hand-over of
+  // what it received for a persona, never a page's. A community's own portal
+  // sees its own notified elections through window.vtaWallet.elections.
+  {
+    prefix: "https://trusttasks.org/spec/vta/notifications/",
+    why:
+      "Your held notifications say which communities and parties you belong to, and a generic prompt cannot say " +
+      "what a page would learn from them. Read them in the wallet's console; a community's own member portal " +
+      "sees the elections it notified you of with window.vtaWallet.elections.",
+  },
   // A mediator's own operations surface (`@openvtc/pnm-core/mediator`). A page
   // routing one of these to an agent would be misaddressed anyway — they are
   // served by the relay, not the agent — but the refusal is about what they
@@ -123,6 +156,18 @@ const REFUSED: { prefix: string; why: string }[] = [
       "publication with window.vtaWallet.directory.publishCard, which shows the " +
       "member every value and that anyone will be able to read it before anything " +
       "is signed.",
+  },
+  // A presentation of one of the holder's credentials, signed as its subject,
+  // to a verifier the caller names (`directory-page.ts`). A generic task prompt
+  // cannot show what it discloses or to whom.
+  {
+    prefix: "https://trusttasks.org/spec/vault/credentials/present/",
+    why:
+      "vault/credentials/present has the agent sign a presentation of one of the " +
+      "holder's credentials, as its subject, for a verifier the caller names. A page " +
+      "cannot ask for one: to verify directory fields with a credential, use " +
+      "window.vtaWallet.directory.presentCredential, which shows the member the " +
+      "community and every claim it discloses first.",
   },
   // A Data Integrity proof made as one of the holder's DIDs over a document the
   // caller chose: a credential, a published card. A generic task prompt cannot

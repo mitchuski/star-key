@@ -127,12 +127,47 @@ export function isAgreement(x: unknown): x is Agreement {
   );
 }
 
-/** The latest record per counterparty: what stands today. Input in any order. */
+/** Canonical text of a stored value: object members in sorted key order,
+ *  `undefined` members dropped (as storage drops them). Two records with the
+ *  same text are the same value, so it is a total tie-break: no digest is
+ *  needed (and sha-256 here would be async). */
+function canonicalText(x: unknown): string {
+  if (Array.isArray(x)) return `[${x.map(canonicalText).join(",")}]`;
+  if (x && typeof x === "object") {
+    const o = x as Record<string, unknown>;
+    return `{${Object.keys(o).sort().filter((k) => o[k] !== undefined).map((k) => `${JSON.stringify(k)}:${canonicalText(o[k])}`).join(",")}}`;
+  }
+  return JSON.stringify(x) ?? "null";
+}
+
+/** `at` as a total key: a NaN (possible in memory, never from JSON storage)
+ *  sorts below every time instead of comparing false both ways. */
+function when(a: Agreement): number {
+  return Number.isNaN(a.reached.at) ? Number.NEGATIVE_INFINITY : a.reached.at;
+}
+
+/** Which of two records stands: the later `reached.at`; on a tie the greater
+ *  `id` (the agreement id, unique per record); on a tie of that too (two
+ *  records stored under one id) the greater canonical text. A total order on
+ *  record values, so the standing never depends on the order records were
+ *  read in (before 2026-10-26 a tie on `at` kept whichever came first;
+ *  formal_mage `Formal.Agreements.standing_perm`). */
+function laterThan(a: Agreement, b: Agreement): boolean {
+  if (when(a) !== when(b)) return when(a) > when(b);
+  if (a.id !== b.id) return a.id > b.id;
+  return canonicalText(a) > canonicalText(b);
+}
+
+/** The latest record per counterparty: what stands today. Input in any order:
+ *  the result is the same for every ordering of the same records. Newest
+ *  first; standings reached at the same time in counterparty order. */
 export function standingAgreements(records: readonly Agreement[]): Agreement[] {
   const latest = new Map<string, Agreement>();
   for (const r of records) {
     const held = latest.get(r.counterparty);
-    if (!held || r.reached.at > held.reached.at) latest.set(r.counterparty, r);
+    if (!held || laterThan(r, held)) latest.set(r.counterparty, r);
   }
-  return [...latest.values()].sort((a, b) => b.reached.at - a.reached.at);
+  return [...latest.values()].sort((a, b) =>
+    when(a) !== when(b) ? when(b) - when(a) : a.counterparty < b.counterparty ? -1 : a.counterparty > b.counterparty ? 1 : 0,
+  );
 }

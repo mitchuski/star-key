@@ -28,7 +28,7 @@
 // claims, and never framed, since a `blob:` URL here has the extension's origin.
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import type { HeldRoom } from "@openvtc/pnm-core/rooms";
+import type { RoomPlace } from "../room-groups.js";
 import { Button, Note } from "../../ui.js";
 import { c, t, font } from "../../theme.js";
 import { requestOriginPermission } from "../../host-permissions.js";
@@ -40,8 +40,10 @@ import {
   putRoomFileFromConsole,
   ROOM_FILE_MAX_BYTES,
   safeFileName,
+  writeTarget,
   type GetResult,
   type RoomFileClaim,
+  type WritingPlace,
 } from "../room-files.js";
 import {
   imageBlob,
@@ -107,7 +109,7 @@ export function PutRoomFile({
   prepared,
   onPut,
 }: {
-  room: HeldRoom;
+  room: WritingPlace;
   host: string;
   prepared: RoomFilesPrepared;
   onPut: () => void;
@@ -136,7 +138,7 @@ export function PutRoomFile({
       try {
         if (!(await allowed)) throw new Error(REFUSED_HOST);
         const res = await putRoomFileFromConsole(
-          { roomId: room.roomId, hostDid: host, ...(room.member !== undefined ? { member: room.member } : {}) },
+          writeTarget(room, host),
           file,
           title.trim() ? { title: title.trim() } : {},
           { signal: ctl.signal, onProgress: (p) => setLine(describeProgress(p)) },
@@ -272,7 +274,7 @@ export function GetRoomFile({
   showTitle = true,
   autoPreview = false,
 }: {
-  room: HeldRoom;
+  room: RoomPlace;
   host: string;
   prepared: RoomFilesPrepared | null;
   recordKey: string;
@@ -332,7 +334,7 @@ export function GetRoomFile({
           if (!(await allowed)) throw new Error(REFUSED_HOST);
           const fetchIt = () =>
             getRoomFileIntoConsole(
-              { roomId: room.roomId, hostDid: host, ...(room.member !== undefined ? { member: room.member } : {}) },
+              writeTarget(room, host),
               recordKey,
               {
                 signal: ctl.signal,
@@ -491,14 +493,23 @@ export function GetRoomFile({
 
       {got ? (
         saved ? (
-          <Note tone="accent">
-            Saved. It hashed to the digest its author signed, and the record is signed by{" "}
-            <code style={{ fontFamily: font.mono, wordBreak: "break-all" }}>{got.author}</code>. Its
-            type is the author&rsquo;s word for it — open it with that in mind.
-          </Note>
+          got.signed ? (
+            <Note tone="accent">
+              Saved. It hashed to the digest its author signed, and the record is signed by{" "}
+              <code style={{ fontFamily: font.mono, wordBreak: "break-all" }}>{got.author}</code>. Its
+              type is the author&rsquo;s word for it — open it with that in mind.
+            </Note>
+          ) : (
+            <Note tone="accent">
+              Saved. It hashed to the digest its record states. This is an open room, so the record is not
+              signed by its author: the host says{" "}
+              <code style={{ fontFamily: font.mono, wordBreak: "break-all" }}>{got.author}</code> wrote it, and
+              its name and type are that member&rsquo;s word — open it with that in mind.
+            </Note>
+          )
         ) : (
           <span style={{ fontSize: t.xs, color: c.ok }}>
-            ✓ Every byte matches the digest its author signed.
+            ✓ Every byte matches the digest {got.signed ? "its author signed" : "its record states"}.
           </span>
         )
       ) : (
@@ -506,7 +517,7 @@ export function GetRoomFile({
         !error && (
           <p style={{ margin: 0, fontSize: t.xs, color: c.faint }}>
             Name, size and type are what the record says; nothing has checked them yet. A preview or a download
-            happens only after every byte matches the digest its author signed.
+            happens only after every byte matches the digest the record states.
           </p>
         )
       )}

@@ -1,6 +1,6 @@
 // Step-up against a did-hosting relying party, as Trust Tasks:
-// `auth/step-up/start/0.1` → verified approve-request/0.3 → consent →
-// `approve-response/0.5` → `auth/refresh/0.1`, all to `{base}/trust-tasks`.
+// `auth/step-up/start/0.2` → verified approve-request/0.5 → consent →
+// `approve-response/0.7` → `auth/refresh/0.2`, all to `{base}/trust-tasks`.
 //
 // The RP here is a fake that answers the way the control plane does: every
 // reply signed by the RP's key (`proofPurpose: authentication`), threaded to
@@ -11,8 +11,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 import {
-  AGENT_APPROVE_REQUEST_TYPES,
-  RP_APPROVE_REQUEST_TYPES,
+  STEP_UP_APPROVE_REQUEST_TYPE,
   buildStepUpApproval,
   performStepUpVta,
   stepUpVtaFinish,
@@ -24,11 +23,11 @@ import {
 } from "../dist/index.js";
 
 const TT = "https://trusttasks.org/spec/";
-const START = `${TT}auth/step-up/start/0.1`;
-const APPROVE_REQUEST_03 = `${TT}auth/step-up/approve-request/0.3`;
+const START = `${TT}auth/step-up/start/0.2`;
+const APPROVE_REQUEST_05 = `${TT}auth/step-up/approve-request/0.5`;
 const APPROVE_REQUEST_02 = `${TT}auth/step-up/approve-request/0.2`;
-const APPROVE_RESPONSE_05 = `${TT}auth/step-up/approve-response/0.5`;
-const REFRESH = `${TT}auth/refresh/0.1`;
+const APPROVE_RESPONSE_07 = `${TT}auth/step-up/approve-response/0.7`;
+const REFRESH = `${TT}auth/refresh/0.2`;
 const ERROR = `${TT}trust-task-error/0.3`;
 
 const RP = generateSigningIdentity(); // the control plane — enrolled
@@ -41,10 +40,10 @@ const sign = (doc, as, proofPurpose = "authentication") =>
 
 // ── Fixtures ────────────────────────────────────────────────────────────────
 
-/** The RP's signed approve-request/0.3 for `holder`'s session. */
+/** The RP's signed approve-request/0.5 for `holder`'s session. */
 async function approveRequest(
   holder,
-  { as = RP, type = APPROVE_REQUEST_03, over = {}, envelope = {}, purpose } = {},
+  { as = RP, type = APPROVE_REQUEST_05, over = {}, envelope = {}, purpose } = {},
 ) {
   const doc = {
     id: `urn:uuid:${crypto.randomUUID()}`,
@@ -59,7 +58,7 @@ async function approveRequest(
       challenge: "a".repeat(64),
       reason: "Elevate this session to aal2",
       targetAcr: "aal2",
-      acceptableEvidence: ["didSigned"],
+      accepts: ["didSigned"],
       ...over,
     },
     ...envelope,
@@ -118,7 +117,7 @@ function honestRp(holder, { request, ack, tokens } = {}) {
     switch (req.type) {
       case START:
         return reply(req, { approveRequest: request ?? (await approveRequest(holder)) });
-      case APPROVE_RESPONSE_05:
+      case APPROVE_RESPONSE_07:
         return reply(req, ack ?? { status: "elevated", session: session(holder) });
       case REFRESH:
         return reply(req, {
@@ -152,7 +151,7 @@ const startArgs = (holder, fetchFn) => ({
 
 // ── buildStepUpApproval ─────────────────────────────────────────────────────
 
-test("buildStepUpApproval: a 0.5 approval echoes the request and is the holder's attestation", async () => {
+test("buildStepUpApproval: a 0.7 approval echoes the request and is the holder's attestation", async () => {
   const holder = generateSigningIdentity();
   const request = { subject: holder.did, sessionId: SESSION, challenge: "c".repeat(64) };
   const doc = await buildStepUpApproval({
@@ -160,13 +159,12 @@ test("buildStepUpApproval: a 0.5 approval echoes the request and is the holder's
     rpDid: RP.did,
     request,
     approved: true,
-    responseVersion: "0.5",
   });
 
-  assert.equal(doc.type, APPROVE_RESPONSE_05);
+  assert.equal(doc.type, APPROVE_RESPONSE_07);
   assert.equal(doc.issuer, holder.did);
   assert.equal(doc.recipient, RP.did);
-  assert.ok(doc.issuedAt, "0.5 requires issuedAt");
+  assert.ok(doc.issuedAt, "0.7 requires issuedAt");
   assert.deepEqual(doc.payload, { ...request, decision: "approved" });
   const proof = await verifyTrustTaskProof(doc, { expectedProofPurpose: "assertionMethod" });
   assert.equal(proof.verified, true, proof.reason);
@@ -182,7 +180,6 @@ test("buildStepUpApproval: a denial carries a signed deniedReason; tampering bre
     request,
     approved: false,
     deniedReason: "No.",
-    responseVersion: "0.5",
   });
   assert.equal(doc.payload.decision, "denied");
   assert.equal(doc.payload.deniedReason, "No.");
@@ -193,9 +190,9 @@ test("buildStepUpApproval: a denial carries a signed deniedReason; tampering bre
 
 // ── verifyStepUpApproveRequest ──────────────────────────────────────────────
 
-const rpOpts = { enrolledExecutorDids: [RP.did], acceptTypes: RP_APPROVE_REQUEST_TYPES };
+const rpOpts = { enrolledExecutorDids: [RP.did] };
 
-test("verifyStepUpApproveRequest: the RP's signed 0.3 verifies, fields come from inside the signature", async () => {
+test("verifyStepUpApproveRequest: the RP's signed 0.5 verifies, fields come from inside the signature", async () => {
   const holder = generateSigningIdentity();
   const res = await verifyStepUpApproveRequest(await approveRequest(holder), rpOpts);
   assert.equal(res.ok, true, res.reason);
@@ -215,11 +212,11 @@ test("verifyStepUpApproveRequest: refusals", async () => {
   const cases = [
     ["no document", undefined, /no signed approve-request/],
     ["a signer the wallet is not enrolled with", await approveRequest(holder, { as: STRANGER }), /not an executor/],
-    ["an unsigned document", { type: APPROVE_REQUEST_03, payload: {} }, /no proof/],
+    ["an unsigned document", { type: APPROVE_REQUEST_05, payload: {} }, /no proof/],
     [
       "another party's version",
       await approveRequest(holder, { type: APPROVE_REQUEST_02 }),
-      /not a step-up approve-request this party mints/,
+      /is not https:\/\/trusttasks\.org\/spec\/auth\/step-up\/approve-request\/0\.5/,
     ],
     [
       "a lapsed request",
@@ -236,14 +233,26 @@ test("verifyStepUpApproveRequest: refusals", async () => {
   }
 });
 
-test("verifyStepUpApproveRequest: the agent's 0.2 passes only for a caller that accepts the agent's versions", async () => {
+test("verifyStepUpApproveRequest: a request that does not accept didSigned is refused before anyone is asked", async () => {
   const holder = generateSigningIdentity();
-  const doc = await approveRequest(holder, { type: APPROVE_REQUEST_02 });
-  const res = await verifyStepUpApproveRequest(doc, {
-    enrolledExecutorDids: [RP.did],
-    acceptTypes: AGENT_APPROVE_REQUEST_TYPES,
-  });
-  assert.equal(res.ok, true, res.reason);
+  for (const accepts of [["webauthn"], ["approverSigned"], "didSigned"]) {
+    const doc = await approveRequest(holder, { over: { accepts } });
+    const res = await verifyStepUpApproveRequest(doc, rpOpts);
+    assert.equal(res.ok, false, JSON.stringify(accepts));
+    assert.match(res.reason, /DID-signed/);
+  }
+});
+
+test("one approve-request version for every party: the pin, and the one start/0.2 embeds", async () => {
+  // The did-hosting control plane's start/0.2 reply names its request's type
+  // as a schema const; the wallet pins approve-request on its own. They are
+  // one version, or an RP step-up is refused at the first check.
+  const { RESPONSE_PAYLOAD_SCHEMA } = await import("../dist/specs/auth/step-up/start/0.2/payload.js");
+  assert.equal(
+    RESPONSE_PAYLOAD_SCHEMA.$defs.Response.properties.approveRequest.properties.type.const,
+    STEP_UP_APPROVE_REQUEST_TYPE,
+  );
+  assert.equal(STEP_UP_APPROVE_REQUEST_TYPE, APPROVE_REQUEST_05);
 });
 
 // ── stepUpVtaStart ──────────────────────────────────────────────────────────
@@ -370,7 +379,6 @@ function approvalFor(holder) {
     rpDid: RP.did,
     request: { subject: holder.did, sessionId: SESSION, challenge: "a".repeat(64) },
     approved: true,
-    responseVersion: "0.5",
   });
 }
 
@@ -386,7 +394,7 @@ test("stepUpVtaFinish: sends the approval, then a signed refresh, and returns th
     refreshToken: "elevated-refresh",
     sessionId: SESSION,
   });
-  assert.deepEqual(calls.map((c) => c.doc.type), [APPROVE_RESPONSE_05, REFRESH]);
+  assert.deepEqual(calls.map((c) => c.doc.type), [APPROVE_RESPONSE_07, REFRESH]);
   assert.equal(calls[0].doc.id, approval.id);
   const refresh = calls[1].doc;
   assert.deepEqual(refresh.payload, { refreshToken: "aal1-refresh" });
@@ -452,7 +460,7 @@ test("performStepUpVta: consent sees the verified reason, then approve-response 
   assert.deepEqual(seen, [
     { issuer: RP.did, subject: holder.did, sessionId: SESSION, reason: "Elevate this session to aal2" },
   ]);
-  assert.deepEqual(calls.map((c) => c.doc.type), [START, APPROVE_RESPONSE_05, REFRESH]);
+  assert.deepEqual(calls.map((c) => c.doc.type), [START, APPROVE_RESPONSE_07, REFRESH]);
   const approval = calls[1].doc;
   assert.equal(approval.payload.challenge, "a".repeat(64));
   assert.equal(approval.payload.decision, "approved");

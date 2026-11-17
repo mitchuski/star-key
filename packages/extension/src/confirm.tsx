@@ -28,6 +28,8 @@ import { DisclosureConsent } from "./disclosure-consent.js";
 import { ApproverConsent } from "./approver-consent.js";
 import { RoomConsent } from "./room-consent.js";
 import { DirectoryConsent } from "./directory-consent.js";
+import { GitConsent } from "./git-consent.js";
+import { ElectionConsent } from "./election-consent.js";
 import { consentResultSender } from "./consent-result.js";
 import { DidQrButton } from "./did-qr-view.js";
 import { SessionKeyNotice } from "./session-key-notice.js";
@@ -64,6 +66,13 @@ const isRoomConsent = params.get("kind") === "room";
 // `kind=directory` selects publishing the member's directory card from a
 // community's portal (`directory-consent.tsx`).
 const isDirectoryConsent = params.get("kind") === "directory";
+// `kind=git` selects linking or unlinking the member's forge account from a
+// community's portal, and where to authorise a link (`git-consent.tsx`).
+const isGitConsent = params.get("kind") === "git";
+// `kind=election` selects a member's election window from a community's
+// portal: taking a ticket, the ballot, and how the vote went
+// (`election-consent.tsx`). The ballot exists only in this window.
+const isElectionConsent = params.get("kind") === "election";
 /** Wallet sign-in from a trigger link (sign-in-view.tsx). Names a flow id and
  *  nothing else; the link and the origin stay in the background's record. */
 const signInFlowId = params.get("kind") === "sign-in" ? params.get("flow") : null;
@@ -113,7 +122,7 @@ const changedFromBaseUrl = params.get("changedFromBase");
 // pairing so the human can see which relying party the page is bound to.
 const isPinned = params.get("pinned") === "1";
 const pinnedBaseUrl = params.get("pinnedBase");
-// Set when this sign-in binds a session key (`auth/authenticate/0.2`). The
+// Set when this sign-in binds a session key (`auth/authenticate/0.3`). The
 // background validated it as a `did:key` before opening this window.
 const sessionKey = params.get("sessionKey");
 
@@ -446,7 +455,7 @@ function VerificationDetails({ state }: { state: VerificationState }) {
   lines.push(
     <span key="method" style={{ color: colours.textMuted }}>
       Method: <strong style={{ color: colours.text }}>did:{result.method}</strong>
-      {result.method === "webvh" && " — log chain + proofs verified"}
+      {(result.method === "webvh" || result.method === "scid") && " — log chain + proofs verified"}
       {(result.method === "peer" || result.method === "key") && " — self-certifying identifier"}
     </span>,
   );
@@ -1115,7 +1124,7 @@ function matchCode(payloadDigest: string): string | null {
 }
 
 function taskLabel(typeUri: string): string {
-  // `https://trusttasks.org/spec/webvh/dids/update/1.0` → `webvh/dids/update`
+  // `https://trusttasks.org/spec/vta/webvh/dids/update/1.1` → `vta/webvh/dids/update`
   const m = /\/spec\/(.+)\/[\d.]+$/.exec(typeUri);
   return m?.[1] ?? typeUri;
 }
@@ -1454,8 +1463,30 @@ if (root) {
         <JoinView />
       ) : signInFlowId ? (
         <SignInView flowId={signInFlowId} />
+      ) : isElectionConsent ? (
+        <ElectionConsent
+          consentId={consentId}
+          decide={(d) =>
+            void sendConsentResult(
+              { approved: d.approved, remember: false, ...(d.ballot !== undefined ? { ballot: d.ballot } : {}) },
+              // The ballot window stays to show the cast's progress.
+              { keepOpen: d.keepOpen === true },
+            )
+          }
+        />
+      ) : isGitConsent ? (
+        <GitConsent consentId={consentId} decide={(ok) => void sendConsentResult({ approved: ok, remember: false })} />
       ) : isDirectoryConsent ? (
-        <DirectoryConsent consentId={consentId} decide={(ok) => void sendConsentResult({ approved: ok, remember: false })} />
+        <DirectoryConsent
+          consentId={consentId}
+          decide={(ok, credential) =>
+            void sendConsentResult({
+              approved: ok,
+              remember: false,
+              ...(ok && credential ? { selectedCredential: credential } : {}),
+            })
+          }
+        />
       ) : isRoomConsent ? (
         <RoomConsent
           consentId={consentId}

@@ -14,7 +14,6 @@ import {
   disclosureApprovalPayload,
   verifyDisclosureStepUp,
   approveDisclosureStepUp,
-  buildStepUpApproval,
   DISCLOSURE_STEP_UP_REQUIRED_CODE,
   VtaClientError,
   generateSigningIdentity,
@@ -34,7 +33,7 @@ const CONTEXT_TYPE = "https://openvtc.org/persona/authorization-context/0.1";
 async function approveRequest({ as = AGENT, previewId = PREVIEW, ctx = {} } = {}) {
   const document = {
     id: "step-up-req-1",
-    type: "https://trusttasks.org/spec/auth/step-up/approve-request/0.2",
+    type: "https://trusttasks.org/spec/auth/step-up/approve-request/0.5",
     issuer: as.did,
     recipient: "did:key:zHolder",
     issuedAt: new Date().toISOString(),
@@ -43,6 +42,7 @@ async function approveRequest({ as = AGENT, previewId = PREVIEW, ctx = {} } = {}
       sessionId: "sess-42",
       challenge: "a".repeat(32),
       reason: "Approve disclosing 1 attribute to did:key:zVerifier",
+      accepts: ["didSigned"],
       ext: {
         [AUTHZ_EXT]: {
           type: CONTEXT_TYPE,
@@ -272,12 +272,10 @@ test("an action with no kind at all is refused", async () => {
   assert.equal(res.ok, false, "an action with no kind was approved as a disclosure");
 });
 
-test("the disclosure approval is minted as 0.3, and rp-login's is not", async () => {
-  // The split this wallet has to hold: it answers TWO relying parties with
-  // different capabilities. The agent accepts 0.3 (VTI #1316); the did-hosting
-  // control plane does not. Getting it wrong is silent in both directions —
-  // too low and a bound approval needlessly elevates a session, too high and
-  // every step-up against that party is refused as an unsupported type.
+test("the disclosure approval is minted as 0.7, the version that can answer `recorded`", async () => {
+  // A bound approval answered in a version without `recorded` needlessly
+  // elevates a session. The agent serves 0.7 and nothing older, and so does
+  // the did-hosting control plane rp-login answers: one builder, one version.
   const seen = disclosureStepUpRequiredFrom(
     refusal({ previewId: PREVIEW, previewRetained: true, approveRequest: await approveRequest() }),
   );
@@ -293,30 +291,13 @@ test("the disclosure approval is minted as 0.3, and rp-login's is not", async ()
   });
   assert.equal(
     disclosure.type,
-    "https://trusttasks.org/spec/auth/step-up/approve-response/0.3",
-    "a bound disclosure approval must be minted 0.3, or the agent answers `elevated` and the \
+    "https://trusttasks.org/spec/auth/step-up/approve-response/0.7",
+    "a bound disclosure approval must be minted in 0.7, or the agent answers `elevated` and the \
      session is raised on the strength of a decision about one card number",
   );
 
-  // The same builder, answering the did-hosting control plane, mints 0.5.
-  const rp = await buildStepUpApproval({
-    signing: holder,
-    rpDid: "did:web:rp.example",
-    request: verified.request,
-    approved: true,
-    responseVersion: "0.5",
-  });
-  assert.equal(
-    rp.type,
-    "https://trusttasks.org/spec/auth/step-up/approve-response/0.5",
-    "the version must be per relying party, not a property of the builder",
-  );
-
-  // Both verify as the holder's attestation.
-  for (const doc of [disclosure, rp]) {
-    const proof = await verifyTrustTaskProof(doc, { expectedProofPurpose: "assertionMethod" });
-    assert.equal(proof.verified, true, proof.reason ?? "");
-  }
+  const proof = await verifyTrustTaskProof(disclosure, { expectedProofPurpose: "assertionMethod" });
+  assert.equal(proof.verified, true, proof.reason ?? "");
 });
 
 test("a refusal that was not thrown is recognised the same way", () => {

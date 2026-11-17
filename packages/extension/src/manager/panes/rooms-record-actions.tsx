@@ -29,11 +29,19 @@
 //   member read, and the host refuses it if anything has replaced the record
 //   since.
 
-import { useState } from "react";
-import type { HeldRoom } from "@openvtc/pnm-core/rooms";
+import { useEffect, useState } from "react";
+import {
+  memberNameRefusal,
+  memberNameWriteRefusal,
+  roomsKeysProfileRead,
+  type HeldRoom,
+} from "@openvtc/pnm-core/rooms";
+import type { RoomPlace } from "../room-groups.js";
 import { Button, Note } from "../../ui.js";
 import { c, t } from "../../theme.js";
-import { curateRoomRecord, writeRoomNote } from "../room-files.js";
+import { curateRoomRecord, writeRoomMemberName, writeRoomNote, writeTarget, type WritingPlace } from "../room-files.js";
+import { managerSender } from "../sender.js";
+import type { Parties } from "../use-vta.js";
 
 const fieldStyle: React.CSSProperties = {
   boxSizing: "border-box",
@@ -60,7 +68,7 @@ export function NoteEditor({
   onDone,
   onCancel,
 }: {
-  room: HeldRoom;
+  room: WritingPlace;
   host: string;
   existing?: { key: string; version: number; title?: string; body?: string };
   onDone: () => void;
@@ -76,7 +84,7 @@ export function NoteEditor({
     setError(null);
     try {
       await writeRoomNote(
-        { roomId: room.roomId, hostDid: host, ...(room.member !== undefined ? { member: room.member } : {}) },
+        writeTarget(room, host),
         {
           title: title.trim(),
           ...(body.trim() ? { body } : {}),
@@ -129,6 +137,135 @@ export function NoteEditor({
   );
 }
 
+/**
+ * The member's own name in this room (`memberProfile`, rooms/_shared/0.3): set,
+ * changed or withdrawn.
+ *
+ * The room's profile is read first, through the member's own agent, and the
+ * control says so plainly when it does not list both `kind` and `memberProfile`
+ * in `recordMembers` — a reader that predates names would show each one as a
+ * note. The offscreen document reads it again and refuses before anything is
+ * sent, so this check is the explanation, not the gate.
+ */
+export function MemberNameEditor({
+  parties,
+  room,
+  host,
+  current,
+  held,
+  onDone,
+  onCancel,
+}: {
+  parties: Parties;
+  room: RoomPlace;
+  host: string;
+  /** The name this member has in the room now, where the page knows who the member is. */
+  current?: string | undefined;
+  /** Every author's name record the page read: the member's own is written over. */
+  held: { author: string; key: string; version: number }[];
+  onDone: () => void;
+  onCancel: () => void;
+}) {
+  const [name, setName] = useState(current ?? "");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  // `undefined`: still reading the profile; `null`: the room takes names.
+  const [closed, setClosed] = useState<string | null | undefined>(undefined);
+
+  useEffect(() => {
+    let live = true;
+    roomsKeysProfileRead(managerSender, {
+      ...parties,
+      roomId: room.roomId,
+      host,
+      ...(room.member !== undefined ? { member: room.member } : {}),
+    }).then(
+      (read) => {
+        const listed = read.status === "found" ? (read.profile as { recordMembers?: string[] } | undefined)?.recordMembers : undefined;
+        if (live) setClosed(memberNameWriteRefusal(listed) ?? null);
+      },
+      (e: unknown) => {
+        if (live) {
+          setClosed(
+            `This room's profile could not be read, so whether it takes members' names is not known, and nothing is written: ${
+              e instanceof Error ? e.message : String(e)
+            }`,
+          );
+        }
+      },
+    );
+    return () => {
+      live = false;
+    };
+  }, [parties, room, host]);
+
+  const invalid = memberNameRefusal(name);
+  const save = async (value: string) => {
+    setBusy(true);
+    setError(null);
+    try {
+      await writeRoomMemberName(
+        writeTarget(room, host),
+        { name: value, held },
+      );
+      onDone();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div
+      style={{
+        display: "grid",
+        gap: 8,
+        padding: 12,
+        border: `1px solid ${c.line}`,
+        borderRadius: "var(--w-r-md)",
+        background: c.surface,
+      }}
+    >
+      <span style={{ fontSize: t.sm, fontWeight: 650 }}>Your name in this room</span>
+      {closed === undefined && <span style={{ fontSize: t.xs, color: c.faint }}>Checking whether this room takes members&rsquo; names…</span>}
+      {typeof closed === "string" && <Note tone="warn">{closed}</Note>}
+      {closed === null && (
+        <>
+          <input
+            aria-label="Your name in this room"
+            placeholder="What the room's members should call you"
+            style={fieldStyle}
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+          />
+          <span style={{ fontSize: t.xs, color: c.faint }}>
+            Shown to this room&rsquo;s members beside your records, in this room only. It is your own claim: nobody
+            verifies it, and a member who keeps their own name for you sees theirs instead. Signed by your agent as the
+            identity you act as here, and sealed on a sealed room.
+          </span>
+          {invalid && name !== "" && <Note tone="warn">{invalid}</Note>}
+        </>
+      )}
+      <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+        {closed === null && (
+          <Button kind="primary" disabled={busy || !name.trim() || invalid !== undefined} onClick={() => void save(name.trim())}>
+            {busy ? "Saving…" : "Save my name"}
+          </Button>
+        )}
+        {closed === null && current !== undefined && (
+          <Button disabled={busy} onClick={() => void save("")}>
+            Withdraw my name
+          </Button>
+        )}
+        <Button kind="quiet" disabled={busy} onClick={onCancel}>
+          {closed === null || closed === undefined ? "Cancel" : "Close"}
+        </Button>
+      </div>
+      {error && <Note tone="danger">{error}</Note>}
+    </div>
+  );
+}
+
 /** The actions on one record, by its standing and what the place may do. */
 export function RecordActions({
   room,
@@ -140,7 +277,7 @@ export function RecordActions({
   onEdit,
   onChanged,
 }: {
-  room: HeldRoom;
+  room: WritingPlace;
   host: string;
   recordKey: string;
   version: number;
@@ -165,7 +302,7 @@ export function RecordActions({
     setError(null);
     try {
       await curateRoomRecord(
-        { roomId: room.roomId, hostDid: host, ...(room.member !== undefined ? { member: room.member } : {}) },
+        writeTarget(room, host),
         { key: recordKey, expectedVersion: version, ...params },
       );
       setConfirming(false);

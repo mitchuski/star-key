@@ -13,6 +13,8 @@
 
 import type { AdminScope } from "@openvtc/pnm-core";
 
+import type { PageErrorCode, PageFailure } from "./page-error.js";
+
 /** `source` on messages the injected provider posts toward the content script. */
 export const INPAGE_SOURCE = "vta-wallet/inpage" as const;
 /** `source` on messages the content script posts back toward the provider. */
@@ -42,7 +44,9 @@ export type BridgeMethod =
   | "approveDecision"
   | "rooms"
   | "directory"
-  | "membership";
+  | "membership"
+  | "git"
+  | "elections";
 
 /** Parameters for `window.vtaWallet.login(...)` (REST SIOPv2).
  *  @deprecated Legacy sign-in (sign-in contract C7); kept working. New pages
@@ -58,7 +62,7 @@ export interface LoginParams {
   baseUrl: string;
   /**
    * Optional `did:key` for the RP to bind to this login's session
-   * (`auth/authenticate/0.2` `sessionKey`). The page generates it and keeps
+   * (`auth/authenticate/0.3` `sessionKey`). The page generates it and keeps
    * the private half, ideally as a non-extractable WebCrypto key. The wallet
    * puts it inside the document it signs, so the RP accepts that key's proofs
    * as the user for this session only, and never for a step-up approval.
@@ -86,10 +90,10 @@ export interface DidcommLoginParams {
 }
 
 /** Parameters for `window.vtaWallet.stepUpVta(...)`: raise an existing RP
- *  session to `aal2`. The wallet sends `auth/step-up/start/0.1`, verifies the
+ *  session to `aal2`. The wallet sends `auth/step-up/start/0.2`, verifies the
  *  RP's signed reply and the approve-request inside it, asks the human, sends
- *  a signed `approve-response/0.5`, and renews the session with
- *  `auth/refresh/0.1` — all to `{baseUrl}/trust-tasks`. The holder that signs
+ *  a signed `approve-response/0.7`, and renews the session with
+ *  `auth/refresh/0.2` — all to `{baseUrl}/trust-tasks`. The holder that signs
  *  is the active connection's; the page does not choose it. */
 export interface StepUpVtaParams {
   /** The RP's Trust Task base (the same one used for the base login). */
@@ -205,7 +209,7 @@ export interface ApproverIdentityResult {
 
 /** Parameters for `window.vtaWallet.approveStepUp(...)`. */
 export interface ApproveStepUpParams {
-  /** The inline `auth/step-up/approve-request/0.4` payload, as received. */
+  /** The inline `auth/step-up/approve-request/0.5` payload, as received. */
   request: Record<string, unknown>;
   /** The refused document's type and payload. The wallet recomputes
    *  `request.boundTo` from it and refuses on a mismatch. */
@@ -292,10 +296,11 @@ export interface InpageRequest {
 }
 
 /** content → provider (content world → page world). `result` is untyped
- *  wire data — each provider method casts to its own result type. */
+ *  wire data — each provider method casts to its own result type. A failure
+ *  always carries a `code` (`page-error.ts`, docs/page-bridge-errors.md). */
 export type ContentResponse =
   | { source: typeof CONTENT_SOURCE; id: string; ok: true; result: unknown }
-  | { source: typeof CONTENT_SOURCE; id: string; ok: false; error: string };
+  | { source: typeof CONTENT_SOURCE; id: string; ok: false; error: string; code: PageErrorCode };
 
 /** Wallet lifecycle event names broadcast from background → content
  *  script → page-world provider → dispatched as `vtawallet:<kind>`
@@ -364,6 +369,25 @@ export interface RuntimeEmitWalletEvent {
   type: typeof RUNTIME_EMIT_WALLET_EVENT;
   event: WalletEventKind;
   detail?: Record<string, unknown>;
+}
+
+/**
+ * offscreen → the console's pages: a room watched through the wallet's own VTA
+ * moved (`rooms/keys/changed/0.1`). The offscreen document has checked that the
+ * transport proved the sender to be that VTA and that the payload is the
+ * schema's; whether a watch was armed for it is the console's question
+ * (`RoomWatcher.accept`), and a signal nobody armed is dropped there. Content
+ * free: a room, a member, a host and a version — a reason to read, nothing more.
+ * A listener takes it only from the offscreen document itself (`sender.url`),
+ * since a content script carries this extension's id too.
+ */
+export const RUNTIME_ROOMS_KEYS_CHANGED = "vta-wallet/rooms-keys-changed" as const;
+
+export interface RuntimeRoomsKeysChanged {
+  type: typeof RUNTIME_ROOMS_KEYS_CHANGED;
+  /** The VTA the signal came from: the one the watch was armed through. */
+  vtaDid: string;
+  signal: { roomId: string; member: string; host: string; latestVersion: number };
 }
 
 /** offscreen → background: raise a browser notification. An offscreen
@@ -604,7 +628,7 @@ export type RuntimeApproverStatementResponse =
 /** background → content (sendResponse). */
 export type RuntimeLoginResponse =
   | { ok: true; result: LoginResult }
-  | { ok: false; error: string };
+  | { ok: false; error: string; code?: PageErrorCode };
 
 /** background → content for an `apiGet` (sendResponse). */
 export type RuntimeApiGetResponse =
@@ -636,6 +660,13 @@ export interface RuntimeConsentResult {
    *  page's origin (`data-rooms-files.md` §8.5), each `heldRoomKey` — the room
    *  and the member it is shared as. Ignored on a denial. */
   selectedRooms?: string[];
+  /** Directory credential prompt only: the credential the member picked to
+   *  present, one of those the prompt offered. Ignored on a denial. */
+  selectedCredential?: string;
+  /** Ballot prompt only: the ballot the member filled in, in the wallet's own
+   *  window (`voting/ballot/cast` `Ballot`). Checked again by the background
+   *  against the election before anything is built. Ignored on a denial. */
+  ballot?: unknown;
 }
 
 /** confirm popup → background: resolve + verify an RP DID. */
@@ -649,7 +680,7 @@ export interface RuntimeVerifyRpDidRequest {
  *  depend on `@openvtc/pnm-core` types directly. */
 export interface VerifyRpDidResult {
   did: string;
-  method: "webvh" | "peer" | "key" | "unknown";
+  method: "webvh" | "scid" | "peer" | "key" | "unknown";
   resolved: boolean;
   domain?: string;
   error?: string;
@@ -1179,7 +1210,7 @@ export type RuntimeHolderStateResponse =
 // M1 read-only surface: enumerate the connected VTA's vault entries (metadata
 // only — no secret material). Authenticates via the same /auth/challenge +
 // authcrypt /auth/ flow the onboarding swap uses, then POSTs the canonical
-// vault/list/0.1 Trust Task envelope to the VTA dispatcher.
+// vault/list/0.4 Trust Task envelope to the VTA dispatcher.
 
 export const RUNTIME_VAULT_LIST = "vta-wallet/vault-list" as const;
 
@@ -1231,7 +1262,8 @@ export interface VaultListFilter {
   neverUsed?: boolean;
   expiresBefore?: string;
   breached?: boolean;
-  pageSize?: number;
+  /** vault/list/0.4's page size (`pageSize` through 0.3). */
+  limit?: number;
 }
 
 export interface VaultListResultView {
@@ -1368,7 +1400,7 @@ export const RUNTIME_VAULT_PROXY_LOGIN = "vta-wallet/vault-proxy-login" as const
 export const RUNTIME_VAULT_PROXY_LOGIN_PAGE =
   "vta-wallet/vault-proxy-login-page" as const;
 /** content-script (relayed from page world) → background: enumerate
- *  vault entries via `vault/list/0.1`. Same op as the popup's
+ *  vault entries via `vault/list/0.4`. Same op as the popup's
  *  `RUNTIME_VAULT_LIST`, but the request arrives wrapped in
  *  `{ params }` per the page-bridge convention. M2B.4 surfaces this
  *  to RP pages so they can discover did-self-issued entries pinned to
@@ -1436,7 +1468,8 @@ export interface RuntimeVaultUpsertRequest {
 
 export interface VaultUpsertResultView {
   entry: VaultEntryView;
-  created: boolean;
+  /** vault/upsert/0.4's `wasCreated`: true when the call created the entry. */
+  wasCreated?: boolean;
 }
 
 export type RuntimeVaultUpsertResponse =
@@ -1799,7 +1832,7 @@ export const OFFSCREEN_VERIFY_DID = "offscreen/verify-did" as const;
 /** background → offscreen: enumerate the connected VTA's vault entries.
  *  Loads the holder identity in offscreen (has DOM for WebAuthn-PRF unwrap),
  *  authenticates over REST + DIDComm-authcrypt, posts the canonical
- *  vault/list/0.1 envelope. Reply is a `RuntimeVaultListResponse`'s payload
+ *  vault/list/0.4 envelope. Reply is a `RuntimeVaultListResponse`'s payload
  *  via sendResponse. */
 export const OFFSCREEN_VAULT_LIST = "offscreen/vault-list" as const;
 export const OFFSCREEN_REQUEST_TASK = "offscreen/request-task" as const;
@@ -1812,7 +1845,7 @@ export interface OffscreenVaultListRequest {
   filter?: VaultListFilter;
 }
 
-/** background → offscreen: vault/upsert/0.1. Holder X25519 lives in
+/** background → offscreen: vault/upsert/0.4. Holder X25519 lives in
  *  offscreen, so the authcrypt sealing of the secret happens there. */
 export const OFFSCREEN_VAULT_UPSERT = "offscreen/vault-upsert" as const;
 
@@ -1981,7 +2014,7 @@ export interface OffscreenDidcommLoginRequest {
 }
 
 /** background → offscreen: run the page's `login()`, `auth/challenge/0.1` then
- *  `auth/authenticate/0.2`, over the RP's HTTPS Trust Task binding
+ *  `auth/authenticate/0.3`, over the RP's HTTPS Trust Task binding
  *  (`{baseUrl}/trust-tasks`). The signing must happen here in offscreen,
  *  because that is where the unwrapped holder secret lives (the PRF AES cache
  *  is module-scoped). Background has no access to the cache, so signing from
@@ -2524,7 +2557,7 @@ export interface RuntimeRoomsPageRequest {
   params: RoomsPageOp;
 }
 
-export type RuntimeRoomsPageResponse = { ok: true; result: unknown } | { ok: false; error: string };
+export type RuntimeRoomsPageResponse = { ok: true; result: unknown } | PageFailure;
 
 /** A room the member shared with this page's origin. */
 export interface PageRoomView {
@@ -2534,7 +2567,9 @@ export interface PageRoomView {
   /** The epoch the member's VTA is at, and the earliest it can read. */
   epoch?: number;
   earliestReadableEpoch?: number;
-  /** False when the VTA no longer holds keys for it (removed, or not yet welcomed). */
+  /** False when the VTA no longer holds keys for it (removed, or not yet welcomed).
+   *  True for an open room the member is in, which has no keys to hold: it is
+   *  read with the offer's credentials, and has no `epoch`. */
   held: boolean;
   sharedAt: string;
   expiresAt: string;
@@ -2548,6 +2583,16 @@ export interface PageRoomView {
   label?: string;
   /** The room's tier, as the same offer carried it. */
   visibility?: string;
+  /**
+   * The room's own state in its owner's lifecycle, as the community's record
+   * carries it (`vtc/rooms/memberships/list/0.2`): archived (`roomAccess`
+   * `readOnly` or `noAccess`), scheduled for removal (`purgeAt`), removed.
+   * Absent for an active room the record does not mark, and for a room the
+   * community does not own. Spelled as the community's member portal reads it.
+   */
+  roomState?: "active" | "archived" | "removalScheduled" | "purging" | "removed";
+  roomAccess?: "readOnly" | "noAccess";
+  purgeAt?: string;
   /**
    * Where `label` came from: `profile` — the room's own profile, sealed inside
    * it and read by the member's VTA (`rooms/keys/profile/read`), which wins —
@@ -2594,6 +2639,12 @@ export interface PageRecordSummary {
   /** `open` rooms only: on a sealed room the title is inside the body. */
   title?: string;
   description?: string;
+  /** When the host stored the record's first version: what messages without `writtenAt` are ordered by. */
+  createdAt?: string;
+  /** The author of the record's first version, as the host recorded it (`open` and `attributed`). */
+  createdBy?: string;
+  /** `open` rooms only: on a sealed room the kind is inside the body. */
+  kind?: string;
 }
 
 export interface PageListingView {
@@ -2616,6 +2667,30 @@ export interface PageRecordView {
   body?: string;
   tags?: string[];
   file?: { name: string; mediaType?: string; size: number };
+  /**
+   * `note`, `message`, `reaction`, or a kind to show as a note; absent means a
+   * note (trust-tasks-tf #1027). A message's and a reaction's `body` is plain
+   * text, never markup, and a page opens no link in it unless the member asks
+   * and confirms.
+   */
+  kind?: string;
+  /** The record this one answers, or a reaction responds to. Resolved only against records the page already holds. */
+  inReplyTo?: { key: string; version?: number };
+  /** When the author says they wrote it — their claim, judged against `createdAt` (more than 24 hours before it: backdated). */
+  writtenAt?: string;
+  /** Present when this version is an edit: the author's claim of when. */
+  editedAt?: string;
+  createdAt?: string;
+  createdBy?: string;
+  /** Past its `validUntil`: nothing of the record is in the view. Shown only on an explicit request, marked expired. */
+  expired?: true;
+  validUntil?: string;
+  /**
+   * Its author cannot be verified — their DID no longer resolves, or the proof
+   * fails against their current DID document where the one at the time it was
+   * stored could not be had. Nothing of the record is in the view.
+   */
+  authorUnverified?: true;
   /** False on an `open` room, where the host stores and can alter cleartext. */
   sealed: boolean;
   verification: unknown;
@@ -2652,6 +2727,9 @@ export type RoomFilesPageMessage =
       kind: "got";
       file: { name: string; mediaType?: string; size: number };
       author: string;
+      /** Whether `author` signed the record. An open room's record is not signed: there the
+       *  author and the digest the file matched are the host's word. */
+      signed: boolean;
       version: number;
       title?: string;
       description?: string;
@@ -2659,7 +2737,7 @@ export type RoomFilesPageMessage =
     }
   | { kind: "data"; data: string /* base64url */ }
   | { kind: "done" }
-  | { kind: "failed"; error: string };
+  | { kind: "failed"; error: string; code: PageErrorCode };
 
 // ─── A member's directory card for a page: `window.vtaWallet.directory` ──────
 //
@@ -2677,8 +2755,56 @@ export type RoomFilesPageMessage =
 export const RUNTIME_DIRECTORY_PAGE = "vta-wallet/directory-page" as const;
 
 /** `member` is the DID the page says is signed in: a hint that picks among the
- *  identities the wallet holds for this community, never adds one. */
-export type DirectoryPageOp = { op: "publishCard"; hostDid: string; member?: string };
+ *  identities the wallet holds for this community, never adds one.
+ *
+ *  `marks`, `mark`, `putList` and `deleteList` reach the member's own marks on
+ *  other members — stars, petnames, lists (`persona/contact/{put,list}/1.1`) — kept in
+ *  the member's own agent, never at the community. The page is the community's
+ *  code, so the wallet asks the person once, per community, before it hands it
+ *  any (`directory-page.ts`). */
+export type DirectoryPageOp =
+  | { op: "publishCard"; hostDid: string; member?: string }
+  | { op: "marks"; hostDid: string; member?: string }
+  | {
+      op: "mark";
+      hostDid: string;
+      member?: string;
+      entryId: string;
+      starred?: boolean;
+      petname?: string;
+      removePetname?: true;
+      /** Replaces the set; empty takes the entry off every list. */
+      lists?: string[];
+    }
+  | { op: "putList"; hostDid: string; member?: string; listId?: string; name?: string; colour?: string }
+  | { op: "deleteList"; hostDid: string; member?: string; listId: string }
+  /** Fill `credential`-sourced fields from a credential the member's agent
+   *  holds (`vtc/directory/card/present/0.1`): the wallet finds the
+   *  credentials the fields accept, the person picks one and sees every claim
+   *  it discloses, and the agent presents it. */
+  | { op: "presentCredential"; hostDid: string; member?: string; fields: string[] };
+
+/** The member's marks on one directory entry. */
+export interface PageEntryMark {
+  starred: boolean;
+  petname?: string;
+  lists?: string[];
+}
+
+/** One of the member's lists. */
+export interface PageMarkList {
+  listId: string;
+  name: string;
+  colour?: string;
+  order: number;
+  contactCount: number;
+}
+
+/** The member's marks for one community's directory, by entry. */
+export interface PageMarksView {
+  entries: Record<string, PageEntryMark>;
+  lists: PageMarkList[];
+}
 
 export interface RuntimeDirectoryPageRequest {
   type: typeof RUNTIME_DIRECTORY_PAGE;
@@ -2694,9 +2820,286 @@ export interface PagePublishedCardView {
   publishedAt?: string;
 }
 
+/** One value a presentation put on the member's card. */
+export interface PageVerifiedValue {
+  value: unknown;
+  /** The credential's issuer: the value's badge. */
+  issuer: string;
+  credentialType: string;
+  verifiedAt: string;
+  /** When the community withdraws it: the credential's expiry. */
+  validUntil?: string;
+}
+
+/** The verified values now on the member's card, by field. */
+export interface PageVerifiedFieldsView {
+  verified: Record<string, PageVerifiedValue>;
+  revision: number;
+}
+
 export type RuntimeDirectoryPageResponse =
-  | { ok: true; result: PagePublishedCardView }
-  | { ok: false; error: string };
+  | {
+      ok: true;
+      result:
+        | PagePublishedCardView
+        | PageMarksView
+        | PageEntryMark
+        | PageMarkList
+        | { deleted: boolean }
+        | PageVerifiedFieldsView;
+    }
+  | PageFailure;
+
+// ─── A member's forge account for a page: `window.vtaWallet.git` ────────────
+//
+// `git-ns/account/link/0.1` and `git-ns/account/unlink/0.1`. A portal sign-in
+// key may not sign either (`auth/oob/grant/0.3` consumer item 6), so the page
+// asks and the wallet signs as the member, after asking them. As with the
+// directory, the background refuses unless the page's browser-attested origin
+// is the origin of `hostDid`'s `SignInPortal` (`git-page.ts`).
+
+/** page → background, through the content script: one git operation. */
+export const RUNTIME_GIT_PAGE = "vta-wallet/git-page" as const;
+
+/** `member` is the DID the page says is signed in: a hint that picks among the
+ *  identities the wallet holds for this community, never adds one. */
+export type GitPageOp =
+  | { op: "linkAccount"; hostDid: string; forge: string; member?: string }
+  | { op: "unlinkAccount"; hostDid: string; forge: string; accountId?: string; member?: string };
+
+export interface RuntimeGitPageRequest {
+  type: typeof RUNTIME_GIT_PAGE;
+  /** Overwritten by the background with the browser-attested origin. */
+  origin: string;
+  params: GitPageOp;
+}
+
+/** A link the wallet began: what the page follows it by. Where to authorise it,
+ *  and any device code, stay in the wallet's window. */
+export interface PageGitLinkView {
+  linkId: string;
+  expiresAt: string;
+}
+
+/** The account the wallet unlinked. */
+export interface PageGitUnlinkView {
+  unlinked: { forge: string; id: string; login: string };
+  unlinkedAt: string;
+}
+
+export type RuntimeGitPageResponse =
+  | { ok: true; result: PageGitLinkView | PageGitUnlinkView }
+  | PageFailure;
+
+// ─── A member's elections for a page: `window.vtaWallet.elections` ─────────
+//
+// The community's portal lists and shows its elections, and asks the wallet to
+// take the member's ticket or to vote. The page is the community's own code and
+// knows who is signed in, so it never sees a choice: the ballot is filled in
+// the wallet's own window, built and signed by the member's VTA under a key
+// made for that cast alone, and sent by the wallet to the ballot box — never
+// through the community (VTI-VOT-001 – 004; `elections-page.ts`). As with the
+// directory and git channels, the background refuses unless the page's
+// browser-attested origin is the origin of `hostDid`'s `SignInPortal`.
+
+/** page → background, through the content script: one elections operation. */
+export const RUNTIME_ELECTIONS_PAGE = "vta-wallet/elections-page" as const;
+
+/** `member` is the DID the page says is signed in: a hint that picks among the
+ *  identities the wallet holds for this community, never adds one.
+ *
+ *  `memberOf` opens an election the community lists to nobody but its managers
+ *  and the party it is put to: one whose credential roll names a party that is
+ *  itself a member of the community (VTI-VOT-015, VTI-VOT-017). The member
+ *  learns of it from outside the community's list — from a link, for now — and
+ *  the page passes on the party the link names. Nothing is presented on the
+ *  page's say-so: the wallet first reads the election without presenting, and
+ *  presents the member's credential issued by exactly `memberOf` only after the
+ *  member chose to in the wallet's own window (VTI-VOT-016). */
+export type ElectionsPageOp =
+  | { op: "list"; hostDid: string; member?: string }
+  | { op: "show"; hostDid: string; electionId: string; member?: string; memberOf?: string }
+  | { op: "takeTicket"; hostDid: string; electionId: string; member?: string; memberOf?: string }
+  | { op: "takeTickets"; hostDid: string; electionIds: string[]; member?: string }
+  | { op: "vote"; hostDid: string; electionId: string; member?: string; memberOf?: string }
+  | { op: "checkVote"; hostDid: string; electionId: string; member?: string; memberOf?: string };
+
+export interface RuntimeElectionsPageRequest {
+  type: typeof RUNTIME_ELECTIONS_PAGE;
+  /** Overwritten by the background with the browser-attested origin. */
+  origin: string;
+  params: ElectionsPageOp;
+}
+
+/** One election as the community lists it to the member (`vtc/elections/list/0.5`). */
+export interface PageElection {
+  electionId: string;
+  title?: string;
+  state: string;
+  votingOpensAt: string;
+  votingClosesAt: string;
+  binding: boolean;
+  /** Whether the community has issued the member's ticket. The community
+   *  knows this already; whether the member has voted is never told the page. */
+  ticketHeld: boolean;
+}
+
+/** A question as the page may show it: what is asked, never an answer. */
+export interface PageElectionQuestion {
+  key: string;
+  type: "choice" | "ranking" | "score" | "text";
+  text?: string;
+  options: { key: string; label?: string }[];
+  optional: boolean;
+  minSelections?: number;
+  maxSelections?: number;
+  partial?: boolean;
+  min?: number;
+  max?: number;
+  maxLength?: number;
+}
+
+/** One election as the community shows it to the member (`vtc/elections/show/0.6`),
+ *  without the voting parameters, the trustees' ceremony or the board's checkpoints. */
+export interface PageElectionView {
+  electionId: string;
+  title?: string;
+  description?: string;
+  state: string;
+  secrecy: string;
+  registrationOpensAt: string;
+  votingOpensAt: string;
+  votingClosesAt: string;
+  binding: boolean;
+  questions: PageElectionQuestion[];
+  /** What the community publishes about how the election is run (VTI-VOT-090). */
+  disclosure: {
+    ballotBox: string;
+    ballotBoxOperator: string;
+    sameOperator: boolean;
+    boardVisibility: string;
+    revote: string;
+    auditors: string[];
+    /** Under a credential roll, whose membership credential admits a voter
+     *  (voting/_shared/0.4 `RollCredentialDisclosure`, VTI-VOT-090): the portal
+     *  tells the member, before a ticket, that taking one shows the community
+     *  their membership of that party. Absent under any other rule. */
+    rollCredential?: {
+      memberOf: string;
+      memberOfKind: "thisCommunity" | "communityGroup" | "memberParty";
+      memberOfName?: string;
+    };
+  };
+  /** The manifest's `textReleaseThreshold`: counted ballots before any written
+   *  answer is released. As low as 1 (VTI-VOT-065); below 10 a written answer
+   *  may identify who wrote it, and the wallet warns before a ticket and on the
+   *  ballot (VTI-VOT-090). */
+  textReleaseThreshold?: number;
+  ticketsIssued?: number;
+  /** The certified result, once the community has certified it. */
+  certified?: { certifiedAt: string; result: unknown };
+}
+
+/** After `takeTicket`: the member holds a ticket. `taken` is false when their
+ *  agent already held it. */
+export interface PageTicketView {
+  ticketHeld: true;
+  taken: boolean;
+}
+
+/** One election of a `takeTickets` call, and what came of it. The community
+ *  knows all of this already — it issued the tickets — so the page learns
+ *  nothing it could not read from `list`.
+ *
+ *  - `taken`: the wallet took the ticket now.
+ *  - `held`: the member held it already; nothing was asked.
+ *  - `unavailable`: the community shows the member no such election, or shows
+ *    it only to the members of a party (VTI-VOT-015) — take that one alone,
+ *    with `takeTicket` and its `memberOf`.
+ *  - `notEligible`: its roll admits holders of a membership credential the
+ *    member does not hold.
+ *  - `failed`: the community refused, or could not be reached; `error` says why. */
+export interface PageBatchTicket {
+  electionId: string;
+  outcome: "taken" | "held" | "unavailable" | "notEligible" | "failed";
+  /** With `failed`: the message, and its code as a rejection would carry it. */
+  error?: string;
+  code?: PageErrorCode;
+}
+
+/** After `takeTickets`: each election asked for, in the order asked. */
+export interface PageTicketsView {
+  tickets: PageBatchTicket[];
+}
+
+/** After `vote`. The page learns only that the wallet's window closed, and
+ *  whether a ticket had to be taken first — never whether a vote was cast, and
+ *  never a choice: the outcome is shown in the wallet's own window. */
+export interface PageVoteView {
+  ticketTaken: boolean;
+}
+
+/** After `checkVote`: nothing. The check's answer — and whether the member
+ *  voted at all — is shown only in the wallet's own window (VTI-VOT-053). */
+export type PageCheckVoteView = Record<string, never>;
+
+/** An election the member's agent holds a notification of (VTI-NTF-063), as
+ *  the page may show it until the member opens it: the community's identifier
+ *  for it, the party it is put to, the period the notification states and
+ *  whether it was withdrawn — nothing of the election itself. Elections the
+ *  community's list shows the member are in `elections`; one it does not list
+ *  (put to a party that is itself a member of the community, VTI-VOT-015) is
+ *  opened with `show` by its id, and the wallet reads it as that party's member. */
+export interface PageNotifiedElection {
+  electionId: string;
+  /** The DID the election is put to: under a credential roll, the party whose
+   *  members may take part (`roll.memberOf`). */
+  audience: string;
+  status: "available" | "withdrawn";
+  votingOpensAt?: string;
+  votingClosesAt?: string;
+}
+
+export type RuntimeElectionsPageResponse =
+  | {
+      ok: true;
+      result:
+        | { elections: PageElection[]; notified: PageNotifiedElection[] }
+        | PageElectionView
+        | PageTicketView
+        | PageTicketsView
+        | PageVoteView
+        | PageCheckVoteView;
+    }
+  | PageFailure;
+
+/** console → background: open an election the member holds a notification of,
+ *  from the wallet's own notifications view (VTI-NTF-063). Only the record is
+ *  named: the community, the election, the member and the party all come from
+ *  the notification as the VTA holds it. `present`: the member chose, on the
+ *  console, to present their membership credential issued by the
+ *  notification's audience (VTI-VOT-016). Never page-reachable. */
+export const RUNTIME_NOTIFIED_ELECTION = "vta-wallet/notified-election" as const;
+
+export interface RuntimeNotifiedElectionRequest {
+  type: typeof RUNTIME_NOTIFIED_ELECTION;
+  params: { contextId: string; recordId: string; present?: boolean };
+}
+
+/** What opening a notified election came to. */
+export type NotifiedElectionOutcome =
+  /** Read. `presented`: the read presented the member's membership. */
+  | { kind: "shown"; election: PageElectionView; presented: boolean; community: string; member: string; audience: string }
+  /** The wallet may not reach the community yet: the console asks, in a click. */
+  | { kind: "needsReach"; origin: string; community: string }
+  /** The community shows the election only to the audience's members: reading
+   *  it presents the member's membership credential issued by `audience`, and
+   *  the member decides first. `held`: whether they hold one at all. */
+  | { kind: "needsPresent"; audience: string; held: boolean; community: string; member: string };
+
+export type RuntimeNotifiedElectionResponse =
+  | { ok: true; result: NotifiedElectionOutcome }
+  | { ok: false; error: string; code?: string };
 
 // ─── Membership for a page: `window.vtaWallet.membership` ───────────────────
 //
@@ -2731,6 +3134,10 @@ export type PageMembershipView =
       /** The standing agreement with this community, if a request went out
        *  under terms: the code, how it stands, when. */
       agreement?: { code: string; status: "proffered" | "agreed" | "declined"; at: number };
+      /** What the wallet carries of the person's Star Hold, if they chose to
+       *  carry one in the Hold pane: the root and the count, never the items,
+       *  the signers or the key. */
+      hold?: { root: string; count: number; at: string };
     };
 
 export type RuntimeMembershipPageResponse = { ok: true; result: PageMembershipView } | { ok: false; error: string };
@@ -2756,6 +3163,8 @@ export const PAGE_FACING_RUNTIME_TYPES = [
   RUNTIME_ROOMS_PAGE,
   RUNTIME_DIRECTORY_PAGE,
   RUNTIME_MEMBERSHIP_PAGE,
+  RUNTIME_GIT_PAGE,
+  RUNTIME_ELECTIONS_PAGE,
   // Not a provider method: the content script's own click listener sends it
   // (`trigger-link-click.ts`). Listed so the background takes the activation
   // origin from the browser, never from the body (VTI-LNK-056).
@@ -2798,6 +3207,10 @@ export interface RuntimeTriggerLinkRequest {
   link: string;
   /** Overwritten by the background with the attested `sender.origin`. */
   origin: string;
+  /** The clicked code's `data-oob-intent`: `join` when the page offered it
+   *  as a way to join rather than to sign in. A page's word, so it only
+   *  changes what the wallet offers the person — never what it sends. */
+  intent?: "join";
 }
 
 export interface RuntimeTriggerLinkNumberRequest {
@@ -2835,17 +3248,23 @@ export type SignInStep =
    *  fetches its join manifest as a throwaway key, saying nothing of who is
    *  asking. */
   | { step: "join-manifest" }
+  /** A community the person is already a member of, reached from its join
+   *  page (`confirm` with `joinOffered`): they chose to join with a new
+   *  identity instead of signing in. Reads the join manifest, as
+   *  `join-manifest` does, and answers `join-apply`. */
+  | { step: "join-new" }
   /** Unknown community: the person sent a join request as `did` (one of the
-   *  `join-apply` candidates), with their answers to what it asked. */
-  | {
+   *  `join-apply` candidates), or as a new identity their agent sets up for
+   *  this community on the hosting server `serverId` (one of `join-apply`'s
+   *  `newIdentity.servers`), with their answers to what it asked. */
+  | ({
       step: "join-submit";
-      did: string;
       attributes: Array<{ type: string; value: string }>;
       registryConsent: boolean;
       /** MyTerms: join under this agreement (the one `join-apply` offered).
        *  Absent: no terms are proffered, even where the community takes them. */
       terms?: { code: string };
-    }
+    } & ({ did: string } | { newIdentity: { serverId: string } }))
   | { step: "claim"; entryId: string }
   | { step: "prove"; enteredNumber: string }
   /** The community's signed name differs from the wallet's record and the
@@ -2886,6 +3305,13 @@ export type OffscreenSignInStepRequest = {
    *  (`RUNTIME_JOIN_COMMUNITY`), from the background's own record. */
   joinDid?: string;
   joinSource?: JoinSource;
+  /** Present on `prepare` only, when `origin` is pinned to a relying party
+   *  (`origin-pin.ts`, M5): that DID. The flow names it on the confirm screen
+   *  when the link's community is a different one, so a changed pairing gets
+   *  the loud prompt the page-bridge logins give it. */
+  pinnedDid?: string;
+  /** Present on `prepare` only: the page offered the code as a way to join. */
+  intent?: "join";
 } & SignInStep;
 
 /** How this browser approves sign-ins at an agent: the kind of UV key the
@@ -2909,6 +3335,13 @@ export interface SignInIdentityView {
 
 /** A DID the member's agent hosts, offered when they start using a DID
  *  hosting service (`join-hosting`). */
+/** A new identity the agent can set up for one community. `servers` empty:
+ *  it has no DID hosting server to publish one through. */
+export interface SignInNewIdentityView {
+  contextId: string;
+  servers: Array<{ id: string; label?: string }>;
+}
+
 export interface SignInPersonaView {
   did: string;
   contextId: string;
@@ -2988,6 +3421,11 @@ export type SignInStepResult =
        *  terms (a `MyTerms` service in its verified document). Absent when it
        *  does not. */
       terms?: SignInJoinTermsView;
+      /** The agent can set up a new identity for this community: a context of
+       *  its own (`contextId`) holding one new DID, published through one of
+       *  `servers`. Absent when the agent would not say which servers it
+       *  publishes through (it is not one this wallet administers). */
+      newIdentity?: SignInNewIdentityView;
     }
   /** The community asks for evidence this wallet cannot provide (a
    *  credential, an invitation, vetting), or takes no members. The flow has
@@ -3004,8 +3442,25 @@ export type SignInStepResult =
    *  wants more evidence (`requestMore`, `needs`). The flow has ended; no
    *  sign-in document was sent. */
   | { kind: "join-pending"; host: string; portalOrigin: string; needs?: string[]; terms?: SignInJoinTermsRecord }
-  /** C3 step 5: "Sign in to <name> at <portal origin>?" */
-  | { kind: "confirm"; communityName: string; portalOrigin: string; identities: SignInIdentityView[] }
+  /** C3 step 5: "Sign in to <name> at <portal origin>?" `changedFromDid` is
+   *  the community this origin was pinned to by an earlier sign-in, when the
+   *  link names a different one (M5): the window warns, and does not skip the
+   *  screen for a single identity. `alreadyMember`: the person asked to join,
+   *  and the community answered that the identity they applied as is already
+   *  one of its members (`submit:alreadyMember`) — the window says so, and does
+   *  not skip the screen either. */
+  | {
+      kind: "confirm";
+      communityName: string;
+      portalOrigin: string;
+      identities: SignInIdentityView[];
+      changedFromDid?: string;
+      alreadyMember?: true;
+      /** The code came from the community's join page (`data-oob-intent`):
+       *  the window does not skip the screen, and offers `join-new` beside
+       *  signing in. */
+      joinOffered?: true;
+    }
   /** After the claim: type the number. `nameMismatch` is the community's own
    *  name for itself when it differs from this wallet's record (VTI-LNK-104).
    *  `audience` is the session the website asked for, from the community's
@@ -3033,7 +3488,7 @@ export type SignInStepResult =
        *  number came from the page and no number screen was shown. */
       decisionDeadline: number;
       /** The task families approving also lets that browser sign as the
-       *  member, for the session (auth/oob/grant/0.2). Absent: none. */
+       *  member, for the session (auth/oob/grant/0.3). Absent: none. */
       signingScope?: string[];
       /** How this browser approves at the member's agent. Absent: not set up
        *  yet — the first approval sets it up. */
@@ -3116,7 +3571,7 @@ export interface SignInRefusalDetail {
  *  checking a domain-linked community's website (its DID Configuration);
  *  `identify` and `grant` are the member's VTA signing; `claim`, `prove` and
  *  `respond` are the exchanges with the community. */
-export type SignInFailureStage = "domain-linkage" | "join" | "join-manifest" | "join-sign" | "join-submit" | "claim" | "identify" | "prove" | "grant-digest" | "enrol-uv" | "grant" | "respond";
+export type SignInFailureStage = "domain-linkage" | "join-identity" | "join" | "join-manifest" | "join-sign" | "join-submit" | "claim" | "identify" | "prove" | "grant-digest" | "enrol-uv" | "grant" | "respond";
 export type SignInFailureParty = "community" | "vta" | "wallet";
 
 export type RuntimeSignInStepResponse =
@@ -3245,6 +3700,12 @@ export type OffscreenRoomsPageOp =
    *  (`vtc/rooms/memberships/list`, signed as that member): `{ [roomId]: { label, visibility? } }`.
    *  A member whose record could not be read contributes nothing. */
   | { op: "roomNames"; hostDid: string; members: string[] }
+  /** The open rooms of `hostDid` each of `members` is in, from its record of
+   *  them (`vtc/rooms/memberships/list`): `{ roomId, member, actions }[]`
+   *  (`admittedOpenRooms`). The VTA's listing never names an open room — it has
+   *  no group — so these stand beside `held`. A member whose record could not
+   *  be read contributes nothing. */
+  | { op: "openRooms"; hostDid: string; members: string[] }
   /** Each room's own profile, read from `hostDid` as its member by the member's
    *  VTA (`rooms/keys/profile/read`): `{ [roomId]: RoomProfileSummary }`. A room
    *  whose profile could not be read contributes nothing. */
@@ -3272,7 +3733,7 @@ export interface OffscreenRoomsPageRequest {
   params: OffscreenRoomsPageOp;
 }
 
-export type OffscreenRoomsPageResponse = { ok: true; result: unknown } | { ok: false; error: string };
+export type OffscreenRoomsPageResponse = { ok: true; result: unknown } | { ok: false; error: string; code?: string };
 
 /** background → offscreen: the directory work behind a page's call, after the
  *  background checked the page is the community's portal. */
@@ -3287,7 +3748,49 @@ export type OffscreenDirectoryPageOp =
   | { op: "prepare"; hostDid: string; member: string }
   /** Have the agent sign `card` as the member and publish it. `card` is the
    *  one `prepare` built, which the person approved. */
-  | { op: "publish"; hostDid: string; member: string; card: Record<string, unknown>; revision: number };
+  | { op: "publish"; hostDid: string; member: string; card: Record<string, unknown>; revision: number }
+  /** The community as the wallet names it (the member's identity's label). */
+  | { op: "communityName"; hostDid: string; member: string }
+  /** The member's marks on this community's entries, and their lists — from
+   *  their own agent. */
+  | { op: "marks"; hostDid: string; member: string }
+  /** Change the member's marks on one entry. */
+  | {
+      op: "mark";
+      hostDid: string;
+      member: string;
+      entryId: string;
+      starred?: boolean;
+      petname?: string;
+      removePetname?: true;
+      lists?: string[];
+    }
+  | { op: "putList"; hostDid: string; member: string; listId?: string; name?: string; colour?: string }
+  | { op: "deleteList"; hostDid: string; member: string; listId: string }
+  /** Read the schema as the member: what the named fields ask of a
+   *  credential, and the member's credentials that answer it. */
+  | { op: "preparePresent"; hostDid: string; member: string; fields: string[] }
+  /** Have the agent present `credentialId` disclosing `claims`, and send it as
+   *  the member. Answers `{ undisclosed }`, presenting nothing, when the
+   *  credential cannot hide a claim `claims` leaves out. */
+  | { op: "present"; hostDid: string; member: string; fields: string[]; credentialId: string; claims: string[] };
+
+/** A credential the member's agent holds that the named fields accept. */
+export interface PresentCandidate {
+  /** The agent's handle for it. */
+  id: string;
+  issuerDid?: string;
+  types: string[];
+  validUntil?: string;
+}
+
+/** What `preparePresent` found. */
+export interface PreparedPresent {
+  communityName: string;
+  fields: Array<{ key: string; label: string }>;
+  claims: string[];
+  candidates: PresentCandidate[];
+}
 
 export interface OffscreenDirectoryPageRequest {
   target: typeof OFFSCREEN_TARGET;
@@ -3297,7 +3800,107 @@ export interface OffscreenDirectoryPageRequest {
   params: OffscreenDirectoryPageOp;
 }
 
-export type OffscreenDirectoryPageResponse = { ok: true; result: unknown } | { ok: false; error: string };
+export type OffscreenDirectoryPageResponse = { ok: true; result: unknown } | { ok: false; error: string; code?: string };
+
+/** background → offscreen: the git work behind a page's call, after the
+ *  background checked the page is the community's portal and the person
+ *  approved. */
+export const OFFSCREEN_GIT_PAGE = "offscreen/git-page" as const;
+
+export type OffscreenGitPageOp =
+  /** The community's portal origin and Trust-Task endpoint, from its verified DID document. */
+  | { op: "portal"; hostDid: string }
+  /** The identities the member signs in with at this community, with its name. */
+  | { op: "members"; hostDid: string }
+  /** Sign `git-ns/account/link` as the member and send it. */
+  | { op: "link"; hostDid: string; member: string; forge: string }
+  /** Sign `git-ns/account/unlink` as the member and send it. */
+  | { op: "unlink"; hostDid: string; member: string; forge: string; accountId?: string };
+
+export interface OffscreenGitPageRequest {
+  target: typeof OFFSCREEN_TARGET;
+  type: typeof OFFSCREEN_GIT_PAGE;
+  vtaDid: string;
+  restBaseUrl?: string;
+  params: OffscreenGitPageOp;
+}
+
+export type OffscreenGitPageResponse = { ok: true; result: unknown } | { ok: false; error: string; code?: string };
+
+/** background → offscreen: the elections work behind a page's call, after the
+ *  background checked the page is the community's portal (and, for a ticket or
+ *  a vote, the person approved in the wallet's window). */
+export const OFFSCREEN_ELECTIONS_PAGE = "offscreen/elections-page" as const;
+
+export type OffscreenElectionsPageOp =
+  /** The community's portal origin and Trust-Task endpoint, from its verified DID document. */
+  | { op: "portal"; hostDid: string }
+  /** The identities the member signs in with at this community, with its name. */
+  | { op: "members"; hostDid: string }
+  /** The ballot box's cast door, `<TrustTaskHTTPS>/trust-tasks`, from its DID document. */
+  | { op: "ballotBox"; ballotBox: string }
+  /** `vtc/elections/list`, signed by the member's VTA as the member. */
+  | { op: "list"; hostDid: string; member: string }
+  /** `vtc/elections/show`, the same way — the whole answer, for the background.
+   *  `readAs`: the read presents the member's membership credential issued by
+   *  exactly `memberOf`, which the member chose to show (VTI-VOT-015, 016). */
+  | { op: "show"; hostDid: string; member: string; electionId: string; readAs?: ElectionReadAs }
+  /** Whether the member holds a membership credential issued by exactly
+   *  `memberOf`, about `member` — answered before they are asked to present it. */
+  | { op: "membership"; hostDid: string; member: string; memberOf: string }
+  /** Take the member's ticket: register → the community issues it blind → accept.
+   *  `presentFor`: under a credential roll, the `roll.memberOf` the member chose
+   *  to present their membership of in the claim (VTI-VOT-025); the work refuses
+   *  a credential roll naming any other. */
+  | { op: "takeTicket"; hostDid: string; member: string; electionId: string; readAs?: ElectionReadAs; presentFor?: string }
+  /** A cast, in the three steps the ballot window shows (`elections-page.ts`).
+   *  First: read the election afresh, check the ballot against it, and have the
+   *  VTA build and sign the cast under a key made for it alone. */
+  | { op: "castPrepare"; hostDid: string; member: string; electionId: string; ballot: unknown; readAs?: ElectionReadAs }
+  /** Then: wait `delayMs` (at most `MAX_CAST_DELAY_MS`), and post the cast to
+   *  the ballot box exactly as the VTA built it. Answers the ballot box's receipt. */
+  | { op: "castPost"; castDocument: Record<string, unknown>; ballotBox: string; endpoint: string; delayMs: number }
+  /** Last: the VTA keeps and checks the receipt (`vta/pcs/voter/receipt`). */
+  | { op: "castKeep"; hostDid: string; member: string; electionId: string; receipt: Record<string, unknown> }
+  /** After close (VTI-VOT-053): how many receipts the member's VTA keeps for
+   *  the election, and the ballot box they are from (`voter/receipts/list`). */
+  | { op: "receiptsKept"; hostDid: string; member: string; electionId: string }
+  /** Then: the head the community kept at close — from `show`, or from the
+   *  tombstone once the election's board is deleted — each receipt's inclusion
+   *  proof from the ballot box at `endpoint`, and the VTA's check of each. */
+  | { op: "receiptsCheck"; hostDid: string; member: string; electionId: string; endpoint: string; readAs?: ElectionReadAs }
+  /** The notifications of the kind `election` the member's VTA holds for this
+   *  community's elections, in the context of the identity `member` lives in
+   *  (`vta/notifications/list`, VTI-NTF-063). */
+  | { op: "notified"; hostDid: string; member: string }
+  /** An election notification the VTA holds, opened from the wallet's own
+   *  view: read afresh from the VTA, with the community's Trust-Task endpoint. */
+  | { op: "notifiedTarget"; contextId: string; recordId: string }
+  /** Read the notified election from its community as the DID the
+   *  notification was addressed to. `present`: present that member's
+   *  membership credential issued by exactly the notification's audience,
+   *  which the member chose to show (VTI-VOT-016). */
+  | { op: "notifiedShow"; contextId: string; recordId: string; present?: boolean }
+  /** Whether that member holds a membership credential issued by exactly the
+   *  notification's audience — answered before they are asked to present it. */
+  | { op: "notifiedMembership"; contextId: string; recordId: string };
+
+export interface OffscreenElectionsPageRequest {
+  target: typeof OFFSCREEN_TARGET;
+  type: typeof OFFSCREEN_ELECTIONS_PAGE;
+  vtaDid: string;
+  restBaseUrl?: string;
+  params: OffscreenElectionsPageOp;
+}
+
+/** A read that presents the member's membership credential for `memberOf`. */
+export interface ElectionReadAs {
+  memberOf: string;
+}
+
+/** `code`: the community's or the VTA's refusal code (its local name), where
+ *  the work was refused by one — what the background switches on (R3.7). */
+export type OffscreenElectionsPageResponse = { ok: true; result: unknown } | { ok: false; error: string; code?: string };
 
 /**
  * Port name for one room write from the console — a file transfer, a note, or a
@@ -3316,6 +3919,14 @@ interface RoomFilesTarget {
   /** The member (persona DID) to act as. Required where the VTA holds more
    *  than one member of the room: it refuses rather than choose. */
   member?: string;
+  /**
+   * The member's own name record as the console read it (rule 2 of
+   * `MemberProfileRecord`, rooms/_shared/0.3): after a write whose version runs
+   * more than 500 past it, the offscreen document writes the name again
+   * (*Near the room's head*, trust-tasks-tf #1038). Absent where the console
+   * holds none, or the name is withdrawn.
+   */
+  ownName?: { key: string; version: number; name: string; writtenAt?: string; editedAt?: string };
 }
 
 /** console → offscreen, once, as the port's first message. */
@@ -3338,6 +3949,14 @@ export type RoomFilesOpen =
    * the host refuses the write if anything has replaced it since.
    */
   | (RoomFilesTarget & { kind: "note"; key?: string; replaces?: number; title: string; body?: string })
+  /**
+   * Write the member's own name in the room (`memberProfile`, rooms/_shared/0.3),
+   * empty to withdraw it. `held`: the name records the console read, by author —
+   * the member's own, if among them, is written over rather than doubled. The
+   * offscreen document reads the room's profile and refuses unless it lists
+   * `kind` and `memberProfile`.
+   */
+  | (RoomFilesTarget & { kind: "name"; name: string; held?: { author: string; key: string; version: number }[] })
   /** Change a record's standing: retract, demote, restore, pin. */
   | (RoomFilesTarget & {
       kind: "curate";
@@ -3364,6 +3983,8 @@ export type RoomFilesMessage =
       /** The author's manifest. Untrusted text from another member. */
       file: { name: string; mediaType?: string; size: number };
       author: string;
+      /** Whether `author` signed the record; false on an open room, where it is the host's word. */
+      signed: boolean;
       version: number;
       title?: string;
       description?: string;
@@ -3371,6 +3992,8 @@ export type RoomFilesMessage =
     }
   /** A note written or replaced, as the member. */
   | { kind: "noted"; key: string; version: number; author: string }
+  /** The member's name written (or withdrawn), as the member. */
+  | { kind: "named"; key: string; version: number; author: string }
   /** A record's new standing, as the host recorded it. */
   | { kind: "curated"; key: string; version: number; status: "active" | "deprecated" | "retracted"; pinned?: boolean }
   | { kind: "failed"; error: string; code?: string };

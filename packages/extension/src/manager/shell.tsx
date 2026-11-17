@@ -32,6 +32,7 @@ import { PolicyPane } from "./panes/policy.js";
 import { ServicesPane } from "./panes/services.js";
 import { MaintenancePane } from "./panes/maintenance.js";
 import { AuditPane } from "./panes/audit.js";
+import { NotificationsPane } from "./panes/notifications.js";
 import { CredentialsPane } from "./panes/credentials.js";
 import { MemoryPane } from "./panes/memory.js";
 import { PersonaPane } from "./panes/persona.js";
@@ -54,6 +55,7 @@ export type SectionId =
   | "app-state"
   | "rooms"
   | "agreements"
+  | "notifications"
   | "services"
   | "mediator"
   | "maintenance"
@@ -142,6 +144,10 @@ const ACTS: Act[] = [
       // Agreements (MyTerms first) are the wallet's own, keyed by the agent a request
       // was signed at; a context column would filter nothing.
       { id: "agreements", label: "Agreements", icon: "terms", contextScoped: false },
+      // Held in the context of the DID each was addressed to (VTI-NTF-050), so
+      // the selection narrows the list; with none selected every context the
+      // wallet can read is listed.
+      { id: "notifications", label: "Notifications", icon: "notifications", contextScoped: true },
     ],
   },
   {
@@ -558,6 +564,15 @@ export function ManagerShell() {
         return <RoomsPane parties={parties} contexts={contexts.records} />;
       case "agreements":
         return <AgreementsPane parties={parties} />;
+      case "notifications":
+        return (
+          <NotificationsPane
+            parties={parties}
+            contextId={selected}
+            contextHeading={heading}
+            contexts={contexts.records.map((r) => r.id)}
+          />
+        );
       case "services":
         return <ServicesPane parties={parties} authority={vta.authority} />;
       case "mediator":

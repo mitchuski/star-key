@@ -5,19 +5,23 @@
 // not belong in a wallet at all, so it lives here with the rest of the
 // administration surface.
 //
-// Unlike the `acl/*` family these bodies are **not** camelCase — `vta_sdk`'s
-// `context_management::delete` declares no `rename_all`, so the wire is
-// snake_case. Both fields happen to be single words, which is exactly the kind
-// of coincidence that hides a casing bug until someone adds `dry_run`.
+// The bodies are the registry's camelCase, as generated into `../specs/`, and
+// only that spelling is read: a snake_case fallback here was a compatibility
+// fold for an agent that no longer exists.
 
 import type { TaskParty, TrustTaskSender } from "../vta/channel.js";
 import { buildTrustTask } from "../vta/trust-task.js";
 
 import {
   TYPE_URI as TASK_CONTEXTS_DELETE,
+  RESPONSE_TYPE_URI as TASK_CONTEXTS_DELETE_RESPONSE,
   type VTAContextsDeleteResponsePayload,
-} from "@openvtc/trust-tasks/vta/contexts/delete/1.0/payload";
-import { TYPE_URI as TASK_CONTEXTS_PREVIEW_DELETE } from "@openvtc/trust-tasks/vta/contexts/preview-delete/1.0/payload";
+} from "../specs/vta/contexts/delete/1.1/payload.js";
+import {
+  TYPE_URI as TASK_CONTEXTS_PREVIEW_DELETE,
+  RESPONSE_TYPE_URI as TASK_CONTEXTS_PREVIEW_DELETE_RESPONSE,
+  type VTAContextsPreviewDeleteResponsePayload,
+} from "../specs/vta/contexts/preview-delete/1.0/payload.js";
 
 export interface ContextDeleteParams {
   holder: TaskParty;
@@ -26,13 +30,22 @@ export interface ContextDeleteParams {
   id: string;
   /** Delete even when the context still holds keys or DIDs. Default false. */
   force?: boolean;
+  /**
+   * Finish the deletion even where a `did:webvh` DID's published log could not
+   * be confirmed removed from its host. Default false, and the default is the
+   * point: the agent then refuses with `vta/contexts/delete:hostCleanupFailed`
+   * and deletes nothing, so the operator can wait for the host and retry.
+   * With it, every DID left resolving is named in `daemonCleanupErrors`.
+   */
+  abandonHostCopies?: boolean;
 }
 
 /** The delete response, from the binding. The hand-written copy omitted
  *  `ext`, which SPEC §4.5.1 lets any agent send. */
 export type ContextDeleteResult = VTAContextsDeleteResponsePayload & {
-  /** DIDs whose host copy the agent could not confirm removing. Empty is the
-   *  ordinary case; non-empty means the deletion is not finished. */
+  /** DIDs whose host copy the agent could not confirm removing — only ever
+   *  non-empty when the request set `abandonHostCopies`. Non-empty means the
+   *  deletion is not finished. */
   daemonCleanupErrors: string[];
 };
 
@@ -80,33 +93,18 @@ export async function contextPreviewDelete(
     { id: params.id },
     { issuer: params.holder.did, recipient: params.service.did },
   );
-  const payload = await sender.send<{
-    id: string;
-    keys?: string[];
-    webvhDids?: string[];
-    subContexts?: string[];
-    aclEntriesRemoved?: string[];
-    aclEntriesUpdated?: string[];
-    didTemplates?: string[];
-    /** Pre-fold spellings, still sent by an agent that has not taken the
-     *  camelCase change. Accepted on read; never emitted. */
-    webvh_dids?: string[];
-    sub_contexts?: string[];
-    acl_entries_removed?: string[];
-    acl_entries_updated?: string[];
-    did_templates?: string[];
-  }>(envelope, {
-    expectedResponseType: `${TASK_CONTEXTS_PREVIEW_DELETE}#response`,
+  const payload = await sender.send<VTAContextsPreviewDeleteResponsePayload>(envelope, {
+    expectedResponseType: TASK_CONTEXTS_PREVIEW_DELETE_RESPONSE,
     operationLabel: "vta/contexts/preview-delete/1.0",
   });
   return {
     id: payload.id,
-    subContexts: payload.subContexts ?? payload.sub_contexts ?? [],
+    subContexts: payload.subContexts ?? [],
     keys: payload.keys ?? [],
-    webvhDids: payload.webvhDids ?? payload.webvh_dids ?? [],
-    aclEntriesRemoved: payload.aclEntriesRemoved ?? payload.acl_entries_removed ?? [],
-    aclEntriesUpdated: payload.aclEntriesUpdated ?? payload.acl_entries_updated ?? [],
-    didTemplates: payload.didTemplates ?? payload.did_templates ?? [],
+    webvhDids: payload.webvhDids ?? [],
+    aclEntriesRemoved: payload.aclEntriesRemoved ?? [],
+    aclEntriesUpdated: payload.aclEntriesUpdated ?? [],
+    didTemplates: payload.didTemplates ?? [],
   };
 }
 
@@ -117,25 +115,24 @@ export async function contextDelete(
 ): Promise<ContextDeleteResult> {
   const envelope = buildTrustTask(
     TASK_CONTEXTS_DELETE,
-    { id: params.id, force: params.force ?? false },
+    {
+      id: params.id,
+      force: params.force ?? false,
+      ...(params.abandonHostCopies ? { abandonHostCopies: true } : {}),
+    },
     { issuer: params.holder.did, recipient: params.service.did },
   );
-  const payload = await sender.send<{
-    id: string;
-    deleted?: boolean;
-    daemonCleanupErrors?: string[];
-    daemon_cleanup_errors?: string[];
-  }>(envelope, {
-    expectedResponseType: `${TASK_CONTEXTS_DELETE}#response`,
-    operationLabel: "vta/contexts/delete/1.0",
+  const payload = await sender.send<VTAContextsDeleteResponsePayload>(envelope, {
+    expectedResponseType: TASK_CONTEXTS_DELETE_RESPONSE,
+    operationLabel: "vta/contexts/delete/1.1",
   });
   return {
     id: payload.id,
-    deleted: payload.deleted ?? false,
+    deleted: payload.deleted,
     // A success that is not the whole story: these DIDs' records are gone
     // and their published logs may still be served. The spec says a consumer
     // MUST surface it rather than report the deletion as complete, so it is
     // returned rather than dropped here.
-    daemonCleanupErrors: payload.daemonCleanupErrors ?? payload.daemon_cleanup_errors ?? [],
+    daemonCleanupErrors: payload.daemonCleanupErrors ?? [],
   };
 }

@@ -68,6 +68,7 @@ import {
   runProvisionIntegration,
   type TrustTaskChannel,
   vaultDelete,
+  vaultGet,
   vaultList,
   vaultProxyLogin,
   vaultRelease,
@@ -94,6 +95,8 @@ import {
   disclosureApprovalPayload,
   DISCLOSURE_APPROVE_RESPONSE_TYPE,
 } from "@openvtc/pnm-core/persona";
+import { webvhDidCreate, webvhServerList } from "@openvtc/pnm-core/webvh";
+import { parseRoomsKeysChanged } from "@openvtc/pnm-core/rooms";
 import { base64url } from "@openvtc/vti-didcomm-js";
 import { grantCommand } from "./grant-command.js";
 import { forgetInbox, getSettings, inboxFor, inboxToAdopt, setInbox } from "./config.js";
@@ -169,6 +172,8 @@ import {
   CONSENT_KEEPALIVE_PORT,
   RUNTIME_STEP_UP_CONSENT,
   RUNTIME_EMIT_WALLET_EVENT,
+  RUNTIME_ROOMS_KEYS_CHANGED,
+  type RuntimeRoomsKeysChanged,
   RUNTIME_NOTIFY,
   type RuntimeNotifyRequest,
   type OffscreenDidcommLoginRequest,
@@ -216,6 +221,9 @@ import {
 import { installRoomFilesPort, isNoTrustTaskService, resolveRoomHostEndpoint } from "./room-files-offscreen.js";
 import { runRoomsPageOp } from "./room-page-offscreen.js";
 import { runDirectoryPageOp } from "./directory-page-offscreen.js";
+import { runGitPageOp } from "./git-page-offscreen.js";
+import { runElectionsPageOp } from "./elections-page-offscreen.js";
+import { pageFailure } from "./page-error.js";
 import { OfferOpError, runRoomOffersOp } from "./room-offers-offscreen.js";
 import {
   OFFSCREEN_ROOM_OFFERS,
@@ -229,6 +237,12 @@ import {
   OFFSCREEN_DIRECTORY_PAGE,
   type OffscreenDirectoryPageRequest,
   type OffscreenDirectoryPageResponse,
+  OFFSCREEN_GIT_PAGE,
+  OFFSCREEN_ELECTIONS_PAGE,
+  type OffscreenElectionsPageRequest,
+  type OffscreenElectionsPageResponse,
+  type OffscreenGitPageRequest,
+  type OffscreenGitPageResponse,
 } from "./bridge-protocol.js";
 import {
   OFFSCREEN_SIGN_IN_STEP,
@@ -670,6 +684,62 @@ chrome.runtime.onMessage.addListener((message, sender, respond) => {
       );
     return true; // async sendResponse
   }
+  if (msg.type === OFFSCREEN_ELECTIONS_PAGE) {
+    // Only the background sends this, after checking the page is the
+    // community's portal and, for a ticket or a vote, the person decided in
+    // the wallet's window (`elections-page.ts`).
+    if (!isExtensionContextSender(sender)) {
+      sendResponse({ ok: false, error: "elections work is asked for by the wallet" } satisfies OffscreenElectionsPageResponse);
+      return false;
+    }
+    const req = message as OffscreenElectionsPageRequest;
+    runElectionsPageOp(
+      {
+        async agent(vtaDid, restBaseUrl) {
+          const { session, holder, service } = await getVtaSession(vtaDid, restBaseUrl);
+          return { sender: session, holder, service };
+        },
+        identities: (vtaDid, restBaseUrl) => listSelfIssued(vtaDid, restBaseUrl),
+        // The member's voter keys are derived in the context their identity
+        // here lives in at their agent.
+        async contextOf(vtaDid, restBaseUrl, did) {
+          const { session, holder, service } = await getVtaSession(vtaDid, restBaseUrl);
+          const dids = await vtaListDids(session, { holder, service });
+          return dids.find((d) => d.did === did)?.contextId ?? null;
+        },
+      },
+      { vtaDid: req.vtaDid, ...(req.restBaseUrl ? { restBaseUrl: req.restBaseUrl } : {}) },
+      req.params,
+    )
+      .then((result) => sendResponse({ ok: true, result } satisfies OffscreenElectionsPageResponse))
+      // The error's code rides along, read off the error here — the one place
+      // its class is still known (`page-error.ts`).
+      .catch((e: unknown) => sendResponse(pageFailure(e) satisfies OffscreenElectionsPageResponse));
+    return true; // async sendResponse
+  }
+  if (msg.type === OFFSCREEN_GIT_PAGE) {
+    // Only the background sends this, after checking the page is the
+    // community's portal and the person approved (`git-page.ts`).
+    if (!isExtensionContextSender(sender)) {
+      sendResponse({ ok: false, error: "git work is asked for by the wallet" } satisfies OffscreenGitPageResponse);
+      return false;
+    }
+    const req = message as OffscreenGitPageRequest;
+    runGitPageOp(
+      {
+        async agent(vtaDid, restBaseUrl) {
+          const { session, holder, service } = await getVtaSession(vtaDid, restBaseUrl);
+          return { sender: session, holder, service };
+        },
+        identities: (vtaDid, restBaseUrl) => listSelfIssued(vtaDid, restBaseUrl),
+      },
+      { vtaDid: req.vtaDid, ...(req.restBaseUrl ? { restBaseUrl: req.restBaseUrl } : {}) },
+      req.params,
+    )
+      .then((result) => sendResponse({ ok: true, result } satisfies OffscreenGitPageResponse))
+      .catch((e: unknown) => sendResponse(pageFailure(e) satisfies OffscreenGitPageResponse));
+    return true; // async sendResponse
+  }
   if (msg.type === OFFSCREEN_DIRECTORY_PAGE) {
     // Only the background sends this, after checking the page is the
     // community's portal (`directory-page.ts`); a content script reaching this
@@ -690,17 +760,19 @@ chrome.runtime.onMessage.addListener((message, sender, respond) => {
         },
         // The sign-in flow's own listing, so the two agree on who the member is.
         identities: (vtaDid, restBaseUrl) => listSelfIssued(vtaDid, restBaseUrl),
+        // Where the member's own marks are kept: the context their identity
+        // here lives in at their agent.
+        async contextOf(vtaDid, restBaseUrl, did) {
+          const { session, holder, service } = await getVtaSession(vtaDid, restBaseUrl);
+          const dids = await vtaListDids(session, { holder, service });
+          return dids.find((d) => d.did === did)?.contextId ?? null;
+        },
       },
       { vtaDid: req.vtaDid, ...(req.restBaseUrl ? { restBaseUrl: req.restBaseUrl } : {}) },
       req.params,
     )
       .then((result) => sendResponse({ ok: true, result } satisfies OffscreenDirectoryPageResponse))
-      .catch((e: unknown) =>
-        sendResponse({
-          ok: false,
-          error: e instanceof Error ? e.message : String(e),
-        } satisfies OffscreenDirectoryPageResponse),
-      );
+      .catch((e: unknown) => sendResponse(pageFailure(e) satisfies OffscreenDirectoryPageResponse));
     return true; // async sendResponse
   }
   if (msg.type === OFFSCREEN_ROOMS_PAGE) {
@@ -727,9 +799,7 @@ chrome.runtime.onMessage.addListener((message, sender, respond) => {
       req.params,
     )
       .then((result) => sendResponse({ ok: true, result } satisfies OffscreenRoomsPageResponse))
-      .catch((e: unknown) =>
-        sendResponse({ ok: false, error: e instanceof Error ? e.message : String(e) } satisfies OffscreenRoomsPageResponse),
-      );
+      .catch((e: unknown) => sendResponse(pageFailure(e) satisfies OffscreenRoomsPageResponse));
     return true; // async sendResponse
   }
 
@@ -1587,7 +1657,7 @@ async function listSelfIssued(vtaDid: string, restBaseUrl?: string): Promise<Sig
     });
     return {
       items: page.entries as unknown as SignInVaultEntry[],
-      ...(page.cursor ? { nextCursor: page.cursor } : {}),
+      ...(page.nextCursor !== undefined ? { nextCursor: page.nextCursor } : {}),
     };
   });
 }
@@ -1671,6 +1741,42 @@ const signInFlows = new SignInFlows({
     unbindIdentity: async (entryId) => {
       const { session, holder, service } = await getVtaSession(vtaDid, restBaseUrl);
       await vaultDelete(session, { holder, service, id: entryId, reason: "join request not taken" });
+    },
+    listHostingServers: async () => {
+      const { session, holder, service } = await getVtaSession(vtaDid, restBaseUrl);
+      const { servers } = await webvhServerList(session, { holder, service });
+      return (servers ?? []).map((s) => ({ id: s.id, ...(s.label ? { label: s.label } : {}) }));
+    },
+    // A community's own identity: its own context, one DID. Read before
+    // written, so a join retried after a failure reuses what the first
+    // attempt made (R2.1) rather than minting a second DID.
+    createCommunityIdentity: async ({ contextId, name, serverId }) => {
+      const { session, holder, service } = await getVtaSession(vtaDid, restBaseUrl);
+      const contexts = await contextsList(session, { holder, service });
+      if (!contexts.some((c) => c.id === contextId)) {
+        await contextsCreate(session, {
+          holder,
+          service,
+          id: contextId,
+          name,
+          description: `Your identity at ${name}, set up when you asked to join it`,
+        });
+      }
+      const [existing] = await vtaListDids(session, { holder, service, contextId });
+      if (existing) return { did: existing.did, contextId };
+      // No method named: the agent's configured form (webvh or did:scid) is
+      // the one a community should see. The DIDComm entry is how the community
+      // reaches the member's agent, to deliver what it issues.
+      const minted = await webvhDidCreate(session, {
+        holder,
+        service,
+        contextId,
+        serverId,
+        setPrimary: true,
+        addMediatorService: true,
+        label: `Member of ${name}`,
+      });
+      return { did: minted.did, contextId };
     },
     ensureDevice: () => ensureDeviceEnrolment(vtaDid, restBaseUrl),
     signIdentify: (entryId, unsigned) =>
@@ -1945,7 +2051,7 @@ async function getVtaSession(
   );
 }
 
-// Vault — list. Runs vault/list/0.2 over the VTA's preferred transport
+// Vault — list. Runs vault/list/0.4 over the VTA's preferred transport
 // (DIDComm > REST). The holder's X25519 is the authcrypt sender / envelope
 // issuer.
 /**
@@ -2285,9 +2391,10 @@ async function doVaultList(req: OffscreenVaultListRequest) {
     service,
     ...(req.filter ? { filter: req.filter as NonNullable<ListParams["filter"]> } : {}),
   });
+  // One page; 0.4 says "more" only by carrying a `nextCursor`.
   return {
     entries: response.entries,
-    truncated: response.truncated,
+    truncated: response.nextCursor !== undefined,
   };
 }
 
@@ -2401,8 +2508,20 @@ async function doSignTrustTask(
     // override — a connection without one still reaches the VTA over TSP or
     // DIDComm, so it must not gate the session.
     const vta = await getVtaSession(vtaDid, restBaseUrl);
-    const listed = await vaultList(vta.session, { holder: vta.holder, service: vta.service });
-    const signer = chooseTrustTaskSigner(params.asDid, signing.did, listed.entries);
+    // Read to the end: the identity may sit on any page, and a short page is
+    // not exhaustion — stopping at the first would refuse an identity held.
+    const entries = await collectPages("vault/list", async (cursor) => {
+      const page = await vaultList(vta.session, {
+        holder: vta.holder,
+        service: vta.service,
+        ...(cursor ? { filter: { cursor } } : {}),
+      });
+      return {
+        items: page.entries,
+        ...(page.nextCursor !== undefined ? { nextCursor: page.nextCursor } : {}),
+      };
+    });
+    const signer = chooseTrustTaskSigner(params.asDid, signing.did, entries);
     // Unreachable — `chooseTrustTaskSigner` refuses rather than answering
     // `holder` for an identity other than the holder — and kept so this
     // branch can only ever end in a VTA signature or a refusal.
@@ -4312,6 +4431,30 @@ async function dispatchInbound(
     return;
   }
 
+  // A room watched through this VTA moved (`rooms/keys/changed/0.1`). Accepted
+  // only from our own VTA as the transport proved it, and only when the payload
+  // is the closed schema's; the console that armed the watch decides whether it
+  // is one it armed, and reads the room if so. One-way and content-free, so
+  // nothing is answered, kept or shown on the strength of it here.
+  const changed = parseRoomsKeysChanged(message, vtaDid, senderDid);
+  if (changed) {
+    const out: RuntimeRoomsKeysChanged = {
+      type: RUNTIME_ROOMS_KEYS_CHANGED,
+      vtaDid,
+      signal: {
+        roomId: changed.roomId,
+        member: changed.member,
+        host: changed.host,
+        latestVersion: changed.latestVersion,
+      },
+    };
+    // No console open is the common case: the signal is then dropped, and the
+    // next reading of the room recovers anything it said (rooms/keys/changed/0.1
+    // producer item 4: a lost signal costs nothing reading cannot recover).
+    chrome.runtime.sendMessage(out).catch(() => undefined);
+    return;
+  }
+
   // The executor's answer to a decision this device already sent — accepted, or
   // refused with a reason. Checked before the request parser because it is a
   // reply on the same envelope type, and `parseTaskConsentRequest` can only
@@ -4500,7 +4643,7 @@ async function doRestLogin(
     ? await personaTaskSigner(req.vtaDid, req.restBaseUrl, req.entryId)
     : undefined;
 
-  // `auth/challenge` then `auth/authenticate/0.2`, as Trust Tasks, to the RP
+  // `auth/challenge` then `auth/authenticate/0.3`, as Trust Tasks, to the RP
   // this origin is pinned to. `rpHttpsSender` refuses a document addressed to
   // anyone else and any reply the RP did not sign.
   const sender = rpHttpsSender({
@@ -4545,9 +4688,10 @@ async function personaTaskSigner(
   entryId: string,
 ): Promise<TaskSigner> {
   const { session, holder, service } = await getVtaSession(vtaDid, restBaseUrl);
-  const listed = await vaultList(session, { holder, service });
-  const entry = listed.entries.find((e) => e.id === entryId);
-  if (!entry?.principalDid) {
+  // Fetched by id rather than found in a listing, which would miss an entry
+  // past the first page.
+  const { entry } = await vaultGet(session, { holder, service, id: entryId });
+  if (!entry.principalDid) {
     throw new Error(`vault entry ${entryId} names no persona DID`);
   }
   return vaultTaskSigner({ session, holder, service, entryId, did: entry.principalDid });

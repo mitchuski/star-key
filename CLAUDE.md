@@ -32,22 +32,16 @@ Rules that bite hardest here:
   issue rather than absorbing the old shape here. This is also why a request to
   another repo should not ask for a deprecation window on this repo's behalf.
 
-  **The one exception is TSP Rev 2, and the reason it is one is worth reading
-  before citing it for anything else.** The rule above rests on "our peers cut
-  over with us", which is true of the VTA and the mediator and false of the
-  Trust Spanning Protocol: it is a ToIP specification with implementations
-  nobody here controls, and the reference `tsp_sdk` shipped Rev 3 in 0.10.0
-  while others are still on Rev 2. So `@openvtc/vti-tsp-js` **reads** both and
-  **packs** only Rev 3. That asymmetry is what keeps it from being the pattern
-  this rule bans: there is no dual-accept *arm* anywhere on the Rev 3 path, no
-  `if (rev === 2)` branch, and no negotiation. Rev 2 is a frozen decode-only
-  codec in its own directory, reached by dispatching on a version marker the
-  wire actually carries — and it is deleted whole, with its arm of the
-  dispatcher, the day the last Rev 2 peer is gone. A fold you can delete in one
-  `rm` is not a fold. **Nothing else in this repo has that shape**; if you are
-  reaching for this paragraph to justify a second version arm, the honest test
-  is whether a peer you do not control is on the far side, and for the VTA and
-  the mediator the answer is no.
+  **TSP is not an exception either.** The Trust Spanning Protocol is a ToIP
+  specification with implementations nobody here controls, and
+  `@openvtc/vti-tsp-js` once kept a frozen decode-only Rev 2 codec for exactly
+  that reason. It was deleted when the specification released 1.0
+  (`YTSP-BAA`, October 2026): the package now speaks 1.0 only and refuses every
+  other MAJOR — Rev 2 and Rev 3 included — as `E_TSP_REVISION`, in step with
+  affinidi-tsp 0.3 and the reference `tsp_sdk` 0.16. MAJOR is the
+  specification's own "not interoperable" signal, so honouring it is the
+  protocol, not a fold. Do not reintroduce a draft reader; a lagging TSP peer
+  upgrades.
 
 - **R3.7 — match errors on stable machine-readable codes, never on strings,
   and parse error *bodies* before throwing on status.** Any condition this
@@ -57,6 +51,13 @@ Rules that bite hardest here:
   `errorFromBody(doc, status, statusText)`, never by handing the spent
   `Response` back to `errorFromResponse` — that throws into a swallowing
   `catch` and silently degrades to a status-only guess.
+  The same rule faces the other way on the page bridge: every
+  `window.vtaWallet.*` rejection carries a `code` beside its `message`
+  (`src/page-error.ts`, `docs/page-bridge-errors.md`). A refusal a gate or the
+  offscreen document raises names its code (`PageRefusal`, or the channel's
+  refusal class); the offscreen document sends `pageFailure(e)` so the code is
+  read while the error's class is still known. A new wallet code goes in
+  `WALLET_ERROR_CODES` and the document's table together — a test compares them.
 - **Endpoints this wallet did not choose are vetted before they are dialed, and
   production gets no opt-out.** A mediator's REST, auth and WebSocket URLs come
   out of its DID document; a VTA's REST base is written from one at onboarding.
@@ -234,8 +235,9 @@ signer and the page-facing `signTrustTask` all read the one rule.
 
 **RP sign-in over DIDComm is `loginViaTrustTask` over a
 `DidcommVtaTransport`** (`loginViaDidcomm`). Keep it that way rather than
-growing a second login. The bare `auth/authenticate` it used to send survives
-only for a caller that passes no `signing`, and is deprecated.
+growing a second login. The bare `auth/authenticate/0.1` it used to send for a
+caller with no `signing` is gone, and `signing` is required: no RP serves that
+form (did-hosting-control refuses it by name).
 
 **Each DIDComm and TSP document is sent by its signer.** The VTA, the VTC and
 the RPs act on a document from those transports only when its proof verifies
@@ -522,7 +524,7 @@ biggest privacy answer this product has and it used to be a footer under every
 other view.
 
 `movePlan` (`world-model.ts`) owns a move, and the **order is the reason it is a
-function**: `facet/put` replaces, and the agent refuses to place a face that is
+function**: `persona/world/put` replaces, and the agent refuses to place a face that is
 already placed, so the source is rewritten without it before the destination is
 rewritten with it. Every write carries live membership via `seedMembership` — a
 put echoing a dangling id is refused `unresolvedReference` and leaves the world
@@ -549,7 +551,7 @@ only way out the moment it became persistent.
 **What breaks it:** rendering an editor inline again, or as a mode that replaces
 the list; dropping the anchor from `Editing`; unpinning the strip, or letting it
 grow past its cap; re-adding a Worlds pane; reading
-`.faceIds` off a facet to build a move instead of `movePlan`; drawing a value on
+`.faceIds` off a world to build a move instead of `movePlan`; drawing a value on
 a closed card; or letting the strip render one again.
 
 **Colour on the map carries three things, in three channels that never
@@ -895,6 +897,25 @@ authority to admin the room — and the room would be right to honour it.
 whole family because the boundary is "a page is not a member", not a judgement
 about particular verbs.
 
+**Every surface that shows a sealed record verifies it first, with the one
+verifier.** `verifyRecordBody` (`@openvtc/pnm-core/rooms`, module
+`rooms/record-body.ts`, re-exported from `rooms/files`) applies
+`SealedRecordBody`'s *Reading* rule: the author's proof for `assertionMethod`,
+the room, key and the version the body was sealed at (`readSealedVersion` for a
+`rooms/keys/read` answer), and on an `attributed` room the host's author equal
+to the signer. The records pane, the page view (`readView`) and the file engine
+all go through it, and each passes `bodyStoredAt` and a `resolveDidAt`
+(`resolveDidDocumentAt`, `@openvtc/pnm-core/did`; one
+`memoResolveDidDocumentAt()` per listing, since a historical resolution
+re-verifies the whole log): for a did:webvh / did:scid author the proof is
+checked against the document as of then, and a failure — or an author with no
+document yet (`E_DID_VERSION_NOT_FOUND`, a `null` answer) — is refused, not a
+placeholder. A body that fails shows none of its content; "signed" is
+said only of one that passed, and is worded apart from the host-listing
+verdict. Its member list is the released schema's exactly
+(`RECORD_BODY_MEMBERS`, pinned by `tests/rooms.record-body.mjs`): a member is
+added when the schema that defines it is released, not from a draft.
+
 **What breaks it:** exporting `rooms` from the root barrel (its URIs then reach
 the service worker); sending a `keys/*` task to the host or a host verb to the
 VTA; drawing a failed listing as an empty one ("this agent holds keys to no
@@ -926,6 +947,70 @@ and a tombstone with the member's reason stays, and anyone who read it may still
 have it; a reason is required. Editing needs `write`, retracting `curate`, which
 `write` does not imply; an action the place's agent says it lacks
 (`HeldRoom.actions`) is shown as such, not offered.
+
+**Members' names are records, read by their own rules** (`memberProfile`,
+`rooms/_shared/0.3`, trust-tasks-tf #1035; `rooms/member-name.ts`).
+`assembleRoomRecords` takes them out of every conversation, library and count
+and returns `names` by author: the version of that author's name records the
+host stored most recently (`bodyStoredAt`, else `updatedAt`), none where it is
+empty, retracted or refused. A name
+applies to its author in that room only. The pane shows the member's own
+contact petname first (`useContactPetnames`), then the room name — in quotes,
+never beside a check mark, with a DID fingerprint where two would read the same
+(`authorLabels`) — then the DID. Writing one (`writeMemberNameAsMember`, the
+`name` open on the room-files port) reads the room's profile as the member and
+refuses before anything is sealed or sent unless `recordMembers` lists both
+`kind` and `memberProfile`; it seals at `rooms/keys/seal/0.3` and puts in the
+clear at `rooms/records/put/0.5`, over the member's own record where one is
+held.
+
+**The #1038 amendments.** Rule 2 is the whole rule for an author with several
+name records: the most recently stored current version wins, ties to the greater
+version, never the first a reader met. A version one member wrote over another's
+record is the writer's own claim (never the original author's), weighed like
+any of theirs. Names that would read the same after NFC and case folding, **or
+whose UTS #39 skeletons are equal**, carry a fingerprint (`rooms/confusables.ts`,
+over Unicode's own `confusables.txt`, generated whole by
+`scripts/sync-confusables.mjs` and pinned by its SHA-256). Before a name is
+found an author is the member's petname or a shortened DID — never a name from
+the DID document, a directory or another room. And a write from the console
+that lands more than 500 versions past the member's name record writes the name
+again (`rewriteMemberNameAsMember`: same key, same name, `writtenAt` kept, no new
+`editedAt`); the portal's writes do not, since the wallet holds no copy of the
+room's records there.
+
+**An open room learns of changes through the member's VTA** (`rooms/keys/watch/0.1`,
+`rooms/keys/changed/0.1`, trust-tasks-tf #1040; `@openvtc/pnm-core/rooms`'s
+`watch.ts`, the console's `manager/room-watch.ts`). The wallet cannot arm
+`rooms/watch` itself — it may not present as the member, and its sessions have
+no address a host can reach (trust-tasks-tf #1036) — so it asks its VTA, which
+arms each room as the member at an address of its own and passes the host's
+signal on as `rooms/keys/changed`, through the mediator where the wallet already
+collects from it, like `task-consent/granted`. The offscreen document accepts
+one only from its own VTA as the transport proved it, and only when the payload
+is the closed schema's (`parseRoomsKeysChanged`), and hands it to the console's
+pages (`RUNTIME_ROOMS_KEYS_CHANGED`), which take it only from `offscreen.html`
+and only for a watch they armed (`RoomWatcher.accept`); anything else is dropped
+silently. Each open records pane holds its room's watch: armed after the first
+read at the version read, gathered into one request per VTA, member and host (64
+rooms at most), re-armed only after the read a signal causes, and cancelled when
+the pane closes. A signal is answered by listing from the watermark and
+batch-reading what changed (a `lastPrune` past the watermark rebuilds from a
+full listing). Unread is the reader's decision after reading
+(`unreadMessages`): a message, not the member's own, current, whose host
+`createdAt` (else `updatedAt`) is after the member's read marker
+(`room-read:<vtaDid>|<member>|<roomId>` in `chrome.storage.local`, never sent).
+The pane shows the count, and a hidden console raises one notification whose
+words are fixed (`UNREAD_NOTIFICATION`) — no room, author or text. Polling stays
+as the fallback: every minute while no watch covers the room (the VTA refused,
+does not serve the task, or the room was refused — quietly), every ten minutes
+while one does.
+
+**What breaks it:** showing anything because a signal arrived rather than
+because reading found it; putting a room, an author or message text in an OS
+notification; re-arming without reading, or on every poll; accepting a signal
+from a content script (it carries the extension's id) or for a watch not armed;
+or arming as the wallet's own key at a host (`rooms/keys/act` with an address).
 
 **Archive and restore are offered; pin is not.** Every curation moves the
 record to a new version (vti-rooms `curate_record`), and a sealed body is bound
@@ -992,6 +1077,46 @@ revocable in the console's **Communities** tab, beside the room it shares
 (`rooms-shares.tsx` reads, `rooms-communities.tsx` draws). A page asking
 about a room it was not given gets one sentence whatever the reason.
 
+**An open room is offered beside the listing, from the community's record.**
+An open room has no group, so `rooms/keys/list` never names it: the member
+reads it with the credentials the offer gave (`browse` / `read` present the
+vaulted authority, no group needed), and `roomStanding` counts it joined. So
+`choose` adds the open rooms the community's record says each identity is in
+(`openRooms` → `admittedOpenRooms`: `state: admitted`, `visibility: open`), and
+a page's list reports a share of one as `held` with no `epoch` — asked only
+for shares the listing does not name, read each time and never kept, so a
+removal stops counting at once. Without this, the portal shows an open room
+joined while the share window can never offer it, and the console's lane stops
+at "Joined: not yet" (`joinedOpen`).
+
+**An open room takes notes in the clear, and lives apart in the console.** A
+page's `putNote` on an open room writes `rooms/records/put/0.4` with
+`cleartext` (`putCleartextAsMember`, completed as the member by `rooms/keys/act`
+like every host request) — there is no group to seal under — after the same
+confirmation, which says the note will be readable by the room's host.
+
+**An open room's file carries its own key.** With no storage key to derive from, `putRoomFile` mints
+32 random bytes for the file, seals the blob exactly as on a sealed tier, and
+writes `rooms/records/put/0.4` with the manifest — `fileKey` included — in
+`cleartext.file` and `blobs` exactly `[file.blobRef]` (`putCleartextAsMember`
+with `file`). Every record, with a file or without, is `put/0.4`, and every
+request the VTA completes as the member is `rooms/keys/act/0.10`, whose closed
+table names it — one version of each, as the lock requires (VTI serves 0.3,
+0.8 and 0.9 only for wallets that predate the cutover; 0.10 is 0.9's table plus
+`vtc/rooms/memberships/list/0.2`). `getRoomFile` holds the key to the tier: required in an open
+record's manifest, refused in a sealed body's; the opener is handed the
+manifest without it, and nothing returns or shows it (`withoutFileKey` in the
+records pane). An open record is not signed by its author, so the result says
+`signed: false` and every surface says the file matched the digest *its record
+states*, not one its author signed.
+
+The
+console's *My rooms* is key custody, so it lists the open rooms the member is in
+in their own section (`openRooms` in `room-groups.ts`, from the communities'
+offers, joined and open, not also held), and opens one as its records only
+(`rooms-open.tsx`): `RoomRecords` takes a `RoomPlace` — room, member, actions —
+which a held place and an open room both are.
+
 **A share names the member it acts as, and every request for the page names
 it.** One VTA can hold two members of one room — the community's own place in
 a room the community owns, beside an administrator's own membership, or two
@@ -1027,8 +1152,8 @@ answer.
 
 **A community's own rooms are shown by name.** A room the community owns has
 a label its administrators gave it, and the community's offer to the member
-carries it (`vtc/rooms/memberships/list/0.1`, built unsigned and completed by
-the VTA as the member with `rooms/keys/act/0.5`, sent to the community's
+carries it (`vtc/rooms/memberships/list/0.2`, built unsigned and completed by
+the VTA as the member with `rooms/keys/act/0.10`, sent to the community's
 `TrustTaskHTTPS` unchanged — `@openvtc/pnm-core/rooms`'s
 `communityRoomMemberships`).
 `list` and `choose` read it for the members the shares (or the share prompt)
@@ -1112,14 +1237,31 @@ or removed, for as long as the community keeps it) read beside the VTA's custody
 (`roomsKeysList`, for that member), and its `state` is the standing every
 surface derives from those two (`roomStanding`): `offered`, `joined`,
 `unfinished` (accepted somewhere and not held — accepting again finishes it),
-`needsReadmission` (too late to finish: an administrator re-admits) or
-`removed`. The wallet keeps no record of an accept of its own, so a room
-accepted in OpenVTC shows joined here, and one interrupted here is finished
-there (`vtc/rooms/memberships/list/0.1`, *One record, every surface*).
+`needsReadmission` (too late to finish: an administrator re-admits),
+`suspended` (the community closed the room to every member — archived with no
+access, or scheduled for removal) or `removed`. Beside it each view carries the
+room's own state as the record gives it — `roomState`, `roomAccess`, `purgeAt`,
+`suspendedAt` — spelled as the community's member portal reads them
+(`PageOffer` / `PageRoom` in vtc-service's `wallet-rooms.ts`), so the portal
+says read-only, closed for now, or going away. The wallet keeps no record of an
+accept of its own, so a room accepted in OpenVTC shows joined here, and one
+interrupted here is finished there (`vtc/rooms/memberships/list/0.2`, *One
+record, every surface*).
+
+**Renewals are collected as the rooms are read.** A community renews an
+admission — and restores every suspended member when a room it archived with no
+access reopens — by listing a renewal beside the member's offers
+(`vtc/rooms/offers/list/0.4` `renewals`). Whenever the offscreen listing finds
+the member in one of the community's rooms, it stores each renewal's membership
+and authority in the member's VTA **in place of** the ones they renew
+(`collectRoomRenewals`, `vault/credentials/{query,get,receive}`), as `pnm rooms
+offers renew` does by hand. A credential the vault already holds is not sent
+again, two held of one kind are never guessed between, and a failure never
+fails the listing: the next read tries again.
 
 **Every request is the member's, completed by the VTA.** The lists and the
 acceptance are built unsigned and completed as the member with
-`rooms/keys/act/0.5` (the version that admits the community's types; a VTA
+`rooms/keys/act/0.10` (the version that admits the community's types; a VTA
 without it gets "must be updated"), then sent to the community unchanged over
 HTTPS; `roomsKeysAct` refuses an answer made as anyone else. On a sealed tier
 the **VTA gives the KeyPackage** (`rooms/keys/key-package/0.2`) — act completes
@@ -1263,9 +1405,12 @@ lease is owned by the offscreen document per console **Port**
 when it disconnects — the mediator allows three subscriptions per account, and a
 closed tab must not hold one past a lease.
 
-**One version floor, `MEDIATOR_VERSION_FLOOR` = 0.28.36**, read from `readyz`
-— not the TDK console's gate per member. There is no older mediator anyone here
-runs.
+**One version floor, `MEDIATOR_VERSION_FLOOR` = 0.48.0**, read from `readyz`
+— not the TDK console's gate per member. It is the first release that both
+serves `messaging/account/{get,list,update}/0.2` (RFC 3339 activity times) and
+pushes `messaging/monitor/event/0.2` (`occurredAt`); below it the account tasks
+are refused and a monitor batch fails `monitorBatchOf`'s exact type match and is
+dropped without a word.
 
 **A fourth CI guard, with two permitted files.** The mediator's operations URIs
 are banned from `dist/` except `manager.js` (composes) and the offscreen entry
@@ -1477,6 +1622,139 @@ custom headers, so no preflight, and any status is a pass because reading a
 status at all proves the origin was allowed. Swapping it for a health endpoint
 would test a different policy than the one that breaks.
 
+## A portal page votes through the wallet, and never sees a choice
+
+`window.vtaWallet.elections.{list, show, takeTicket, takeTickets, vote}` is how a community's
+member portal lets a member take part in its elections (VTI-VOT-001 – 100). The
+portal is the community's own code and knows who is signed in, and the
+community is never trusted to learn how anyone voted or to link a ticket to a
+cast. So the page **never sees a choice**: the ballot is filled in the wallet's
+own window (`election-consent.tsx`, `kind=election`), the member's VTA builds and
+signs the cast under a key made for that cast alone (`vta/pcs/vote`,
+`vote-encrypted`), and the wallet posts it to the ballot box's HTTPS door after a
+random pause of up to 20 s — never through the community. `vote` answers the
+page the same whether the member cast, cancelled or failed (`{ ticketTaken }`
+only); the outcome is shown in the wallet's window. Gates are
+`elections-page.ts` (`ElectionsPageGates`, the git channel's four), work is
+`elections-page-offscreen.ts`, the VTA tasks and ballot rules
+`@openvtc/pnm-core/vtc` `elections.ts`; reference client `pnm elections`.
+
+**Ticket and vote apart in time.** `vote` with no ticket held takes one and
+stops; a ballot opened within an hour of this wallet taking the ticket warns
+(`TICKET_TO_VOTE_GAP_MS`, a time in `chrome.storage.local`, never a choice).
+`requestTask` refuses `vta/pcs/` and `vtc/elections/` (`page-task-policy.ts`).
+
+**Several tickets, one decision.** `takeTickets({ hostDid, electionIds })`
+(1–50 ids; a community board's ideas, VTI-BRD-034) reads each election as
+`takeTicket` does — never presenting a membership just to read one, so an
+election shown only to a party's members is `unavailable` and taken alone — and
+asks once, in one `kind: "tickets"` window listing every election with what each
+claim presents. Then each ticket is still its own `takeTicket` to the community,
+a random `TICKET_SPACING_MS` pause apart (CSPRNG, `defaultTicketSpacingMs`), and
+one refusal does not stop the rest. The page gets one outcome per election
+(`taken`, `held`, `unavailable`, `notEligible`, `failed`) — nothing `list` would
+not tell it. Don't collapse the requests into one, or drop the pause: either
+hands the community one request that ties the elections together in time.
+
+**One ballot window, from permission to receipt.** A ballot box the wallet may
+not reach yet is not a refusal: the ballot window opens with `needsReach` and
+asks first, its Allow button calling `requestOriginPermission` as the click's
+first statement; the gates check `canReach` again before anything is sent.
+After *Cast my vote* the window sends its decision with `keepOpen`
+(`consent-result.ts` — it stays only once the background took the decision)
+and shows the cast as the gates drive it: offscreen `castPrepare` (fresh
+`show`, `ballotRefusal`, the VTA's `pcsCast`) → `castPost` (the pause the gates
+chose with `castDelayMs`, capped, then `postCast`) → `castKeep`
+(`pcsVoterReceipt`), each step reported as a `CastProgress` in
+`chrome.storage.session` under `ELECTION_PROGRESS_PREFIX + consentId`, which
+the window follows with `storage.onChanged`. Closing the window early never
+stops the cast; a failure it can no longer show opens a `kind: "cast"` window.
+A vote the ballot box counted is remembered in `chrome.storage.local`
+(`election-vote:` + `ticketKey`: when, outcome, board entry — never a choice),
+and the next ballot window opens on "You voted…", offering a change only where
+`revote` is `replace` and voting is open. The page is told none of this.
+
+**A membership credential is presented only after the member chose to**
+(credential rolls, VTI-VOT-015 – 018, 025, 090). Under `roll.rule: credential`
+the ticket claim carries a presentation of the member's membership credential
+issued by exactly `roll.memberOf`: the gates check the member holds one
+(offscreen `membership`), the ticket window says what claiming shows the
+community (`presents`, `rollCredentialWarning`), and the offscreen work refuses a
+credential roll whose `memberOf` is not the `presentFor` the member approved. An
+election put to a **member party**'s members is in nobody's list but its
+managers' and the party's, so a page opens it by id with `memberOf` (from a
+link, or from a held notification — below): the wallet reads it
+without presenting first, and only on `electionUnknown` asks in a `disclose`
+window, then reads again presenting (`readAs`). That choice is remembered per
+election (`election-disclosed:` + `ticketKey`, the party's DID only) so later
+reads and the cast's fresh read present without asking. The credential is
+picked in the offscreen document from `vault/credentials/query`
+(`membershipCredentialFor`); its handle never leaves it. An `indeterminate`
+answer (an issuer's DID document or status list the community could not read)
+is resent as the same document by `postCommunityTask`, the one resender of
+community documents, with backoff — never by a second loop above it.
+
+**What breaks it:** returning a ballot, a cast, a receipt or "voted" to the page
+(the remembered vote included); storing a choice; presenting a membership the
+member was not first told of, or one issued by any DID but the roll's own;
+rendering a ballot in a page; sending a cast or a ballot to the community's
+endpoint; signing a cast with any key but the one the VTA made for it.
+
+## Notifications: held at the agent, read by the wallet, opened only by the member
+
+A notification (VTI-NTF-001 – 074, kinds in the spec's Appendix G) is an
+originator's signed statement that a thing exists — an election, say — with
+where it is held (`subject.heldBy`), its id there, the task that opens it and
+the audience it concerns. It confers nothing and is no evidence of
+eligibility (VTI-NTF-004). The member's VTA holds what it accepts in the
+context of the DID it was addressed to; the wallet reads them with
+`@openvtc/pnm-core/notifications` (`vta/notifications/{list,show,dismiss}/0.1`).
+Reading, listing and dismissing tell nobody anything (VTI-NTF-053).
+
+**Two views, one source.** The console's *Notifications* pane
+(`panes/notifications.tsx`) lists every context's (or the selected one's),
+shows an unknown kind as existing and nothing more (VTI-NTF-012), shows the
+delivering document as received, and dismisses. A portal's
+`elections.list` answers `{ elections, notified }`: the community's list
+**and** the election notifications held in the member's context for that
+community, the second only as notified — id, audience, period, status
+(VTI-NTF-063). When the community answers `electionUnknown` and the page named
+no `memberOf`, the gates take it from a held, unwithdrawn notification for
+that election; the `disclose` window still asks before anything is presented.
+
+**Opening from the console names only the record.** *Open the election* sends
+`RUNTIME_NOTIFIED_ELECTION` `{ contextId, recordId, present? }` (extension
+pages only). `ElectionsPageGates.openNotified` re-reads the record from the VTA
+(`notifiedTarget`), reads the election from `heldBy` as the record's
+`addressee` in its context (`notifiedShow`), and only on `electionUnknown`
+returns `needsPresent` — the console tells the member what presenting shows
+and sends `present: true` only from their click. The choice is remembered as a
+page's is (`election-disclosed:`). A withdrawn notification is not opened.
+Tickets and ballots stay the portal's flow.
+
+**Deposit has nowhere to happen in this wallet — and that is a finding, not a
+gap to paper over.** VTI-NTF-054 has a client that holds a *persona* DID's
+mediator socket hand each `notifications/notify` / `relay` it receives to the
+VTA exactly as received (`notificationsDeposit`, in core for a client that
+does). This wallet holds no such socket: its sessions are the holder's
+`did:key` (no service, so nothing can be addressed to it, VTI-NTF-020), the
+approver and the onboarding ephemeral; a persona's keys, keyAgreement
+included, live only at the VTA, so the wallet could neither authenticate to
+the mediator as one nor open what is sealed to it. A persona minted with
+`addMediatorService` (the join flow) advertises the VTA's mediator, where no
+party collects it today. Do not "fix" this with a REST path or by having the
+VTA decrypt for the wallet; the resolution belongs to the VTA (it holding its
+personas' sockets is a direct delivery, VTI-NTF-050) and is recorded as an
+open point against VTI.
+
+**What breaks it:** opening an election (or contacting `heldBy` or the
+originator) because a notification arrived; showing a notified election as
+anything but notified before it is opened; taking the community, election or
+member for `openNotified` from the console rather than the held record;
+presenting a membership without the member's click; letting a page drive
+`vta/notifications/*` (`page-task-policy.ts` refuses the prefix); or
+re-serialising a document before depositing it.
+
 ## A consent window reports its decision before it closes (VTI-40)
 
 Every consent surface — site consent, task consent, the WebAuthn approver and
@@ -1511,7 +1789,7 @@ consent surface that opens its own window — the disclosure prompt did, with no
 `window.vtaWallet.{approverIdentity, approveStepUp, attestApprover,
 approveDecision}` serve a VTC's `approverSigned` step-up
 (`auth/step-up/approver/attest/0.1`, carried in
-`auth/step-up/approve-response/0.6`) and its `approverSigned` decision evidence
+`auth/step-up/approve-response/0.7`) and its `approverSigned` decision evidence
 (carried in `task-consent/decision/0.2`). The store is
 `core/src/store/step-up-approver.ts`; the checks and the statement are
 `core/src/trust-tasks/approver-attest.ts`; the page rules are
@@ -1610,6 +1888,24 @@ and `extension/tests/approver-policy.test.mts` pin these.
 
 ## Repo mechanics worth knowing before you start
 
+- **Task modules are generated here, from `packages/core/trust-tasks.lock`.**
+  `@openvtc/trust-tasks` deprecated its prebuilt per-task modules
+  (dtgwg-trust-tasks-tf #954); core now pins the tasks it speaks with the
+  `trust-tasks` CLI (`cargo install trust-tasks-cli`) and generates them with
+  `@openvtc/trust-tasks-gen` into `src/specs/` — commit `trust-tasks.toml`,
+  `trust-tasks.lock`, the vendored `trust-tasks/` bundles and `src/specs/`.
+  Import a task as `../specs/<slug>/<M.N>/payload.js`, never
+  `@openvtc/trust-tasks/<slug>/…`; from the package take only
+  `@openvtc/trust-tasks/runtime` and framework specifications
+  (`trust-task-discovery`, which the generator skips). The lock holds **one
+  version per slug**, which makes the no-folds rule structural: importing a
+  second version means moving the pin (`trust-tasks add <slug>/<M.N>`, then
+  `npm run tasks:generate -w @openvtc/pnm-core`). `tests/specs.generated.mjs`
+  regenerates into a temp directory and fails on any drift or hand edit.
+  `trust-tasks list` shows which pins the registry has superseded; check what
+  the counterparty serves before moving one, since the registry can run ahead
+  of a release. Never import `_shared/components` from either tree — its names
+  depend on the lock; use the name a task module re-exports.
 - **Build `core` before typechecking anything that depends on it.** Each
   workspace typechecks against its dependencies' emitted, gitignored `dist`,
   so a stale `dist` produces phantom "cannot find module" / "no exported

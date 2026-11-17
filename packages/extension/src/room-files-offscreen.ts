@@ -32,7 +32,9 @@ import {
   curateRecordAsMember,
   opaqueRecordKey,
   putCleartextAsMember,
+  rewriteMemberNameAsMember,
   roomInfoAsMember,
+  writeMemberNameAsMember,
   writeSealedAsMember,
   type CompletedDocumentSender,
   type PersonaRoom,
@@ -45,6 +47,7 @@ import {
   type RoomFilesOpen,
   type RoomFilesUpload,
 } from "./bridge-protocol.js";
+import { pageErrorCode } from "./page-error.js";
 
 export interface RoomFilesDeps {
   /** The agent's session and the wallet's signing identity for it. */
@@ -153,11 +156,9 @@ export function serveRoomFilesPort(port: chrome.runtime.Port, deps: RoomFilesDep
     const code = (e as { code?: unknown })?.code;
     // The error and its code only: never a key, a body or a byte.
     console.warn(`[room files] ${what} failed${typeof code === "string" ? ` (${code})` : ""}:`, e instanceof Error ? e.message : String(e));
-    finish({
-      kind: "failed",
-      error: e instanceof Error ? e.message : String(e),
-      ...(typeof code === "string" ? { code } : {}),
-    });
+    // The page code, read off the error while its class is known: a portal's
+    // transfer carries it to the page (`page-error.ts`).
+    finish({ kind: "failed", error: e instanceof Error ? e.message : String(e), code: pageErrorCode(e) });
   };
 
   let upload: { into: Uint8Array; filled: number; begin: RoomFilesOpen & { kind: "put" } } | undefined;
@@ -179,9 +180,11 @@ export function serveRoomFilesPort(port: chrome.runtime.Port, deps: RoomFilesDep
                   : "new note"
                 : msg.kind === "curate"
                   ? `curate ${msg.key}`
-                  : String(msg.kind);
+                  : msg.kind === "name"
+                    ? "member name"
+                    : String(msg.kind);
         console.info(`[room files] ${what} in ${"roomId" in msg ? msg.roomId : "?"}: started`);
-        if (msg.kind === "get" || msg.kind === "note" || msg.kind === "curate") {
+        if (msg.kind === "get" || msg.kind === "note" || msg.kind === "curate" || msg.kind === "name") {
           void run(deps, msg, abort.signal, post).then(finish, fail);
         } else if (msg.kind === "put") {
           // Allocated once, at the size declared, so a console that sends more
@@ -232,7 +235,7 @@ async function run(
     files ? loadCipher() : Promise.resolve(undefined),
   ]);
   const host = await (deps.host ?? hostChannels)(open.hostDid);
-  if (open.kind === "note" || open.kind === "curate") {
+  if (open.kind === "note" || open.kind === "curate" || open.kind === "name") {
     // The same room handle the portal's writes use: built here, completed by
     // the VTA as the member, sent to the host unchanged.
     const room: PersonaRoom = {
@@ -242,6 +245,16 @@ async function run(
       host: { did: open.hostDid, sender: host.completed },
       ...(open.member !== undefined ? { member: open.member } : {}),
     };
+    if (open.kind === "name") {
+      // The writer's gate (`recordMembers` listing `kind` and `memberProfile`) is
+      // applied in core, against the profile read here as the member, before
+      // anything is sealed or sent.
+      const out = await writeMemberNameAsMember(room, {
+        name: open.name,
+        ...(open.held !== undefined ? { held: open.held } : {}),
+      });
+      return { kind: "named", key: out.key, version: out.version, author: out.principal };
+    }
     if (open.kind === "curate") {
       const out = await curateRecordAsMember(room, {
         key: open.key,
@@ -250,6 +263,7 @@ async function run(
         ...(open.reason !== undefined ? { reason: open.reason } : {}),
         ...(open.expectedVersion !== undefined ? { expectedVersion: open.expectedVersion } : {}),
       });
+      await nameNearTheHead(room, open.ownName, out.version);
       return {
         kind: "curated",
         key: out.key,
@@ -281,6 +295,7 @@ async function run(
             undefined,
             open.replaces !== undefined ? { replaces: open.replaces } : {},
           );
+    await nameNearTheHead(room, open.ownName, version);
     return { kind: "noted", key, version, author: principal };
   }
   const ctx: RoomFileContext = {
@@ -308,6 +323,17 @@ async function run(
       ...(open.tags !== undefined ? { tags: open.tags } : {}),
       ...(open.padme !== undefined ? { padme: open.padme } : {}),
     });
+    await nameNearTheHead(
+      {
+        roomId: open.roomId,
+        holder: { did: signing.did },
+        vta: { did: open.vtaDid, sender: vtaSender },
+        host: { did: open.hostDid, sender: host.completed },
+        ...(open.member !== undefined ? { member: open.member } : {}),
+      },
+      open.ownName,
+      put.version,
+    );
     return { kind: "put", ...put };
   }
   const got = await getRoomFile(ctx, open.key, (provisional) =>
@@ -321,9 +347,30 @@ async function run(
       ...(got.file.mediaType !== undefined ? { mediaType: got.file.mediaType } : {}),
     },
     author: got.author,
+    signed: got.signed,
     version: got.version,
     ...(got.title !== undefined ? { title: got.title } : {}),
     ...(got.description !== undefined ? { description: got.description } : {}),
     ...(got.tags !== undefined ? { tags: got.tags } : {}),
   };
+}
+
+/**
+ * After a write the host assigned `version`, write the member's name again where
+ * it has fallen more than 500 versions behind (*Near the room's head*,
+ * rooms/_shared/0.3 `MemberProfileRecord`, trust-tasks-tf #1038), from the name
+ * record the console read (`ownName`). A SHOULD, done once on this write: its
+ * failure — a concurrent change on another device, a profile that no longer
+ * takes names — leaves the write that was asked for done, and is only logged.
+ */
+async function nameNearTheHead(
+  room: PersonaRoom,
+  own: RoomFilesOpen["ownName"],
+  version: number,
+): Promise<void> {
+  try {
+    await rewriteMemberNameAsMember(room, own, version);
+  } catch (err) {
+    console.warn("[pnm rooms] could not write the member's name again near the room's head:", err);
+  }
 }

@@ -10,6 +10,7 @@ import assert from "node:assert/strict";
 
 import { MembershipPageGates, membershipPageParamsRefusal, membershipView, type MembershipPageDeps } from "../src/membership-page.ts";
 import type { Agreement } from "@openvtc/pnm-core/vtc";
+import type { CarriedHold } from "../src/star-hold-carried.ts";
 
 const HOST = "did:webvh:QmHost:acme.example";
 const PORTAL = "https://members.acme.example";
@@ -31,7 +32,9 @@ const agreement = (over: Partial<Agreement> = {}): Agreement => ({
   ...over,
 });
 
-function harness(opts: { members?: string[]; agreements?: Agreement[]; portal?: string } = {}) {
+const CARRIED: CarriedHold = { root: "sha256:" + "a".repeat(64), count: 7, bearer: "did:key:z6MkBearer", kappa: "sha256:" + "b".repeat(64), at: "2026-10-21T00:00:00.000Z", carriedAt: "2026-10-21T12:00:00.000Z" };
+
+function harness(opts: { members?: string[]; agreements?: Agreement[]; portal?: string; hold?: CarriedHold } = {}) {
   const asked: string[] = [];
   const deps: MembershipPageDeps = {
     async active() {
@@ -45,6 +48,9 @@ function harness(opts: { members?: string[]; agreements?: Agreement[]; portal?: 
     },
     async agreements() {
       return opts.agreements ?? [];
+    },
+    async hold() {
+      return opts.hold;
     },
     now: () => 1_000,
   };
@@ -86,4 +92,24 @@ test("only the community's portal is answered, by the origin its DID document na
 test("a visitor whose wallet holds no identity at the community is told so, and nothing about the wallet", async () => {
   const { gates } = harness({ members: [] });
   assert.deepEqual(await gates.handle(PORTAL, { op: "status", hostDid: HOST }), { ok: true, result: { member: false } });
+});
+
+test("what the wallet carries of a Hold rides in the member view: the root and the count, never the bearer, the κ or an item", async () => {
+  assert.deepEqual(membershipView(HOST, [MEMBER], [], CARRIED), {
+    member: true,
+    identities: [MEMBER],
+    hold: { root: CARRIED.root, count: 7, at: CARRIED.at },
+  });
+  assert.deepEqual(membershipView(HOST, [MEMBER], [], undefined), { member: true, identities: [MEMBER] });
+  assert.deepEqual(membershipView(HOST, [], [], CARRIED), { member: false }, "a stranger is told nothing of the Hold");
+  const { gates } = harness({ hold: CARRIED });
+  const got = await gates.handle(PORTAL, { op: "status", hostDid: HOST });
+  assert.deepEqual(got, { ok: true, result: { member: true, identities: [MEMBER], hold: { root: CARRIED.root, count: 7, at: CARRIED.at } } });
+  const none = new MembershipPageGates({
+    async active() { return { ok: true, vta: VTA }; },
+    async offscreen(_vta, op) { return op.op === "portal" ? { ok: true, result: { portalOrigin: PORTAL, endpoint: "https://vtc.acme.example/v1/trust-tasks" } } : { ok: true, result: [MEMBER] }; },
+    async agreements() { return []; },
+    now: () => 1,
+  });
+  assert.deepEqual(await none.handle(PORTAL, { op: "status", hostDid: HOST }), { ok: true, result: { member: true, identities: [MEMBER] } }, "a wallet without the dependency answers as before");
 });

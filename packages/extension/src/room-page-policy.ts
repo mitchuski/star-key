@@ -85,10 +85,43 @@ export interface RoomGrant {
 /** `chrome.storage.local` key prefix for remembered room names. One record per (VTA, community). */
 export const ROOM_NAMES_PREFIX = "room-names:";
 
+/** A room's state in its owner's lifecycle (`vtc/rooms/memberships/list/0.2` `roomState`). */
+export type RoomOwnerState = "active" | "archived" | "removalScheduled" | "purging" | "removed";
+
+const ROOM_OWNER_STATES: readonly string[] = ["active", "archived", "removalScheduled", "purging", "removed"];
+
+/** A room's name as just read from the community, with its state when the record carried one. */
+export interface FreshRoomName {
+  label: string;
+  visibility?: string;
+  roomState?: RoomOwnerState;
+  roomAccess?: "readOnly" | "noAccess";
+  purgeAt?: string;
+}
+
+/**
+ * The room-state members of a name, each only when it is one the schema allows:
+ * stored records are read back from `chrome.storage`, and a value this wallet
+ * did not write is dropped rather than shown.
+ */
+export function storedRoomState(o: Record<string, unknown>): Pick<FreshRoomName, "roomState" | "roomAccess" | "purgeAt"> {
+  return {
+    ...(typeof o.roomState === "string" && ROOM_OWNER_STATES.includes(o.roomState)
+      ? { roomState: o.roomState as RoomOwnerState }
+      : {}),
+    ...(o.roomAccess === "readOnly" || o.roomAccess === "noAccess" ? { roomAccess: o.roomAccess } : {}),
+    ...(typeof o.purgeAt === "string" && !Number.isNaN(Date.parse(o.purgeAt)) ? { purgeAt: o.purgeAt } : {}),
+  };
+}
+
 /** A room's name, as remembered: when it was last read from the community. */
 export interface RememberedRoomName {
   label: string;
   visibility?: string;
+  /** The room's own state when it was last read (`vtc/rooms/memberships/list/0.2`). */
+  roomState?: RoomOwnerState;
+  roomAccess?: "readOnly" | "noAccess";
+  purgeAt?: string;
   seenAt: number;
 }
 
@@ -107,7 +140,7 @@ export const ROOM_NAMES_MAX = 500;
  */
 export function mergeRoomNames(
   remembered: unknown,
-  fresh: Readonly<Record<string, { label: string; visibility?: string }>>,
+  fresh: Readonly<Record<string, FreshRoomName>>,
   now: number,
 ): Record<string, RememberedRoomName> {
   const out: Record<string, RememberedRoomName> = {};
@@ -118,13 +151,19 @@ export function mergeRoomNames(
       out[roomId] = {
         label: r.label,
         ...(typeof r.visibility === "string" ? { visibility: r.visibility } : {}),
+        ...storedRoomState(r as Record<string, unknown>),
         seenAt: r.seenAt,
       };
     }
   }
   for (const [roomId, n] of Object.entries(fresh)) {
     if (typeof n?.label !== "string" || n.label === "") continue;
-    out[roomId] = { label: n.label, ...(n.visibility !== undefined ? { visibility: n.visibility } : {}), seenAt: now };
+    out[roomId] = {
+      label: n.label,
+      ...(n.visibility !== undefined ? { visibility: n.visibility } : {}),
+      ...storedRoomState(n as unknown as Record<string, unknown>),
+      seenAt: now,
+    };
   }
   const entries = Object.entries(out);
   if (entries.length <= ROOM_NAMES_MAX) return out;
@@ -435,9 +474,27 @@ export function shareRowKey(roomId: string, member: string): string {
 }
 
 /**
+ * The open rooms of a community's record of one member that the member is in:
+ * admitted, on the `open` tier. An open room has no group, so the VTA's listing
+ * never names it — the member reads it with the credentials the offer gave
+ * (`roomStanding` counts it joined) — and these entries stand beside the
+ * listing's wherever a page may use a room. Shaped as a listing entry, with no
+ * epoch: there is none to hold.
+ */
+export function admittedOpenRooms(
+  memberships: readonly { roomId: string; visibility: string; state: string; actions?: readonly string[] }[],
+  member: string,
+): { roomId: string; member: string; actions: string[] }[] {
+  return memberships
+    .filter((m) => m.state === "admitted" && m.visibility === "open")
+    .map((m) => ({ roomId: m.roomId, member, actions: [...(m.actions ?? [])] }));
+}
+
+/**
  * The share prompt's rows.
  *
- * `held` is the VTA's listing, one entry per (room, member). `members` the
+ * `held` is the VTA's listing, one entry per (room, member), and the open rooms
+ * the member is in (`admittedOpenRooms`), which it never lists. `members` the
  * identities the member uses at `hostDid` (their vault entries naming it).
  * Offered: an entry held as one of those identities — never as `hostDid`
  * itself, and never one whose member the VTA did not say. Pre-ticked: what is

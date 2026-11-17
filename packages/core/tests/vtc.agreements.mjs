@@ -75,3 +75,25 @@ test("what stands is the latest record per counterparty, newest first", () => {
   );
   assert.deepEqual(standingAgreements([]), []);
 });
+
+test("the standing does not depend on the order records are read in, ties on time included", () => {
+  // Two records with one counterparty reached in the same millisecond, and a
+  // second counterparty reached then too. Before 2026-10-26 a tie on `at` kept
+  // whichever record came first, so these orderings disagreed.
+  const at = 1_791_460_900_000;
+  const a1 = agreementFromTerms(record({ agreementId: "a-1", at }));
+  const a2 = agreementFromTerms(record({ agreementId: "a-2", code: "SD-BASE", at }));
+  const b1 = agreementFromTerms(record({ agreementId: "b-1", communityDid: "did:webvh:QmOther:example.org:vtc", at }));
+  // Same id twice with different content: the canonical text decides.
+  const a2twin = { ...a2, effect: "pending", status: "proffered" };
+  const perms = (xs) => (xs.length <= 1 ? [xs] : xs.flatMap((x, i) => perms([...xs.slice(0, i), ...xs.slice(i + 1)]).map((p) => [x, ...p])));
+  const all = [a1, a2, b1, a2twin];
+  const want = JSON.stringify(standingAgreements(all));
+  for (const p of perms(all)) assert.equal(JSON.stringify(standingAgreements(p)), want, p.map((r) => r.id).join(","));
+  const standing = standingAgreements(all);
+  assert.equal(standing.length, 2, "one record per counterparty");
+  assert.deepEqual(standing.map((s) => s.counterparty), [b1.counterparty, a1.counterparty].sort());
+  assert.equal(standing.find((s) => s.counterparty === a1.counterparty).id, "a-2", "on a tie the greater id stands");
+  // Two orderings of the pair alone, the old code's counterexample:
+  assert.deepEqual(standingAgreements([a1, a2]), standingAgreements([a2, a1]));
+});

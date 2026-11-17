@@ -24,7 +24,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readdirSync, readFileSync, statSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { dirname, join, relative, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 
 const PKG_ROOT = resolve(import.meta.dirname, "..");
 const SRC = join(PKG_ROOT, "src");
@@ -53,6 +54,21 @@ const NOT_IN_SDK = [
       "no constant for them.",
   },
   {
+    prefix: "https://trusttasks.org/spec/git-ns/account/",
+    why:
+      "A member's forge account at a community (vtc/forge-account.ts): link and unlink go " +
+      "to the community's VTC, signed as the member through vault/sign-trust-task. The VTC, " +
+      "not the VTA, is the counterparty, so vta-sdk carries no constant for them.",
+  },
+  {
+    prefix: "https://trusttasks.org/spec/vtc/elections/",
+    why:
+      "A member's elections at a community (vtc/elections.ts): list and show are read, and " +
+      "tickets/issue sent, as documents the member's VTA signs through vta/pcs/voter/read and " +
+      "vta/pcs/voter/register, posted by the wallet to the community's VTC. The VTC, not the " +
+      "VTA, is the counterparty, so vta-sdk carries no constant for them.",
+  },
+  {
     prefix: "https://trusttasks.org/spec/trust-task-error/",
     why:
       "The error envelope the *service* emits (vta-service/src/trust_tasks/wire_v0_2.rs). " +
@@ -65,14 +81,6 @@ const NOT_IN_SDK = [
       "community's VTC, and identify/grant are documents the member's VTA signs through " +
       "vault/sign-trust-task, never tasks sent to the agent. The VTC, not the VTA, is the " +
       "counterparty, so vta-sdk carries no constant for them.",
-  },
-  {
-    prefix: "https://trusttasks.org/spec/vtc/join-requests/manifest/0.3",
-    why:
-      "Joining a community from a trigger link (vtc/join.ts): posted to the VTC's own " +
-      "Trust-Task endpoint as a throwaway key, never sent to the agent. vta-sdk 0.65 " +
-      "declares it (JOIN_REQUEST_MANIFEST_TYPE); this snapshot (0.56.1) predates it. " +
-      "Drop this entry when the snapshot is resynced — the still-needed check will say so.",
   },
   {
     prefix: "https://trusttasks.org/spec/vtc/join-requests/submit/0.3",
@@ -109,44 +117,10 @@ const NOT_IN_SDK = [
       "up at (rp-login/step-up.ts). The VTA is not the counterparty.",
   },
   {
-    prefix: "https://trusttasks.org/spec/auth/step-up/approve-response/0.5",
-    why:
-      "The version the did-hosting control plane serves (rp-login/step-up.ts). The agent " +
-      "takes 0.3, which vta-sdk carries and the persona path sends.",
-  },
-  {
-    prefix: "https://trusttasks.org/spec/auth/step-up/approve-response/0.6",
-    why:
-      "The version a VTC takes `approverSigned` evidence in. The console builds it and has " +
-      "the wallet sign it as the subject; the VTA is not the counterparty " +
-      "(trust-tasks/approver-attest.ts names it only to recognise it).",
-  },
-  {
     prefix: "https://trusttasks.org/spec/auth/step-up/approver/attest/",
     why:
       "A step-up approver's statement, issued by the wallet's per-audience approver and " +
       "verified by the VTC it is addressed to. Never sent on its own, and never to the VTA.",
-  },
-  {
-    prefix: "https://trusttasks.org/spec/auth/authenticate/0.2",
-    why:
-      "The version the did-hosting control plane serves for `login()`, where the " +
-      "wallet binds a session key (rp-login/trust-task.ts). The relying party is " +
-      "the counterparty, not the VTA.",
-  },
-  {
-    prefix: "https://trusttasks.org/spec/auth/authenticate/0.1",
-    why:
-      "The deprecated bare-authenticate message to a did-hosting relying party " +
-      "(rp-login/didcomm.ts), kept for a caller with no signing key. The RP serves " +
-      "it; the VTA serves 0.2 and 0.3 (vta/auth-tasks.ts sends 0.2).",
-  },
-  {
-    prefix: "https://trusttasks.org/spec/auth/refresh/0.1",
-    why:
-      "The refresh that ends a did-hosting relying party's step-up " +
-      "(rp-login/step-up.ts), posted to that RP's Trust Task endpoint. The VTA " +
-      "serves 0.2, which vta/auth-tasks.ts sends.",
   },
   {
     prefix: "https://trusttasks.org/spec/task-consent/granted/",
@@ -223,10 +197,15 @@ const NOT_IN_SDK = [
 
 // ── what this library references ────────────────────────────────────────────
 
+// `src/specs/` is generated from `trust-tasks.lock` and spells out every
+// pinned URI; what counts is which of them the library's own code imports.
+const SPECS = join(SRC, "specs");
+
 function tsFiles(dir) {
   const out = [];
   for (const entry of readdirSync(dir)) {
     const full = join(dir, entry);
+    if (full === SPECS) continue;
     if (statSync(full).isDirectory()) out.push(...tsFiles(full));
     else if (entry.endsWith(".ts")) out.push(full);
   }
@@ -239,13 +218,16 @@ const PREFIX_CONST = /const\s+([A-Z0-9_]+)\s*=\s*"(https:\/\/trusttasks\.org\/sp
 /** `` `${NAME}/suffix/0.1` `` — the concatenated form (see vta/protocol.ts). */
 const TEMPLATE = /`\$\{([A-Z0-9_]+)\}([^`]*)`/g;
 /**
- * `from "@openvtc/trust-tasks/acl/grant/0.1/payload"` — the admin modules take
- * their URIs from the generated bindings rather than spelling them out, which
- * is the point of those bindings. Resolving the import is how this test still
- * sees what they target: the module's own `TYPE_URI` is the answer, and it
- * cannot disagree with the schema it was generated from.
+ * `from "../specs/acl/grant/0.2/payload.js"` — most modules take their URIs
+ * from the generated bindings rather than spelling them out, which is the
+ * point of those bindings. Resolving the import is how this test still sees
+ * what they target: the module's own `TYPE_URI` is the answer, and it cannot
+ * disagree with the schema it was generated from. A relative import into
+ * `specs/` is loaded from its built copy in `dist/`; a framework specification
+ * (`trust-task-discovery`) is still taken from `@openvtc/trust-tasks` itself.
  */
-const BINDING_IMPORT = /from "(@openvtc\/trust-tasks\/[^"]+)"/g;
+const BINDING_IMPORT = /from "((?:\.\.?\/)+specs\/[^"]+|@openvtc\/trust-tasks\/[^"]+)"/g;
+const DIST = join(PKG_ROOT, "dist");
 
 /** Every task URI this library can emit or match on, with where it came from. */
 async function referencedTasks() {
@@ -270,7 +252,11 @@ async function referencedTasks() {
       if (base) add(base + m[2], rel);
     }
     for (const m of source.matchAll(BINDING_IMPORT)) {
-      const mod = await import(m[1]);
+      const spec = m[1].startsWith(".")
+        ? join(DIST, relative(SRC, resolve(dirname(file), m[1])))
+        : m[1];
+      // A path, not a URL: on Windows an absolute path is no import specifier.
+      const mod = await import(m[1].startsWith(".") ? pathToFileURL(spec).href : spec);
       if (typeof mod.TYPE_URI === "string") add(mod.TYPE_URI, rel);
     }
   }
@@ -469,7 +455,7 @@ test("coverage against the agent's surface is recorded, not discovered", () => {
   // the console. That is not a gap left open: `rooms/create` and
   // `rooms/epoch/chain` are what the agent sends onward, and a second copy of
   // that call from here would be one that never arrives.
-  // 198 → 201: persona/facet/{put,list,delete}, the holder's arrangement of
+  // 198 → 201: persona/facet/{put,list,delete} (now persona/world/*), the holder's arrangement of
   // their own identity (dtgwg-trust-tasks-tf#405, VTI#1338).
   // 201 → 204: rooms/keys/{read,browse} — the console reads a record through
   // its own agent, because `rooms/records/*` is served by a host it cannot
@@ -536,7 +522,33 @@ test("coverage against the agent's surface is recorded, not discovered", () => {
   // `rooms/keys/key-package/0.2` in place — still one family each.
   // 226 → 227: `keys/sign-document/0.1`, the member's agent signing their
   // external directory card as their DID (vtc/directory-card.ts).
-  const expected = 227;
+  // 227 → 230: `persona/contact/lists/{put,list,delete}/1.0`, the member's
+  // own lists, behind the portal's marks (`persona/annotations.ts`).
+  // 230 → 231: `vault/credentials/present/0.1`, the member's agent presenting a
+  // credential to the community to verify directory fields
+  // (vtc/directory-present.ts).
+  // 231 → 229, with the snapshot resynced from vta-sdk 0.75.0 (canonical total
+  // 332): the did-hosting control plane retired `did-management/did/{enable,
+  // disable}` for one `did/set-state/0.1` (−1) and `did/publish/0.1` for
+  // `did/register`, which now carries a DID's next log as well as its first
+  // (−1). `domain/disable` → `domain/set-state` is one family for one. The
+  // same resync moved 64 tasks to the version the agent serves today;
+  // `persona/facet/*` became `persona/world/*`, one family each for one.
+  // 229 → 235: the member's voter engine behind a community's elections
+  // (vtc/elections.ts): `vta/pcs/voter/{read,register,accept,receipt}`,
+  // `vta/pcs/vote` and `vta/pcs/vote-encrypted`.
+  // 235 → 242, with the snapshot resynced from vta-sdk 0.79.0 (canonical total
+  // 340): the held notifications (notifications/index.ts) —
+  // `vta/notifications/{list,show,dismiss,deposit}` and the `notifications/
+  // {notify,relay}` a deposit carries (+6) — and `vtc/elections/show`, which
+  // this library read all along and the SDK now names (+1).
+  // 242 → 244, with the snapshot resynced from vta-sdk 0.83.0 (canonical total
+  // 347): watching rooms through the member's VTA (rooms/watch.ts) —
+  // `rooms/keys/watch` and the `rooms/keys/changed` it signals with.
+  // 244 → 245, resynced from vta-sdk on main: `vta/pcs/voter/receipts/list`,
+  // the receipts a member's VTA keeps, so the wallet checks a vote after close
+  // (VTI-VOT-053).
+  const expected = 245;
   assert.equal(
     implemented.size,
     expected,

@@ -88,6 +88,10 @@
       "types": "./dist/trust-tasks/index.d.ts",
       "import": "./dist/trust-tasks/index.js"
     },
+    "./specs": {
+      "types": "./dist/specs/index.d.ts",
+      "import": "./dist/specs/index.js"
+    },
     "./util": {
       "types": "./dist/util/index.d.ts",
       "import": "./dist/util/index.js"
@@ -124,6 +128,10 @@
     "./links": {
       "types": "./dist/links/index.d.ts",
       "import": "./dist/links/index.js"
+    },
+    "./notifications": {
+      "types": "./dist/notifications/index.d.ts",
+      "import": "./dist/notifications/index.js"
     }
   },
   "sideEffects": false,
@@ -136,21 +144,24 @@
     "lint": "tsc -b",
     "test": "tsc -b && node --test tests/*.mjs",
     "tasks:sync": "node scripts/sync-task-surface.mjs",
+    "tasks:generate": "trust-tasks-gen-ts --lock trust-tasks.lock --out src/specs",
     "acl:sync": "node scripts/sync-acl-capabilities.mjs",
+    "confusables:sync": "node scripts/sync-confusables.mjs",
     "clean": "rm -rf dist *.tsbuildinfo"
   },
   "dependencies": {
     "@cfworker/json-schema": "^4.1.1",
     "@noble/curves": "^2.4.0",
-    "@openvtc/trust-tasks": "^0.26.19",
-    "@openvtc/vti-didcomm-js": "^0.12.0",
-    "@openvtc/vti-tsp-js": "^0.3.0",
+    "@openvtc/trust-tasks": "^0.28.1",
+    "@openvtc/vti-didcomm-js": "^0.14.0",
+    "@openvtc/vti-tsp-js": "^0.4.0",
     "@scure/base": "^2.2.0",
-    "cbor-x": "^1.6.6"
+    "cbor-x": "^1.6.8"
   },
   "devDependencies": {
     "@hpke/chacha20poly1305": "^1.8.0",
     "@hpke/core": "^1.9.0",
+    "@openvtc/trust-tasks-gen": "^0.1.2",
     "@openvtc/vti-rooms-wasm": "^0.1.0",
     "typescript": "^7.0.2"
   }

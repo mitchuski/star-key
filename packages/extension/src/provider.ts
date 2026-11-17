@@ -32,6 +32,20 @@ import type {
   WalletProfileResult,
   RoomsPageOp,
   DirectoryPageOp,
+  PageEntryMark,
+  PageMarkList,
+  PageMarksView,
+  PageVerifiedFieldsView,
+  GitPageOp,
+  PageGitLinkView,
+  ElectionsPageOp,
+  PageElection,
+  PageElectionView,
+  PageTicketView,
+  PageTicketsView,
+  PageVoteView,
+  PageCheckVoteView,
+  PageGitUnlinkView,
   PagePublishedCardView,
   PageMembershipView,
   MembershipPageOp,
@@ -42,6 +56,7 @@ import type {
   RoomFilesPageMessage,
 } from "./bridge-protocol.js";
 import type { PageOfferView } from "./room-offers-policy.js";
+import type { PageErrorCode } from "./page-error.js";
 
 // Bundled as a standalone page-world script, so it must be self-contained
 // (no shared-chunk imports). Inline the protocol constants — keep in sync
@@ -65,7 +80,7 @@ interface VtaWallet {
    * not an error to swallow.
    */
   requestTask(params: RequestTaskParams): Promise<Record<string, unknown>>;
-  /** Sign in to the RP with `auth/challenge/0.1` then `auth/authenticate/0.2`,
+  /** Sign in to the RP with `auth/challenge/0.1` then `auth/authenticate/0.3`,
    *  sent to `{baseUrl}/trust-tasks` and addressed to `rpDid`. Pass
    *  `sessionKey` (a `did:key` the page holds) to have the RP bind it to the
    *  session, so later calls can be signed without the wallet. Resolves with
@@ -155,7 +170,7 @@ interface VtaWallet {
    *  never seen it and may refuse the sign-in until it is on its access list. */
   walletProfile(params: WalletProfileParams): Promise<WalletProfileResult>;
   /** Enumerate vault entries (metadata only, no secret material) via
-   *  vault/list/0.1. Each returned entry's `principalDid` is the DID the entry
+   *  vault/list/0.4. Each returned entry's `principalDid` is the DID the entry
    *  would act AS when used in a proxy-login call.
    *
    *  Not needed to *drive* a proxy login — `proxyLogin({})` resolves the entry
@@ -167,7 +182,7 @@ interface VtaWallet {
    *  party, so communities cannot correlate the user by it. Signs nothing.
    *  `audience` must be the relying party this origin signed in to. */
   approverIdentity(params: ApproverIdentityParams): Promise<ApproverIdentityResult>;
-  /** Answer an operation-bound step-up (`auth/step-up/approve-request/0.4`)
+  /** Answer an operation-bound step-up (`auth/step-up/approve-request/0.5`)
    *  with the approver for `audience`. The wallet refuses unless its approver
    *  is among `request.approvers` and `request.boundTo` is the digest of
    *  `operation`; it shows the reason, the operation and the community, takes
@@ -206,6 +221,60 @@ interface VtaWallet {
    *  DID document. The wallet's own record, never a credential or a
    *  signature; no prompt. */
   membership: VtaWalletMembership;
+  /** The member's forge accounts at the community, for its own portal
+   *  (`git-ns/account/{link,unlink}`). Refused unless this page's origin is the
+   *  `SignInPortal` of `hostDid`'s DID document. The wallet asks the member,
+   *  signs as them, and for a link opens the forge's page and shows any code in
+   *  its own window; the page gets the link's id to follow it, never the code. */
+  git: VtaWalletGit;
+  /** The member's elections at the community, for its own portal
+   *  (`vtc/elections/*` through the member's VTA). Refused unless this page's
+   *  origin is the `SignInPortal` of `hostDid`'s DID document. Taking a ticket
+   *  and voting are decided in the wallet's own window; the ballot is filled in
+   *  there and sent by the wallet to the ballot box, so the page never sees a
+   *  choice — nor, from `vote`, whether a vote was cast. */
+  elections: VtaWalletElections;
+}
+
+/** `window.vtaWallet.elections`. `member` is the DID the page says is signed
+ *  in: a hint among the wallet's identities there. */
+export interface VtaWalletElections {
+  /** The elections the community lets the member vote in, and whether it has
+   *  issued their ticket. Never prompts. */
+  list(p: { hostDid: string; member?: string }): Promise<{ elections: PageElection[] }>;
+  /** One election: what it asks and how it is run. Prompts only to read an
+   *  election the community shows nobody but members of `memberOf`, a party
+   *  that is itself its member (VTI-VOT-015): the member first chooses, in the
+   *  wallet's window, whether to show the community that membership. Such an
+   *  election is never in `list`; the page learns of it from a link. */
+  show(p: { hostDid: string; electionId: string; member?: string; memberOf?: string }): Promise<PageElectionView>;
+  /** Ask to take the member's ticket: they decide in the wallet's window. */
+  takeTicket(p: { hostDid: string; electionId: string; member?: string; memberOf?: string }): Promise<PageTicketView>;
+  /** Ask to take the member's tickets for several elections (a board's ideas):
+   *  they decide once, in one wallet window listing each. Each ticket is still
+   *  its own request to the community, a random pause apart, so this resolves
+   *  some seconds after the member agrees. An election shown only to a party's
+   *  members comes back `unavailable`: take that one with `takeTicket`. */
+  takeTickets(p: { hostDid: string; electionIds: string[]; member?: string }): Promise<PageTicketsView>;
+  /** Ask to vote: the wallet opens its ballot. With no ticket held it takes one
+   *  instead and stops (`ticketTaken: true`) — vote later. Resolves when the
+   *  wallet's window closes, whatever the member did there. */
+  vote(p: { hostDid: string; electionId: string; member?: string; memberOf?: string }): Promise<PageVoteView>;
+  /** After voting closes, ask the wallet to check the member's vote against the
+   *  board the community kept at close (VTI-VOT-053). The answer is shown in
+   *  the wallet's own window; this resolves when it closes, telling the page
+   *  nothing — not even whether the member voted. */
+  checkVote(p: { hostDid: string; electionId: string; member?: string; memberOf?: string }): Promise<PageCheckVoteView>;
+}
+
+/** `window.vtaWallet.git`. */
+export interface VtaWalletGit {
+  /** Begin linking the member's account on `forge`. Follow it with
+   *  `git-ns/account/link-status` by the returned `linkId`. */
+  linkAccount(p: { hostDid: string; forge: string; member?: string }): Promise<PageGitLinkView>;
+  /** Unlink the member's account on `forge`; `accountId` is the account as the
+   *  page last read it, so a re-link since is never removed. */
+  unlinkAccount(p: { hostDid: string; forge: string; accountId?: string; member?: string }): Promise<PageGitUnlinkView>;
 }
 
 /** `window.vtaWallet.membership`. */
@@ -218,6 +287,34 @@ export interface VtaWalletDirectory {
   /** Publish the member's card beyond the community. `member` is the DID the
    *  page says is signed in: a hint among the wallet's identities there. */
   publishCard(p: { hostDid: string; member?: string }): Promise<PagePublishedCardView>;
+  /** The member's own marks on this community's members — stars, petnames and
+   *  their lists — from their own agent, never from the community. The first
+   *  call from a community asks the member, once, whether its portal may show
+   *  them; a refusal rejects. Read the directory as you would without them and
+   *  apply them on the page. */
+  marks(p: { hostDid: string; member?: string }): Promise<PageMarksView>;
+  /** Change the member's marks on one entry: a star, a petname (or
+   *  `removePetname`), the set of lists it is on. Resolves with the entry's
+   *  marks now. */
+  mark(p: {
+    hostDid: string;
+    member?: string;
+    entryId: string;
+    starred?: boolean;
+    petname?: string;
+    removePetname?: true;
+    lists?: string[];
+  }): Promise<PageEntryMark>;
+  /** Create one of the member's lists (no `listId`), or rename or recolour one. */
+  putList(p: { hostDid: string; member?: string; listId?: string; name?: string; colour?: string }): Promise<PageMarkList>;
+  /** Delete one of the member's lists; contacts on it stay. */
+  deleteList(p: { hostDid: string; member?: string; listId: string }): Promise<{ deleted: boolean }>;
+  /** Fill the member's `credential`-sourced fields from a credential their
+   *  agent holds. The wallet finds the credentials the fields accept, and the
+   *  member picks one and sees every claim it discloses to the community; a
+   *  refusal rejects. All the fields must read one credential type. Resolves
+   *  with the verified values now on the card. */
+  presentCredential(p: { hostDid: string; member?: string; fields: string[] }): Promise<PageVerifiedFieldsView>;
 }
 
 /** Progress of a file transfer, for a progress bar. */
@@ -310,6 +407,29 @@ declare global {
   }
 }
 
+/**
+ * What every `window.vtaWallet.*` call rejects with (docs/page-bridge-errors.md):
+ * an `Error` named `VtaWalletError` whose `message` is the wallet's words, for
+ * the member, and whose `code` is the machine-readable reason — a Trust Task
+ * error code's local name when the community or the member's agent refused, or
+ * one of the wallet's own codes (`page-error.ts` `WALLET_ERROR_CODES`). Switch
+ * on `code`, never on `message`: the message is reworded freely.
+ */
+export interface VtaWalletError extends Error {
+  name: "VtaWalletError";
+  code: PageErrorCode;
+}
+
+/** Same rule as `page-error.ts` `PAGE_CODE`, inlined: this script imports nothing. */
+const PAGE_CODE = /^[a-z][A-Za-z0-9]{0,63}$/;
+
+function walletError(message: unknown, code: unknown): VtaWalletError {
+  const err = new Error(typeof message === "string" ? message : String(message)) as VtaWalletError;
+  err.name = "VtaWalletError";
+  err.code = typeof code === "string" && PAGE_CODE.test(code) ? code : "unclassified";
+  return err;
+}
+
 const pending = new Map<
   string,
   { resolve: (r: unknown) => void; reject: (e: Error) => void }
@@ -349,7 +469,7 @@ window.addEventListener("message", (event: MessageEvent) => {
   if (!entry) return;
   pending.delete(data.id);
   if (data.ok) entry.resolve(data.result);
-  else entry.reject(new Error(data.error));
+  else entry.reject(walletError(data.error, data.code));
 });
 
 // `BridgeMethod`, not a copy of it. This used to inline the same union, and the
@@ -376,6 +496,8 @@ function call<T>(
     | RoomsPageOp
     | DirectoryPageOp
     | MembershipPageOp
+    | GitPageOp
+    | ElectionsPageOp
     | Record<string, never>,
 ): Promise<T> {
   const id = crypto.randomUUID();
@@ -444,7 +566,7 @@ function getRoomFile(params: Parameters<VtaWalletRooms["getFile"]>[0]): ReturnTy
         case "done": {
           transfers.delete(id);
           postFrame(id, { kind: "cancel" });
-          if (!meta) return reject(new Error("the wallet finished a download it never described"));
+          if (!meta) return reject(walletError("the wallet finished a download it never described", "unclassified"));
           const { kind: _kind, ...rest } = meta;
           void _kind;
           const type = meta.file.mediaType ?? "application/octet-stream";
@@ -453,11 +575,11 @@ function getRoomFile(params: Parameters<VtaWalletRooms["getFile"]>[0]): ReturnTy
         }
         case "failed":
           transfers.delete(id);
-          reject(new Error(msg.error));
+          reject(walletError(msg.error, msg.code));
           return;
         case "closed":
           transfers.delete(id);
-          reject(new Error("the wallet stopped the download"));
+          reject(walletError("the wallet stopped the download", "walletUnavailable"));
           return;
         default:
           return;
@@ -487,7 +609,7 @@ function putRoomFile(params: Parameters<VtaWalletRooms["putFile"]>[0]): ReturnTy
           })().catch((e: unknown) => {
             transfers.delete(id);
             postFrame(id, { kind: "cancel" });
-            reject(e instanceof Error ? e : new Error(String(e)));
+            reject(walletError(e instanceof Error ? e.message : String(e), "unclassified"));
           });
           return;
         case "put":
@@ -497,11 +619,11 @@ function putRoomFile(params: Parameters<VtaWalletRooms["putFile"]>[0]): ReturnTy
           return;
         case "failed":
           transfers.delete(id);
-          reject(new Error(msg.error));
+          reject(walletError(msg.error, msg.code));
           return;
         case "closed":
           transfers.delete(id);
-          reject(new Error("the wallet stopped the upload"));
+          reject(walletError("the wallet stopped the upload", "walletUnavailable"));
           return;
         default:
           return;
@@ -572,6 +694,112 @@ if (!window.vtaWallet) {
           op: "publishCard",
           hostDid: p.hostDid,
           ...(p.member !== undefined ? { member: p.member } : {}),
+        }),
+      marks: (p) =>
+        call<PageMarksView>("directory", {
+          op: "marks",
+          hostDid: p.hostDid,
+          ...(p.member !== undefined ? { member: p.member } : {}),
+        }),
+      // Only the members the channel takes: anything else the page adds is
+      // dropped here, and refused by the background if it got through.
+      mark: (p) =>
+        call<PageEntryMark>("directory", {
+          op: "mark",
+          hostDid: p.hostDid,
+          entryId: p.entryId,
+          ...(p.member !== undefined ? { member: p.member } : {}),
+          ...(p.starred !== undefined ? { starred: p.starred } : {}),
+          ...(p.petname !== undefined ? { petname: p.petname } : {}),
+          ...(p.removePetname ? { removePetname: true as const } : {}),
+          ...(p.lists !== undefined ? { lists: [...p.lists] } : {}),
+        }),
+      putList: (p) =>
+        call<PageMarkList>("directory", {
+          op: "putList",
+          hostDid: p.hostDid,
+          ...(p.member !== undefined ? { member: p.member } : {}),
+          ...(p.listId !== undefined ? { listId: p.listId } : {}),
+          ...(p.name !== undefined ? { name: p.name } : {}),
+          ...(p.colour !== undefined ? { colour: p.colour } : {}),
+        }),
+      deleteList: (p) =>
+        call<{ deleted: boolean }>("directory", {
+          op: "deleteList",
+          hostDid: p.hostDid,
+          listId: p.listId,
+          ...(p.member !== undefined ? { member: p.member } : {}),
+        }),
+      presentCredential: (p) =>
+        call<PageVerifiedFieldsView>("directory", {
+          op: "presentCredential",
+          hostDid: p.hostDid,
+          fields: Array.isArray(p.fields) ? [...p.fields] : p.fields,
+          ...(p.member !== undefined ? { member: p.member } : {}),
+        }),
+    },
+    git: {
+      linkAccount: (p) =>
+        call<PageGitLinkView>("git", {
+          op: "linkAccount",
+          hostDid: p.hostDid,
+          forge: p.forge,
+          ...(p.member !== undefined ? { member: p.member } : {}),
+        }),
+      unlinkAccount: (p) =>
+        call<PageGitUnlinkView>("git", {
+          op: "unlinkAccount",
+          hostDid: p.hostDid,
+          forge: p.forge,
+          ...(p.accountId !== undefined ? { accountId: p.accountId } : {}),
+          ...(p.member !== undefined ? { member: p.member } : {}),
+        }),
+    },
+    elections: {
+      list: (p) =>
+        call<{ elections: PageElection[] }>("elections", {
+          op: "list",
+          hostDid: p.hostDid,
+          ...(p.member !== undefined ? { member: p.member } : {}),
+        }),
+      show: (p) =>
+        call<PageElectionView>("elections", {
+          op: "show",
+          hostDid: p.hostDid,
+          electionId: p.electionId,
+          ...(p.member !== undefined ? { member: p.member } : {}),
+          ...(p.memberOf !== undefined ? { memberOf: p.memberOf } : {}),
+        }),
+      takeTicket: (p) =>
+        call<PageTicketView>("elections", {
+          op: "takeTicket",
+          hostDid: p.hostDid,
+          electionId: p.electionId,
+          ...(p.member !== undefined ? { member: p.member } : {}),
+          ...(p.memberOf !== undefined ? { memberOf: p.memberOf } : {}),
+        }),
+      takeTickets: (p) =>
+        call<PageTicketsView>("elections", {
+          op: "takeTickets",
+          hostDid: p.hostDid,
+          electionIds: p.electionIds,
+          ...(p.member !== undefined ? { member: p.member } : {}),
+        }),
+      vote: (p) =>
+        call<PageVoteView>("elections", {
+          op: "vote",
+          hostDid: p.hostDid,
+          electionId: p.electionId,
+          ...(p.member !== undefined ? { member: p.member } : {}),
+          ...(p.memberOf !== undefined ? { memberOf: p.memberOf } : {}),
+        }),
+      checkVote: (p) =>
+        call<PageCheckVoteView>("elections", {
+          op: "checkVote",
+          hostDid: p.hostDid,
+          electionId: p.electionId,
+          ...(p.member !== undefined ? { member: p.member } : {}),
+          ...(p.memberOf !== undefined ? { memberOf: p.memberOf } : {}),
         }),
     },
     membership: {

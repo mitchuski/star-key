@@ -21,28 +21,90 @@
 //
 // So `Verdict` below says *what was observed*, never how alarmed to be, and
 // always says that reading still works and writing will not.
+//
+// ## Two checks, and they are said apart
+//
+// The verdict is about the **host**: whether a record is in the set it
+// committed to. It says nothing about who wrote the record. That is the
+// **author's signature** over the sealed body, which this pane checks itself
+// (`verifyRecordBody`, the `SealedRecordBody` *Reading* rule): the proof for
+// `assertionMethod`, the room, key and version it was sealed at, and on an
+// `attributed` room that the host's author is the signer. Nothing of a body is
+// shown before that holds, and a body that fails shows none of its content —
+// never the content with a warning. "Signed" is said only of a body that passed.
+//
+// ## What the room looks like is the reading rules', not this pane's
+//
+// Once read and verified, the records are handed to `assembleRoomRecords`
+// (`@openvtc/pnm-core/rooms`), which applies `SealedRecordBody`'s reading rules
+// (trust-tasks-tf #1027): notes and messages by `kind`, replies against what they
+// answer, reactions counted beside their target, withdrawn messages and
+// tombstones, ordering by `writtenAt` with the backdating rule, `editedAt`, and
+// records past their `validUntil` hidden. This pane draws what it decides.
+// Every body is drawn as plain text: a message's is never markup, a note's is
+// rendered inert, and nothing in either is a link this pane follows.
+//
+// ## Who wrote it: a petname, a name in this room, or the DID
+//
+// An author is a per-room persona DID. The reading rules take members' names
+// out of the room (`memberProfile`, rooms/_shared/0.3) — never shown as notes or
+// counted — and `authorLabels` decides how each author is shown: the member's
+// own petname for that DID from their contacts first, then the name the author
+// gave themselves in this room, then the DID (or a name its document claims).
+// A room name is the author's claim about themselves, so it is drawn in quotes
+// and never beside a check mark; two authors who would read the same carry a
+// fingerprint of their DIDs.
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import { memoResolveDidDocumentAt } from "@openvtc/pnm-core";
 import {
+  assembleRoomRecords,
+  authorLabels,
+  contentFromBody,
+  readingFromCleartext,
+  readSealedVersion,
+  RecordBodyError,
   roomsKeysBrowse,
-  roomsKeysRead,
-  type HeldRoom,
+  roomsKeysReadMany,
+  verifyRecordBody,
+  latestMessageTime,
+  unreadMessages,
+  watchCovers,
+  type HeldRecord,
+  type OwnMemberName,
+  type RoomWatchState,
+  type ReadManyResult,
+  type ResolveDidAt,
+  type RecordInput,
+  type RoomRecordsView,
+  type RoomRecordView,
+  type VerifiedRecordBody,
 } from "@openvtc/pnm-core/rooms";
+import { base64url } from "@openvtc/vti-didcomm-js";
+import type { RoomPlace } from "../room-groups.js";
 import { Button, Note, Pill } from "../../ui.js";
-import { displayAgentName } from "../../agent-name.js";
-import { useAgentNames } from "../../use-agent-names.js";
 import { shortDid } from "../room-words.js";
-import { formatBytes } from "../room-files.js";
-import { createLimiter } from "../limit.js";
+import { untitledLabel } from "../room-record-text.js";
 import { didHost } from "../../did-display.js";
 import { c, t, font } from "../../theme.js";
 import { managerSender } from "../sender.js";
+import {
+  getReadMarker,
+  holdRoomWatch,
+  notifyUnread,
+  POLL_UNWATCHED_MS,
+  POLL_WATCHED_MS,
+  readMarkerKey,
+  setReadMarker,
+  unrefTimer,
+  type RoomWatchHold,
+} from "../room-watch.js";
 import { Loading, LoadError } from "../table.js";
 import type { Parties } from "../use-vta.js";
 import type { RoomFilesPrepared } from "../../bridge-protocol.js";
-import { prepareRoomFiles, roomFileClaimOf } from "../room-files.js";
+import { prepareRoomFiles, roomFileClaimOf, type WritingPlace } from "../room-files.js";
 import { GetRoomFile, PutRoomFile, RoomFilesUnavailable } from "./rooms-files.js";
-import { holds, NoteEditor, RecordActions } from "./rooms-record-actions.js";
+import { holds, MemberNameEditor, NoteEditor, RecordActions } from "./rooms-record-actions.js";
 
 const fieldStyle: React.CSSProperties = {
   boxSizing: "border-box",
@@ -84,6 +146,12 @@ interface RecordRow {
   /** Present only on an `open` room; sealed with the body otherwise. */
   title?: string;
   description?: string;
+  /** The host's, from `rooms/keys/browse/0.4` (`RecordMetadataV3`): absent from an agent or host that predates them. */
+  createdAt?: string;
+  createdBy?: string;
+  bodyStoredAt?: string;
+  /** The record's kind, served on an `open` room's listing (`rooms/records/list/0.6`). */
+  kind?: string;
 }
 
 /**
@@ -189,19 +257,6 @@ function Verdict({
   );
 }
 
-/** base64url → text, for a body this agent just opened. */
-function decodeBody(plaintext: string): string {
-  const padded = plaintext.replace(/-/g, "+").replace(/_/g, "/");
-  try {
-    const bytes = Uint8Array.from(atob(padded), (ch) => ch.charCodeAt(0));
-    return new TextDecoder().decode(bytes);
-  } catch {
-    // Not text. Saying so is better than printing mojibake and letting a member
-    // conclude the record is corrupt.
-    return "(this record's body is not text)";
-  }
-}
-
 /** Whether a verdict reports a host caught out — said in full, never folded away. */
 function adverse(v: Verification): boolean {
   return v.priorRoots === "conflict" || v.count === "short" || v.trace === "failed";
@@ -251,28 +306,86 @@ function VerdictLine({
   );
 }
 
-/** What an opened record says, as far as this pane reads it. */
+/** What reading one key gave this pane, beside what the reading rules make of it. */
 interface Opened {
+  /** The record as read: the signed body once verified, an open room's cleartext. Empty when nothing of it may be shown. */
   text: string;
-  title?: string;
-  body?: string;
-  author?: string;
+  /** Whether the body's author signature, location and author all verified — never true for cleartext. */
+  signed: boolean;
   verification: Verification | null;
 }
 
-/** A note's title, body and author, where its body is the JSON a note is written as. */
-function readNote(text: string): Pick<Opened, "title" | "body" | "author"> {
-  try {
-    const doc = JSON.parse(text) as Record<string, unknown>;
-    if (typeof doc !== "object" || doc === null) return {};
-    return {
-      ...(typeof doc.title === "string" && doc.title ? { title: doc.title } : {}),
-      ...(typeof doc.body === "string" ? { body: doc.body } : {}),
-      ...(typeof doc.author === "string" ? { author: doc.author } : {}),
-    };
-  } catch {
-    return {};
+/** Words for a body that is refused or shown as a placeholder: what failed, never the body. */
+function refusalWords(e: unknown): string {
+  if (e instanceof RecordBodyError) {
+    switch (e.kind) {
+      case "signature":
+        return "Its author's signature does not verify.";
+      case "relocated":
+        return "It is signed for a different room, record or version than the one it was read from.";
+      case "authorMismatch":
+        return "The host names a different author from the one who signed it.";
+      case "malformed":
+        return "It is not a record body this wallet can read.";
+      case "authorUnresolvable":
+        return "Its author's DID no longer resolves, so who wrote it cannot be checked.";
+      case "authorUnverifiable":
+        return (
+          "Its signature does not hold against its author's DID document as it is now, and the document as it was " +
+          "when the record was stored could not be read — so this cannot tell a forgery from a key the author has since replaced."
+        );
+      default:
+        break;
+    }
   }
+  return e instanceof Error ? e.message : String(e);
+}
+
+/**
+ * Verify a sealed body before anything in it is read (`SealedRecordBody`,
+ * *Reading*). `hostAuthor` is the read's author; `listedAuthor` the listing's
+ * for the same version — both are the host's, and on an `attributed` room both
+ * must be the signer. `bodyStoredAt` is when the host stored this body: the
+ * author's DID document is the one that stood then (*Which DID document*),
+ * resolved by `resolveDidAt` where the author's method keeps its history.
+ */
+async function verifySealed(
+  plaintext: string,
+  at: { roomId: string; key: string; version: number },
+  hostAuthor: string | undefined,
+  listedAuthor: string | undefined,
+  bodyStoredAt: string | undefined,
+  resolveDidAt: ResolveDidAt,
+): Promise<VerifiedRecordBody> {
+  let bytes: Uint8Array;
+  try {
+    bytes = base64url.decode(plaintext);
+  } catch {
+    throw new RecordBodyError("malformed", "the record body is not base64url");
+  }
+  const body = await verifyRecordBody(bytes, at, hostAuthor, {
+    resolveDidAt,
+    ...(bodyStoredAt !== undefined ? { bodyStoredAt } : {}),
+  });
+  if (listedAuthor !== undefined && listedAuthor !== body.author) {
+    throw new RecordBodyError(
+      "authorMismatch",
+      `the record body is signed by ${body.author}, but the host listed ${listedAuthor} as its author`,
+    );
+  }
+  return body;
+}
+
+/**
+ * An open room's cleartext with its file's `fileKey` left out. The key is in the
+ * record by design — the host and every member may open the file — but nobody
+ * needs to read it, and what is shown here is copied and screenshotted.
+ */
+function withoutFileKey(cleartext: Record<string, unknown>): Record<string, unknown> {
+  const file = cleartext.file;
+  if (typeof file !== "object" || file === null || !("fileKey" in file)) return cleartext;
+  const { fileKey: _, ...rest } = file as Record<string, unknown>;
+  return { ...cleartext, file: rest };
 }
 
 function when(iso: string | undefined): string {
@@ -282,107 +395,168 @@ function when(iso: string | undefined): string {
 }
 
 /**
- * One record: a title and a preview once opened, everything else on a click.
- *
- * Keys are opaque by rule on the sealed tiers and the title is sealed with the
- * body, so a record says nothing until it is opened. The newest few are opened
- * as the list arrives (`autoOpen`); the rest on a click.
+ * One read answer, made into what the pane keeps and what the reading rules
+ * take. `resolveDidAt` is shared by one listing's reads, so each author's
+ * history is fetched once per instant, not once per record.
+ */
+async function readOne(
+  roomId: string,
+  row: RecordRow,
+  res: ReadManyResult,
+  resolveDidAt: ResolveDidAt,
+): Promise<{ opened: Opened; input: RecordInput }> {
+  const verification = (res.verification as unknown as Verification | undefined) ?? null;
+  const version = res.version ?? row.version;
+  const meta = {
+    key: row.key,
+    version,
+    ...((res.status ?? row.status) !== undefined ? { status: res.status ?? row.status } : {}),
+    ...((res.updatedAt ?? row.updatedAt) !== undefined ? { updatedAt: res.updatedAt ?? row.updatedAt } : {}),
+    ...((res.createdAt ?? row.createdAt) !== undefined ? { createdAt: res.createdAt ?? row.createdAt } : {}),
+    ...((res.createdBy ?? row.createdBy) !== undefined ? { createdBy: res.createdBy ?? row.createdBy } : {}),
+    ...((res.bodyStoredAt ?? row.bodyStoredAt) !== undefined ? { bodyStoredAt: res.bodyStoredAt ?? row.bodyStoredAt } : {}),
+    ...(row.kind !== undefined ? { listedKind: row.kind } : {}),
+  };
+  const nothing = { text: "", signed: false, verification };
+  if (res.error) {
+    const why = res.error.message ?? res.error.code;
+    return { opened: nothing, input: { ...meta, reading: { state: "unreadable", reason: why } } };
+  }
+  // The listing's word, used only for the version it listed.
+  const sameVersion = version === row.version;
+  const hostAuthor = res.author ?? (sameVersion ? row.author : undefined);
+  if (res.plaintext !== undefined) {
+    // Sealed: nothing of the body before its author's signature holds.
+    try {
+      const verified = await verifySealed(
+        res.plaintext,
+        { roomId, key: row.key, version: readSealedVersion({ version, ...(res.ext !== undefined ? { ext: res.ext } : {}) }) },
+        res.author,
+        sameVersion ? row.author : undefined,
+        res.bodyStoredAt ?? (sameVersion ? row.bodyStoredAt : undefined),
+        resolveDidAt,
+      );
+      if (verified.roomProfile) return { opened: nothing, input: { ...meta, reading: { state: "profile" } } };
+      return {
+        opened: { text: new TextDecoder().decode(base64url.decode(res.plaintext)), signed: true, verification },
+        input: { ...meta, reading: { state: "read", content: contentFromBody(verified) } },
+      };
+    } catch (e) {
+      const reason = refusalWords(e);
+      const state = e instanceof RecordBodyError && e.placeholder ? "placeholder" : "refused";
+      return { opened: nothing, input: { ...meta, reading: { state, reason } } };
+    }
+  }
+  if (res.cleartext) {
+    const reading = readingFromCleartext(res.cleartext, hostAuthor ?? meta.createdBy ?? "", version);
+    return {
+      opened: { text: JSON.stringify(withoutFileKey(res.cleartext), null, 2), signed: false, verification },
+      input: { ...meta, reading },
+    };
+  }
+  // A retracted record has no body, and that is an answer rather than a failure.
+  return { opened: nothing, input: { ...meta, reading: { state: "tombstone" } } };
+}
+
+/** What a reply line calls the record it answers. */
+function labelOf(view: RoomRecordView | undefined): string {
+  const c = view?.content;
+  if (!c) return "a record";
+  return c.title || untitledLabel(c.body ?? "")?.label || "an untitled record";
+}
+
+/** When it was written, as far as the reading rules let it be said. */
+function writtenWords(view: RoomRecordView, row: RecordRow): string {
+  const late = view.written.arrivedLate;
+  if (late) return `received ${when(late.received)}, later than the ${when(late.claimed)} it claims`;
+  if (view.written.at) return when(view.written.at);
+  // No claim, or an implausible one: never the claimed time — the host's.
+  return when(row.createdAt ?? row.updatedAt);
+}
+
+/**
+ * One record, as the reading rules show it: a note or a message with its
+ * reactions beside it and what it answers above it; or a withdrawn, retracted,
+ * refused or unverifiable one, saying so and showing nothing of it.
  */
 function RecordItem({
-  parties,
   room,
   host,
   row,
+  view,
+  opened,
+  target,
   prepared,
-  autoOpen,
+  autoPreview,
   authorName,
   onChanged,
 }: {
-  parties: Parties;
-  room: HeldRoom;
+  room: WritingPlace;
   host: string;
   row: RecordRow;
+  view: RoomRecordView;
+  opened: Opened | undefined;
+  /** The record this one answers, where it can be shown. */
+  target: RoomRecordView | undefined;
   prepared: RoomFilesPrepared | null;
-  autoOpen: boolean;
+  autoPreview: boolean;
   authorName: (did: string) => string;
   /** The record was edited or its standing changed: list again. */
   onChanged: () => void;
 }) {
   const [editing, setEditing] = useState(false);
-  const [opened, setOpened] = useState<Opened | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [busy, setBusy] = useState(false);
   const [expanded, setExpanded] = useState(false);
 
-  // A row can be scrolled away or the room left before its read lands.
-  const live = useRef(true);
-  useEffect(() => {
-    live.current = true;
-    return () => {
-      live.current = false;
-    };
-  }, []);
-
-  /** Read the record — through the background queue when nobody asked for it. */
-  const open = useCallback(async (queued = false) => {
-    setBusy(true);
-    setError(null);
-    try {
-      const read = () =>
-        roomsKeysRead(managerSender, {
-          ...parties,
-          roomId: room.roomId,
-          host,
-          key: row.key,
-          ...(room.member !== undefined ? { member: room.member } : {}),
-        });
-      const res = await (queued ? READS.run(read) : read());
-      if (!live.current) return;
-      // A retracted record has no body, and that is an answer rather than a
-      // failure — the tombstone is what the room retains of it.
-      const text = res.plaintext
-        ? decodeBody(res.plaintext)
-        : res.cleartext
-          ? JSON.stringify(res.cleartext, null, 2)
-          : res.status === "retracted"
-            ? "(retracted — the body is gone)"
-            : "(no body)";
-      setOpened({ text, ...readNote(text), verification: (res.verification as unknown as Verification) ?? null });
-    } catch (e) {
-      if (live.current) setError(e instanceof Error ? e.message : String(e));
+  const content = view.content;
+  const shown = view.shown;
+  const readable = content !== undefined;
+  const claim = readable && content.hasFile && opened ? roomFileClaimOf(opened.text) : null;
+  // A file record's `body` is its caption.
+  const caption = claim && content?.body?.trim() ? content.body : undefined;
+  const derived = readable && !content.title && !claim && content.body ? untitledLabel(content.body) : null;
+  const title = (() => {
+    switch (shown) {
+      case "refused":
+        return "This record could not be verified";
+      case "placeholder":
+        return "A record whose author cannot be verified";
+      case "unreadable":
+        return "This record could not be read";
+      case "withdrawn":
+        return "Withdrawn message";
+      case "retracted":
+        return "Retracted record";
+      default:
+        return content?.title ?? claim?.title ?? claim?.name ?? derived?.label ?? (shown === "message" ? "Empty message" : "Untitled record");
     }
-    if (live.current) setBusy(false);
-  }, [parties, room, host, row.key]);
-
-  const started = useRef(false);
-  useEffect(() => {
-    if (!autoOpen || started.current) return;
-    started.current = true;
-    void open(true);
-  }, [autoOpen, open]);
-
-  const claim = opened ? roomFileClaimOf(opened.text) : null;
-  const retracted = row.status === "retracted";
-  const title =
-    opened?.title ?? claim?.title ?? claim?.name ?? row.title ??
-    (retracted ? "Retracted record" : opened ? "Untitled record" : busy ? "Opening…" : "Not opened yet");
-  const preview = claim
-    ? `${claim.name} · ${formatBytes(claim.size)}${claim.mediaType ? ` · ${claim.mediaType}` : ""}`
-    : (opened?.body ?? row.description);
-  const author = row.author ?? opened?.author;
-  // No version here: it is the room's write counter, not this record's revision.
-  const meta = [author ? authorName(author) : "", when(row.updatedAt)].filter(Boolean).join(" · ");
+  })();
+  const preview = !readable ? undefined : claim ? caption : derived ? derived.rest || undefined : content.body;
+  const author = content?.author ?? (shown === "retracted" || shown === "withdrawn" ? undefined : row.author);
+  const edited = view.edited ? (view.edited.at ? `edited ${when(view.edited.at)}` : "edited") : "";
+  const meta = [author ? authorName(author) : "", readable ? writtenWords(view, row) : "", edited]
+    .filter(Boolean)
+    .join(" · ");
   const caught = opened?.verification ? adverse(opened.verification) : false;
-
-  const toggle = () => {
-    setExpanded((x) => !x);
-    if (!opened && !busy) void open();
-  };
+  const unshown = shown === "refused" || shown === "placeholder" || shown === "unreadable";
 
   return (
     <li style={{ borderTop: `1px solid ${c.lineSoft}`, listStyle: "none" }}>
+      {view.replyTo && (
+        <div style={{ padding: "8px 14px 0 38px", fontSize: t.xs, color: c.muted, wordBreak: "break-word" }}>
+          ↩{" "}
+          {view.replyTo.available ? (
+            <>
+              In reply to <strong style={{ fontWeight: 600 }}>{labelOf(target)}</strong>
+              {target?.content?.author && <> by {authorName(target.content.author)}</>}
+              {view.replyTo.changed === "edited" && <> — edited since</>}
+            </>
+          ) : (
+            <>In reply to a record that is not available</>
+          )}
+        </div>
+      )}
       <button
-        onClick={toggle}
+        onClick={() => setExpanded((x) => !x)}
         aria-expanded={expanded}
         style={{
           all: "unset",
@@ -396,13 +570,13 @@ function RecordItem({
         }}
       >
         <span aria-hidden="true" style={{ color: c.faint, paddingTop: 1 }}>
-          {claim ? "▣" : retracted ? "▢" : "▤"}
+          {claim ? "▣" : !readable ? "▢" : shown === "message" ? "▹" : "▤"}
         </span>
         <span style={{ display: "grid", gap: 3, flex: "1 1 auto", minWidth: 0 }}>
-          <span style={{ fontSize: t.base, fontWeight: 600, color: opened || row.title ? c.text : c.muted, wordBreak: "break-word" }}>
+          <span style={{ fontSize: t.base, fontWeight: 600, color: readable ? c.text : c.muted, wordBreak: "break-word" }}>
             {title}
           </span>
-          {preview && !expanded && !claim && (
+          {preview && !expanded && (
             <span
               style={{
                 fontSize: t.sm,
@@ -419,41 +593,101 @@ function RecordItem({
           )}
         </span>
         <span style={{ display: "flex", gap: 8, alignItems: "center", flex: "0 0 auto", fontSize: t.xs, color: c.faint }}>
+          {shown === "refused" && <Pill tone="danger">signature not verified</Pill>}
+          {shown === "placeholder" && <Pill tone="warn">author not verified</Pill>}
           {caught && <Pill tone="danger">check failed</Pill>}
+          {view.expired && <Pill tone="warn">expired</Pill>}
           {row.status && row.status !== "active" && (
             <Pill tone="warn">{row.status === "deprecated" ? "archived" : row.status}</Pill>
           )}
           <span>{meta}</span>
         </span>
       </button>
-      {error && (
-        <div style={{ padding: "0 14px 10px", display: "grid", gap: 6 }}>
-          <Note tone="danger">{error}</Note>
+      {view.reactions.length > 0 && (
+        <div style={{ display: "flex", gap: 6, flexWrap: "wrap", padding: "0 14px 10px 38px" }}>
+          {view.reactions.map((r) => (
+            <span
+              key={r.normalised}
+              title={r.authors.map(authorName).join(", ")}
+              style={{
+                fontSize: t.sm,
+                padding: "1px 8px",
+                border: `1px solid ${c.line}`,
+                borderRadius: 999,
+                whiteSpace: "pre",
+              }}
+            >
+              {r.value} {r.count}
+            </span>
+          ))}
+        </div>
+      )}
+      {/* Refused or unverifiable, it is said where the record is, whether or not it is expanded. */}
+      {shown === "refused" && (
+        <div style={{ padding: "0 14px 12px 38px" }}>
+          <Note tone="danger">
+            <strong>Your agent opened this record, but it could not be verified, so none of it is shown.</strong>{" "}
+            {view.reason}
+          </Note>
+        </div>
+      )}
+      {shown === "placeholder" && (
+        <div style={{ padding: "0 14px 12px 38px" }}>
+          <Note tone="warn">
+            <strong>Who wrote this record cannot be verified, so none of it is shown.</strong> {view.reason}
+          </Note>
+        </div>
+      )}
+      {view.rewrite && (
+        <div style={{ padding: "0 14px 10px 38px", fontSize: t.xs, color: c.warn }}>
+          This version was written by {authorName(view.rewrite.by)}, not by {authorName(view.rewrite.original)}, who
+          wrote the record — it is their rewrite, not an edit by {authorName(view.rewrite.original)}.
         </div>
       )}
       {/* A file is shown whether or not the row is expanded: its thumbnail and
           download are the point of it, and the rest is behind the expand. */}
-      {opened && claim && (
+      {claim && (
         <div style={{ padding: "0 14px 12px 38px" }}>
-          <GetRoomFile room={room} host={host} prepared={prepared} recordKey={row.key} claim={claim} showTitle={false} autoPreview={autoOpen} />
+          <GetRoomFile room={room} host={host} prepared={prepared} recordKey={row.key} claim={claim} showTitle={false} autoPreview={autoPreview} />
         </div>
       )}
       {expanded && (
         <div style={{ display: "grid", gap: 10, padding: "0 14px 14px 38px" }}>
-          {busy && !opened && <Loading what="the record" />}
-          {opened && !claim && (
+          {shown === "withdrawn" && (
+            <div style={{ fontSize: t.sm, color: c.muted }}>Its author withdrew this message. Nothing of it is shown.</div>
+          )}
+          {shown === "retracted" && (
+            <div style={{ fontSize: t.sm, color: c.muted }}>(retracted — the body is gone)</div>
+          )}
+          {shown === "unreadable" && <Note tone="warn">{view.reason}</Note>}
+          {readable && (!claim || caption) && (
+            // Plain text, always: a message's body is never markup, and a note's is rendered inert.
             <div style={{ fontSize: t.base, color: c.text, whiteSpace: "pre-wrap", wordBreak: "break-word", lineHeight: 1.55 }}>
-              {opened.body ?? (opened.title ? "" : opened.text)}
+              {claim ? caption : (content.body ?? "")}
             </div>
           )}
-          {opened && (opened.body !== undefined || claim) && (
+          {readable && view.written.arrivedLate && (
+            <div style={{ fontSize: t.xs, color: c.warn }}>
+              The room received this on {when(view.written.arrivedLate.received)}, though it says it was written on{" "}
+              {when(view.written.arrivedLate.claimed)}. It is placed where it arrived.
+            </div>
+          )}
+          {opened?.signed && content?.author && (
+            // The check is the signature's, over the DID: never beside a name the author gave themselves.
+            <div style={{ fontSize: t.xs, color: c.ok, wordBreak: "break-all" }}>
+              ✓ Signed by {content.author} — the author&rsquo;s signature checks out
+            </div>
+          )}
+          {readable && opened && (
             <details>
-              <summary style={{ fontSize: t.xs, color: c.muted, cursor: "pointer" }}>The signed record</summary>
+              <summary style={{ fontSize: t.xs, color: c.muted, cursor: "pointer" }}>
+                {opened.signed ? "The signed record" : "The record, as the host stores it"}
+              </summary>
               <pre style={bodyStyle}>{opened.text}</pre>
             </details>
           )}
           {opened?.verification && <VerdictLine verification={opened.verification} scope="record" />}
-          {editing && opened ? (
+          {editing && content ? (
             <NoteEditor
               key={`${row.key}@${row.version}`}
               room={room}
@@ -461,8 +695,8 @@ function RecordItem({
               existing={{
                 key: row.key,
                 version: row.version,
-                ...(opened.title !== undefined ? { title: opened.title } : {}),
-                ...(opened.body !== undefined ? { body: opened.body } : {}),
+                ...(content.title !== undefined ? { title: content.title } : {}),
+                ...(content.body !== undefined ? { body: content.body } : {}),
               }}
               onDone={() => {
                 setEditing(false);
@@ -471,17 +705,30 @@ function RecordItem({
               onCancel={() => setEditing(false)}
             />
           ) : (
-            <RecordActions
-              room={room}
-              host={host}
-              recordKey={row.key}
-              version={row.version}
-              status={row.status}
-              // A note this place wrote: replacing someone else's is not an edit.
-              editable={!!opened && !claim && opened.body !== undefined && !!author && author === room.member}
-              onEdit={() => setEditing(true)}
-              onChanged={onChanged}
-            />
+            !unshown && (
+              <RecordActions
+                room={room}
+                host={host}
+                recordKey={row.key}
+                version={row.version}
+                status={row.status}
+                // A note this place wrote, carrying nothing this editor would drop:
+                // a new version must keep `kind`, `inReplyTo` and `writtenAt`, which it
+                // does not write. Replacing someone else's is not an edit.
+                editable={
+                  !!content &&
+                  !claim &&
+                  content.body !== undefined &&
+                  content.kind === undefined &&
+                  content.inReplyTo === undefined &&
+                  content.writtenAt === undefined &&
+                  !!author &&
+                  author === room.member
+                }
+                onEdit={() => setEditing(true)}
+                onChanged={onChanged}
+              />
+            )
           )}
           <code style={{ fontFamily: font.mono, fontSize: t.xs, color: c.faint, wordBreak: "break-all" }}>{row.key}</code>
         </div>
@@ -496,14 +743,23 @@ function RecordItem({
   );
 }
 
-/** How many of the newest records are opened as the list arrives. */
-export const AUTO_OPEN = 5;
+/** How the pane learns of changes, in a few words: through the agent's watch, or by checking. */
+function watchWords(s: RoomWatchState | undefined): string {
+  if (watchCovers(s)) return "New records are signalled through your agent.";
+  return `Checked for new records every ${Math.round(POLL_UNWATCHED_MS / 1000)} seconds.`;
+}
 
-/** The records opened unasked, a few at a time and newest first (`limit.ts`). */
-const READS = createLimiter(2);
+/** How many of the newest file records preview themselves as the list arrives. */
+export const AUTO_PREVIEW = 5;
 
 /**
- * Browse a room's records at a host, and open the ones that matter.
+ * Browse a room's records at a host, read them, and show them as the reading
+ * rules say (`@openvtc/pnm-core/rooms`'s `assembleRoomRecords`).
+ *
+ * Every record listed is read — in batches, through `rooms/keys/read/0.2` — and
+ * verified before any of it is shown: a reply is placed against what it
+ * answers, reactions beside their target, and messages by when they were
+ * written, none of which can be done one opened record at a time.
  *
  * Nothing authoritative maps a room to its host — a room is portable, and may
  * have more than one, a mirror serving reads while its primary takes writes —
@@ -516,11 +772,14 @@ export function RoomRecords({
   room,
   host: knownHost,
   onListed,
+  petnames,
 }: {
   parties: Parties;
-  room: HeldRoom;
+  room: RoomPlace;
   host?: string | undefined;
   onListed?: ((host: string) => void) | undefined;
+  /** The member's own petnames, by DID, from their contacts: shown before any name an author gives themselves. */
+  petnames?: ReadonlyMap<string, string> | undefined;
 }) {
   const [hostDid, setHostDid] = useState(knownHost ?? "");
   const [askHost, setAskHost] = useState(!knownHost);
@@ -529,26 +788,152 @@ export function RoomRecords({
   const [complete, setComplete] = useState<boolean | undefined>(undefined);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [reading, setReading] = useState(false);
+  const [opened, setOpened] = useState<Map<string, Opened>>(new Map());
+  const [shownRoom, setShownRoom] = useState<RoomRecordsView | null>(null);
+  const [showExpired, setShowExpired] = useState(false);
   // The host is learnt here, at listing, so that a click on put or get can ask
   // for its origin as its first act (`rooms-files.tsx`).
   const [listedHost, setListedHost] = useState("");
   const [prepared, setPrepared] = useState<RoomFilesPrepared | null>(null);
   const [filesError, setFilesError] = useState<string | null>(null);
+  /**
+   * The versions this pane last showed, by key: what a later version is compared
+   * with (*What a new version keeps*, *Edits*, *Tombstones*). Kept for as long as
+   * the pane is, across every refresh.
+   */
+  const held = useRef(new Map<string, HeldRecord>());
+  // A listing can be overtaken by the next one before its reads land.
+  const generation = useRef(0);
+
+  /**
+   * What this pane holds of the room, by key: the listed row, what the reading
+   * rules take, and what was opened. A full listing replaces them; a refresh
+   * from the watermark merges what changed into them.
+   */
+  const rowsRef = useRef(new Map<string, RecordRow>());
+  const inputsRef = useRef(new Map<string, RecordInput>());
+  const openedRef = useRef(new Map<string, Opened>());
+  /** The highest version listed: where a refresh lists from, and what a watch is armed at. */
+  const watermark = useRef<number | undefined>(undefined);
+  const hostRef = useRef("");
+  const viewRef = useRef<RoomRecordsView | null>(null);
+
+  // ── Unread, by the member's own read marker ──────────────────────────────
+  const markerKey = room.member !== undefined ? readMarkerKey(parties.service.did, room.member, room.roomId) : undefined;
+  const marker = useRef<number | undefined>(undefined);
+  const markerRead = useRef<Promise<void> | null>(null);
+  const [unread, setUnread] = useState(0);
+  const unreadRef = useRef(0);
+
+  // ── The watch on this room, through the member's own VTA ──────────────────
+  const watch = useRef<RoomWatchHold | null>(null);
+  const [watchState, setWatchState] = useState<RoomWatchState | undefined>(undefined);
+
+  /** Read the listed rows' bodies, in batches, and verify each before anything of it is kept. */
+  const readRows = useCallback(
+    async (host: string, listed: RecordRow[]) => {
+      const toRead = listed.filter((r) => r.status !== "retracted");
+      const answers =
+        toRead.length === 0
+          ? []
+          : await roomsKeysReadMany(managerSender, {
+              ...parties,
+              roomId: room.roomId,
+              host,
+              keys: toRead.map((r) => r.key),
+              ...(room.member !== undefined ? { member: room.member } : {}),
+            });
+      const byKey = new Map(answers.map((a) => [a.key, a]));
+      // One memo for this listing: a historical resolution re-fetches and
+      // re-verifies the author's whole log, and most authors write many records.
+      const resolveDidAt = memoResolveDidDocumentAt();
+      return Promise.all(
+        listed.map(async (row) => {
+          const res = byKey.get(row.key);
+          if (res) return { row, ...(await readOne(room.roomId, row, res, resolveDidAt)) };
+          const input: RecordInput = {
+            key: row.key,
+            version: row.version,
+            ...(row.status !== undefined ? { status: row.status } : {}),
+            ...(row.updatedAt !== undefined ? { updatedAt: row.updatedAt } : {}),
+            ...(row.createdAt !== undefined ? { createdAt: row.createdAt } : {}),
+            ...(row.createdBy !== undefined ? { createdBy: row.createdBy } : {}),
+            ...(row.bodyStoredAt !== undefined ? { bodyStoredAt: row.bodyStoredAt } : {}),
+            ...(row.kind !== undefined ? { listedKind: row.kind } : {}),
+            reading: { state: "tombstone" },
+          };
+          return { row, opened: undefined as Opened | undefined, input };
+        }),
+      );
+    },
+    [parties, room],
+  );
+
+  /**
+   * Show what the pane holds, by the reading rules; then say what is unread
+   * (`rooms/changed/0.1`, *What a reader does with a signal*, step 4) and
+   * re-arm the room's watch, which is only ever done after a read.
+   */
+  const show = useCallback(() => {
+    const all = [...inputsRef.current.values()].map((input) => {
+      const before = held.current.get(input.key);
+      return before !== undefined ? { ...input, held: before } : input;
+    });
+    const view = assembleRoomRecords(all, { now: Date.now() });
+    viewRef.current = view;
+    setRows([...rowsRef.current.values()]);
+    setShownRoom(view);
+    setOpened(new Map(openedRef.current));
+    for (const input of all) {
+      if (input.reading.state === "read") held.current.set(input.key, { version: input.version, content: input.reading.content });
+    }
+
+    const latest = latestMessageTime(view, all);
+    const seen = typeof document === "undefined" || document.visibilityState !== "hidden";
+    if (marker.current === undefined || seen) {
+      // The member is looking (or this is the room's first reading here): what is shown is read.
+      if (latest !== undefined && (marker.current === undefined || latest > marker.current)) {
+        marker.current = latest;
+        if (markerKey !== undefined) void setReadMarker(markerKey, latest);
+      }
+      unreadRef.current = 0;
+      setUnread(0);
+    } else {
+      const own = new Set(room.member !== undefined ? [room.member] : []);
+      const n = unreadMessages(view, all, { readMarker: marker.current, own }).length;
+      // Alert only on what reading found, and with nothing of it: no room, no author, no words.
+      if (n > unreadRef.current) notifyUnread();
+      unreadRef.current = n;
+      setUnread(n);
+    }
+    watch.current?.afterRead(watermark.current);
+  }, [markerKey, room.member]);
 
   const started = useRef(false);
   const browse = useCallback(async (asked: string) => {
     const host = asked.trim();
     if (!host) return;
     started.current = true;
+    const mine = ++generation.current;
     setBusy(true);
     setError(null);
     setRows(null);
+    setShownRoom(null);
+    setOpened(new Map());
     setListedHost(host);
+    hostRef.current = host;
     setPrepared(null);
     setFilesError(null);
     void prepareRoomFiles(host).then(setPrepared, (e: unknown) =>
       setFilesError(e instanceof Error ? e.message : String(e)),
     );
+    if (markerKey !== undefined && markerRead.current === null) {
+      markerRead.current = getReadMarker(markerKey).then((m) => {
+        if (marker.current === undefined) marker.current = m;
+      });
+    }
+    let listed: RecordRow[];
     try {
       const res = await roomsKeysBrowse(managerSender, {
         ...parties,
@@ -556,7 +941,8 @@ export function RoomRecords({
         host,
         ...(room.member !== undefined ? { member: room.member } : {}),
       });
-      setRows((res.records ?? []) as unknown as RecordRow[]);
+      listed = (res.records ?? []) as unknown as RecordRow[];
+      setRows(listed);
       setVerification(res.verification as unknown as Verification);
       setComplete(res.complete);
       setAskHost(false);
@@ -565,20 +951,197 @@ export function RoomRecords({
       setError(e instanceof Error ? e.message : String(e));
       // A host that did not answer is one to correct, so the field comes back.
       setAskHost(true);
+      setBusy(false);
+      return;
     }
     setBusy(false);
-  }, [parties, room, onListed]);
+
+    // Read every record that has a body; a tombstone has none to read.
+    setReading(true);
+    try {
+      const read = await readRows(host, listed);
+      await markerRead.current;
+      if (mine !== generation.current) return;
+      rowsRef.current = new Map(listed.map((r) => [r.key, r]));
+      inputsRef.current = new Map(read.map(({ input }) => [input.key, input]));
+      openedRef.current = new Map(read.flatMap(({ row, opened: o }) => (o ? [[row.key, o] as const] : [])));
+      watermark.current = listed.reduce<number | undefined>((m, r) => (m === undefined || r.version > m ? r.version : m), undefined) ?? 0;
+      show();
+    } catch (e) {
+      if (mine === generation.current) setError(e instanceof Error ? e.message : String(e));
+    }
+    if (mine === generation.current) setReading(false);
+  }, [parties, room, onListed, readRows, show, markerKey]);
+
+  /**
+   * Read what changed since the watermark — after a signal, or on a poll — and
+   * merge it into what the pane holds: list from the watermark through the
+   * agent, batch-read the changed records, and show the room again. A prune
+   * past the watermark means the copy is rebuilt from a full listing
+   * (`lastPrune`, *After a prune*).
+   */
+  const refreshing = useRef<Promise<void> | null>(null);
+  const again = useRef(false);
+  const refresh = useCallback(async (): Promise<void> => {
+    if (refreshing.current) {
+      again.current = true;
+      return refreshing.current;
+    }
+    const run = async () => {
+      const host = hostRef.current;
+      const since = watermark.current;
+      if (!host || since === undefined) return;
+      const mine = generation.current;
+      try {
+        const res = await roomsKeysBrowse(managerSender, {
+          ...parties,
+          roomId: room.roomId,
+          host,
+          sinceVersion: since,
+          ...(room.member !== undefined ? { member: room.member } : {}),
+        });
+        if (mine !== generation.current) return;
+        if (res.lastPrune !== undefined && res.lastPrune.version > since) {
+          await browse(host);
+          return;
+        }
+        const listed = (res.records ?? []) as unknown as RecordRow[];
+        setVerification(res.verification as unknown as Verification);
+        setComplete(res.complete);
+        const read = listed.length === 0 ? [] : await readRows(host, listed);
+        if (mine !== generation.current) return;
+        for (const { row, input, opened: o } of read) {
+          rowsRef.current.set(row.key, row);
+          inputsRef.current.set(input.key, input);
+          if (o) openedRef.current.set(row.key, o);
+          else openedRef.current.delete(row.key);
+          if (watermark.current === undefined || row.version > watermark.current) watermark.current = row.version;
+        }
+        show();
+      } catch (e) {
+        // A refresh that fails leaves what is shown as it was; the next poll or signal tries again.
+        console.warn("[pnm rooms] could not refresh", room.roomId, e);
+      }
+    };
+    refreshing.current = (async () => {
+      try {
+        do {
+          again.current = false;
+          await run();
+        } while (again.current);
+      } finally {
+        refreshing.current = null;
+      }
+    })();
+    return refreshing.current;
+  }, [parties, room, readRows, show, browse]);
+
+  // Handlers the watch and the timers call reach the current ones.
+  const refreshRef = useRef(refresh);
+  refreshRef.current = refresh;
+
+  // Hold the room's watch while this pane is open, at the host it lists from;
+  // closing the pane, or listing elsewhere, releases it — which cancels it.
+  useEffect(() => {
+    if (!listedHost || room.member === undefined) return;
+    const hold = holdRoomWatch(parties, { member: room.member, host: listedHost, roomId: room.roomId }, (latestVersion) => {
+      // A signal at or below what was read: nothing to read, re-arm (step 1).
+      const w = watermark.current;
+      if (w !== undefined && latestVersion <= w) hold.afterRead(w);
+      else void refreshRef.current();
+    });
+    watch.current = hold;
+    setWatchState(hold.state());
+    const off = hold.onState((s) => {
+      setWatchState(s);
+      // A watch that lapsed unsignalled is re-armed after the next read: read now.
+      if (s?.state === "lapsed") void refreshRef.current();
+    });
+    if (watermark.current !== undefined) hold.afterRead(watermark.current);
+    return () => {
+      off();
+      hold.release();
+      if (watch.current === hold) watch.current = null;
+    };
+  }, [parties, room.roomId, room.member, listedHost]);
+
+  // Polling stays: the fallback where no watch covers the room (none served,
+  // refused, or not yet armed), and a slow safety net where one does.
+  const covered = watchCovers(watchState);
+  useEffect(() => {
+    if (!listedHost) return;
+    const t = unrefTimer(setInterval(() => void refreshRef.current(), covered ? POLL_WATCHED_MS : POLL_UNWATCHED_MS));
+    return () => clearInterval(t);
+  }, [listedHost, covered]);
+
+  // When the member comes back to the console, what is on screen has been seen.
+  useEffect(() => {
+    const onVisible = () => {
+      if (document.visibilityState === "hidden" || unreadRef.current === 0) return;
+      const view = viewRef.current;
+      const latest = view ? latestMessageTime(view, [...inputsRef.current.values()]) : undefined;
+      if (latest !== undefined && (marker.current === undefined || latest > marker.current)) {
+        marker.current = latest;
+        if (markerKey !== undefined) void setReadMarker(markerKey, latest);
+      }
+      unreadRef.current = 0;
+      setUnread(0);
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => document.removeEventListener("visibilitychange", onVisible);
+  }, [markerKey]);
 
   const [uploading, setUploading] = useState(false);
   const [writing, setWriting] = useState(false);
-  // Newest first: a version is assigned by every write, so it orders them.
-  const newestFirst = [...(rows ?? [])].sort((x, y) => y.version - x.version);
-  const openFirst = new Set(newestFirst.filter((r) => r.status !== "retracted").slice(0, AUTO_OPEN).map((r) => r.key));
-  const names = useAgentNames(newestFirst.map((r) => r.author));
+  const rowsByKey = new Map((rows ?? []).map((r) => [r.key, r]));
+  const visible = shownRoom ? [...shownRoom.records, ...(showExpired ? shownRoom.expired : [])] : [];
+  const viewsByKey = new Map(visible.map((v) => [v.key, v]));
+  // Newest first, by the order the reading rules give: when it was written,
+  // else when the room received it.
+  const newestFirst = [...visible].sort((x, y) => y.orderAt - x.orderAt || (x.key < y.key ? 1 : x.key > y.key ? -1 : 0));
+  const previewFirst = new Set(
+    newestFirst.filter((v) => v.content?.hasFile).slice(0, AUTO_PREVIEW).map((v) => v.key),
+  );
+  const roomNames = shownRoom?.names;
+  const labels = authorLabels(
+    [
+      ...(rows ?? []).flatMap((r) => (r.author ? [r.author] : [])),
+      ...visible.flatMap((v) => [
+        ...(v.content ? [v.content.author] : []),
+        ...(v.rewrite ? [v.rewrite.by, v.rewrite.original] : []),
+        ...v.reactions.flatMap((r) => r.authors),
+      ]),
+    ],
+    { petnames, roomNames },
+  );
+  // A petname is the member's own; a room name is the author's claim, in quotes;
+  // otherwise the DID, shortened. Never a name from anywhere else — not one its
+  // DID document claims, nor one from a directory or another room — before the
+  // room's own records give one (*Before a name is found*, trust-tasks-tf #1038).
   const authorName = (did: string) => {
-    const n = names[did];
-    return n ? displayAgentName(n) : shortDid(did);
+    const l = labels.get(did);
+    if (l?.source === "petname") return l.text!;
+    if (l?.source === "room") return `“${l.text}”${l.fingerprint ? ` (…${l.fingerprint})` : ""}`;
+    return shortDid(did);
   };
+  const anyRoomName = [...labels.values()].some((l) => l.source === "room");
+  const [naming, setNaming] = useState(false);
+  const ownRecord = room.member !== undefined ? roomNames?.[room.member] : undefined;
+  const ownName = ownRecord?.name;
+  const heldNames = Object.entries(roomNames ?? {}).map(([author, r]) => ({ author, key: r.key, version: r.version }));
+  // What a write near the head writes again: the member's own name as rule 2 gives it here.
+  const ownNameRecord: OwnMemberName | undefined =
+    ownRecord?.name !== undefined
+      ? {
+          key: ownRecord.key,
+          version: ownRecord.version,
+          name: ownRecord.name,
+          ...(ownRecord.writtenAt !== undefined ? { writtenAt: ownRecord.writtenAt } : {}),
+          ...(ownRecord.editedAt !== undefined ? { editedAt: ownRecord.editedAt } : {}),
+        }
+      : undefined;
+
+  const place: WritingPlace = { ...room, ...(ownNameRecord !== undefined ? { ownName: ownNameRecord } : {}) };
 
   // Where the room was last found: list it straight away, once — and not again
   // when the host this listing just found comes back down as the known one.
@@ -588,6 +1151,8 @@ export function RoomRecords({
     void browse(knownHost);
   }, [knownHost, browse]);
 
+  const hiddenExpired = shownRoom?.expired.length ?? 0;
+  const tombstones = shownRoom?.tombstones.length ?? 0;
 
   return (
     <div style={{ display: "grid", gap: 8, marginTop: 10 }}>
@@ -616,9 +1181,11 @@ export function RoomRecords({
           <Button kind="quiet" onClick={() => setAskHost(true)}>
             Change
           </Button>
-          <Button kind="quiet" disabled={busy} onClick={() => void browse(listedHost || hostDid)}>
+          <Button kind="quiet" disabled={busy || reading} onClick={() => void browse(listedHost || hostDid)}>
             {busy ? "Listing…" : "Refresh"}
           </Button>
+          {unread > 0 && <Pill tone="accent">{unread === 1 ? "1 new message" : `${unread} new messages`}</Pill>}
+          <span style={{ fontSize: t.xs, color: c.faint }}>{watchWords(watchState)}</span>
         </div>
       )}
 
@@ -635,38 +1202,75 @@ export function RoomRecords({
               This host served no records for this room — which is also what a host withholding all of them
               looks like, unless it committed to a count.
             </div>
+          ) : reading && !shownRoom ? (
+            <Loading what="the records" />
           ) : (
-            <ul
-              style={{
-                margin: 0,
-                padding: 0,
-                background: c.surface,
-                border: `1px solid ${c.line}`,
-                borderRadius: "var(--w-r-md)",
-                overflow: "hidden",
-              }}
-            >
-              {newestFirst.map((r) => (
-                <RecordItem
-                  // Keyed by version too: an edited record is a new one to open.
-                  key={`${r.key}@${r.version}`}
-                  parties={parties}
-                  room={room}
-                  host={listedHost}
-                  row={r}
-                  prepared={prepared}
-                  autoOpen={openFirst.has(r.key)}
-                  authorName={authorName}
-                  onChanged={() => void browse(listedHost)}
-                />
-              ))}
-            </ul>
+            newestFirst.length > 0 && (
+              <ul
+                style={{
+                  margin: 0,
+                  padding: 0,
+                  background: c.surface,
+                  border: `1px solid ${c.line}`,
+                  borderRadius: "var(--w-r-md)",
+                  overflow: "hidden",
+                }}
+              >
+                {newestFirst.map((v) => {
+                  const row = rowsByKey.get(v.key) ?? { key: v.key, version: v.version };
+                  return (
+                    <RecordItem
+                      // Keyed by version too: an edited record is a new one to show.
+                      key={`${v.key}@${v.version}`}
+                      room={place}
+                      host={listedHost}
+                      row={row}
+                      view={v}
+                      opened={opened.get(v.key)}
+                      target={v.replyTo ? viewsByKey.get(v.replyTo.key) : undefined}
+                      prepared={prepared}
+                      autoPreview={previewFirst.has(v.key)}
+                      authorName={authorName}
+                      onChanged={() => void browse(listedHost)}
+                    />
+                  );
+                })}
+              </ul>
+            )
+          )}
+          {anyRoomName && (
+            <div style={{ fontSize: t.xs, color: c.faint, lineHeight: 1.5 }}>
+              A name in quotes is what that member calls themselves in this room — their own claim, not verified. Your own
+              petnames for people come first.
+            </div>
+          )}
+          {(hiddenExpired > 0 || tombstones > 0) && (
+            <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center", fontSize: t.xs, color: c.faint }}>
+              {hiddenExpired > 0 && (
+                <>
+                  <span>
+                    {hiddenExpired === 1
+                      ? "1 record is past the time its author stood behind it, and is hidden."
+                      : `${hiddenExpired} records are past the time their authors stood behind them, and are hidden.`}
+                  </span>
+                  <Button kind="quiet" onClick={() => setShowExpired((x) => !x)}>
+                    {showExpired ? "Hide expired records" : "Show expired records"}
+                  </Button>
+                </>
+              )}
+              {tombstones > 0 && (
+                <span>
+                  {tombstones === 1 ? "1 record was retracted" : `${tombstones} records were retracted`} — the body is
+                  gone; the room keeps only its key.
+                </span>
+              )}
+            </div>
           )}
           {filesError && <RoomFilesUnavailable error={filesError} />}
           {writing && (
             <NoteEditor
               key={`new@${room.roomId}|${room.member ?? ""}`}
-              room={room}
+              room={place}
               host={listedHost}
               onDone={() => {
                 setWriting(false);
@@ -675,10 +1279,25 @@ export function RoomRecords({
               onCancel={() => setWriting(false)}
             />
           )}
-          {prepared && uploading && (
-            <PutRoomFile room={room} host={listedHost} prepared={prepared} onPut={() => void browse(listedHost)} />
+          {naming && (
+            <MemberNameEditor
+              key={`name@${room.roomId}|${room.member ?? ""}`}
+              parties={parties}
+              room={room}
+              host={listedHost}
+              current={ownName}
+              held={heldNames}
+              onDone={() => {
+                setNaming(false);
+                void browse(listedHost);
+              }}
+              onCancel={() => setNaming(false)}
+            />
           )}
-          {!writing && !uploading && (
+          {prepared && uploading && (
+            <PutRoomFile room={place} host={listedHost} prepared={prepared} onPut={() => void browse(listedHost)} />
+          )}
+          {!writing && !uploading && !naming && (
             <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
               <Button disabled={holds(room, "write") === false} onClick={() => setWriting(true)}>
                 Write a note
@@ -688,6 +1307,9 @@ export function RoomRecords({
                   Upload a file
                 </Button>
               )}
+              <Button kind="quiet" disabled={holds(room, "write") === false} onClick={() => setNaming(true)}>
+                {ownName !== undefined ? "Change my name in this room" : "Set my name in this room"}
+              </Button>
               {holds(room, "write") === false && (
                 <span style={{ fontSize: t.xs, color: c.faint }}>
                   This identity's credentials for the room do not include write.
