@@ -35,7 +35,7 @@ test("a MyTerms record becomes one agreement, with the roster's title and text, 
   assert.deepEqual(a.terms, {
     code: "SD-BASE-DP",
     title: "Service delivery, with data portability",
-    url: "https://customercommons.org/agreements/SD-BASE-DP",
+    url: "https://agreements.info/r/sd-base-dp",
   });
   assert.deepEqual(a.reached, { requestId: "jr-1", requestDigest: "zReq", replyDigest: "zRep", at: 1_791_460_900_000 });
   assert.equal(a.status, "agreed");

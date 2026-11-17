@@ -36,7 +36,7 @@ test("the roster: six service-delivery codes, most protective first, none invent
     ["SD-BASE-DP", "SD-BASE", "SD-BASE-A", "SD-BASE-AT", "SD-BASE-ATP", "SD-BASE-ATP-S3P"],
   );
   for (const a of MYTERMS_ROSTER) {
-    assert.ok(a.title && a.meaning && a.url.startsWith("https://customercommons.org/"), a.code);
+    assert.ok(a.title && a.meaning && a.url.startsWith("https://agreements.info/r/"), a.code);
     assert.ok(a.permitted.length >= 1 && a.prohibited.length >= 1, a.code);
   }
   assert.equal(rosterAgreement("SD-BASE-AT")?.code, "SD-BASE-AT");
@@ -98,7 +98,7 @@ test("the record names both parties, the roster reference and the profile; only 
   const vca = buildVca(BOB, VTC, "SD-BASE-AT", 1_791_460_900_123);
   assert.equal(vca.version, "1");
   assert.equal(vca.profile, MYTERMS_PROFILE);
-  assert.deepEqual(vca.references, [{ code: "SD-BASE-AT", url: "https://customercommons.org/agreements/SD-BASE-AT" }]);
+  assert.deepEqual(vca.references, [{ code: "SD-BASE-AT", url: "https://agreements.info/r/sd-base-at" }]);
   assert.deepEqual(vca.ids, [BOB, VTC]);
   assert.equal(vca.created, 1_791_460_900);
   assert.match(vca.agreementId, /^[0-9a-f-]{36}$/);

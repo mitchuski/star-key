@@ -47,6 +47,7 @@ import {
   credentialAskFor,
   describeExternalCard,
   memberSigningKey,
+  myTermsEndpoint,
   postCommunityTask,
   publishedStateOf,
   resolveCommunityDocument,
@@ -210,8 +211,11 @@ export async function runDirectoryPageOp(
   const now = deps.now ?? Date.now;
   const community = (hostDid: string) => (deps.community ?? ((d) => resolveCommunity(d, now)))(hostDid);
   if (op.op === "portal") {
-    const { portalOrigin, endpoint } = await community(op.hostDid);
-    return { portalOrigin, endpoint };
+    const { portalOrigin, endpoint, document } = await community(op.hostDid);
+    // Where the community keeps its MyTerms configuration, when its document
+    // names one (`site-terms.ts`); the other gates read the first two only.
+    const termsEndpoint = myTermsEndpoint(document);
+    return { portalOrigin, endpoint, ...(termsEndpoint ? { termsEndpoint } : {}) };
   }
   const entries = identitiesAt(await deps.identities(vta.vtaDid, vta.restBaseUrl), op.hostDid);
   if (op.op === "members") return entries.map((e) => e.principalDid as string);

@@ -1201,7 +1201,7 @@ export function SignInView({
             // for the portal and the Trust-Task endpoint together, first in
             // the click (the gesture is spent by any earlier await), then go.
             run: () =>
-              void allowOrigins([screen.portalOrigin, screen.trustTaskOrigin]).then(
+              void allowOrigins([screen.portalOrigin, screen.trustTaskOrigin, ...(screen.termsOrigin ? [screen.termsOrigin] : [])]).then(
                 (ok) => {
                   if (ok) return run({ step: "join-manifest" });
                   setNote(`Your wallet needs permission to reach ${screen.host} to ask it anything. Nothing was sent.`);

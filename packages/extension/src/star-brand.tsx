@@ -35,13 +35,21 @@ function openJoin() {
   window.close();
 }
 
+// The City serves the reading page on its own as a web page (build:star-preview): no wallet there, so
+// none of the wallet's own doors, which would only fail.
+const WEB = import.meta.env.MODE === 'web-experiment';
+
 export function StarBrand({ active = false }: { active?: boolean }) {
   return <header className="star-brand">
     <div className={active ? 'star-mini is-active' : 'star-mini'}><StarMark active={active} /></div>
     <div><div className="star-wordmark">star key</div><p>{active ? 'VTA selected · your chosen perspective' : 'Your boundaries. Your chosen perspective.'}</p></div>
     <a href="star.html" target="_blank" rel="noreferrer" aria-label="Inspect and prepare a selected City Key reading" title="Inspect a reading before sharing">📤</a>
-    <a href="hold.html" target="_blank" rel="noreferrer" aria-label="What the Star holds — verify a Hold locally" title="What the Star holds">🪬</a>
-    <button onClick={openJoin} aria-label="Join a community — paste its DID or scan its code" title="Join a community">🤝</button>
-    <button onClick={() => window.close()} aria-label="Close Star" title="Close Star">✕</button>
+    {WEB
+      ? <a href="https://mages.city/star-key" target="_blank" rel="noreferrer" title="Get Star Key, the wallet">get Star Key ↗</a>
+      : <>
+        <a href="hold.html" target="_blank" rel="noreferrer" aria-label="What the Star holds — verify a Hold locally" title="What the Star holds">🪬</a>
+        <button onClick={openJoin} aria-label="Join a community — paste its DID or scan its code" title="Join a community">🤝</button>
+        <button onClick={() => window.close()} aria-label="Close Star" title="Close Star">✕</button>
+      </>}
   </header>;
 }

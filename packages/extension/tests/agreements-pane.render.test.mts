@@ -21,7 +21,7 @@ const agreement = (over: Record<string, unknown> = {}) => ({
   holder: "did:webvh:QmBob:dids.example.net:bob",
   counterparty: CITY,
   site: "join.mages.city",
-  terms: { code: "SD-BASE-DP", title: "Service delivery, with data portability", url: "https://customercommons.org/agreements/SD-BASE-DP" },
+  terms: { code: "SD-BASE-DP", title: "Service delivery, with data portability", url: "https://agreements.info/r/sd-base-dp" },
   reached: { requestId: "jr-1", requestDigest: "zReq", replyDigest: "zRep", at: 1_791_460_900_000 },
   status: "agreed",
   effect: "allow",
@@ -80,7 +80,7 @@ test("the pane shows the offers in order, a card per community with its standing
   const store = {
     [`agreements:${VTA}`]: [
       agreement(),
-      agreement({ id: "a-2", status: "proffered", effect: "pending", terms: { code: "SD-BASE", title: "Service delivery only", url: "https://customercommons.org/agreements/SD-BASE" }, reached: { requestId: "jr-2", requestDigest: "zReq2", replyDigest: "zRep2", at: 1_791_460_999_000 } }),
+      agreement({ id: "a-2", status: "proffered", effect: "pending", terms: { code: "SD-BASE", title: "Service delivery only", url: "https://agreements.info/r/sd-base" }, reached: { requestId: "jr-2", requestDigest: "zReq2", replyDigest: "zRep2", at: 1_791_460_999_000 } }),
     ],
   };
   const screen = await render(h(AgreementsPane, { parties, readOffers: async () => ["SD-BASE", "SD-BASE-DP"], writeOffers: async () => {} }), { chrome: chromeWith(store) });

@@ -19,7 +19,7 @@ const agreement = (over: Partial<Agreement> = {}): Agreement => ({
   holder: "did:webvh:QmBob:dids.example.net:bob",
   counterparty: CITY,
   site: "join.mages.city",
-  terms: { code: "SD-BASE-DP", title: "Service delivery, with data portability", url: "https://customercommons.org/agreements/SD-BASE-DP" },
+  terms: { code: "SD-BASE-DP", title: "Service delivery, with data portability", url: "https://agreements.info/r/sd-base-dp" },
   reached: { requestId: "jr-1", requestDigest: "zReq", replyDigest: "zRep", at: Date.UTC(2026, 9, 21) },
   status: "agreed",
   effect: "allow",

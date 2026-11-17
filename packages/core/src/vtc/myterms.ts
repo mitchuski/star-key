@@ -1,7 +1,8 @@
 // MyTerms (IEEE Std 7012-2025) at a community's door — the member's side.
 //
 // The person is the **first party**: they proffer one of a small roster of
-// standard-form agreements kept by a neutral non-business (Customer Commons),
+// standard-form agreements kept by a neutral non-business (Customer Commons, published at
+// agreements.info),
 // the community accepts it, makes one counter-offer, or declines, and both
 // sides keep the record. This module does the member's half for a Verifiable
 // Trust Community (VTC) that takes terms at its join door:
@@ -34,6 +35,8 @@
 // the community (`ids`), and a persona is not the individual the standard's
 // first party is. Say "joined under <code>", never "IEEE 7012 compliant".
 
+import { rosterRefOf, type RosterRef } from "./myterms-propose.js";
+
 /** The DID-document service type a community publishes when it takes terms. */
 export const MYTERMS_SERVICE_TYPE = "MyTerms";
 
@@ -61,7 +64,7 @@ export interface RosterAgreement {
   url: string;
 }
 
-const REGISTRY = "https://customercommons.org/agreements/";
+const REGISTRY = "https://agreements.info/r/";
 
 const SERVICE = "deliver the service the person asked for, and use their data for that";
 const ANALYTICS = "first-party analytics (measuring its own service)";
@@ -84,7 +87,7 @@ export const MYTERMS_ROSTER: readonly RosterAgreement[] = [
     permitted: [SERVICE],
     prohibited: [ANALYTICS, TRACKING, PROFILING, SHARE_3P, NO_3P],
     obligations: [PORTABILITY],
-    url: `${REGISTRY}SD-BASE-DP`,
+    url: `${REGISTRY}sd-base-dp`,
   },
   {
     code: "SD-BASE",
@@ -93,7 +96,7 @@ export const MYTERMS_ROSTER: readonly RosterAgreement[] = [
     permitted: [SERVICE],
     prohibited: [ANALYTICS, TRACKING, PROFILING, SHARE_3P, NO_3P],
     obligations: [],
-    url: `${REGISTRY}SD-BASE`,
+    url: `${REGISTRY}sd-base`,
   },
   {
     code: "SD-BASE-A",
@@ -102,7 +105,7 @@ export const MYTERMS_ROSTER: readonly RosterAgreement[] = [
     permitted: [SERVICE, ANALYTICS],
     prohibited: [TRACKING, PROFILING, SHARE_3P, NO_3P],
     obligations: [],
-    url: `${REGISTRY}SD-BASE-A`,
+    url: `${REGISTRY}sd-base-a`,
   },
   {
     code: "SD-BASE-AT",
@@ -111,7 +114,7 @@ export const MYTERMS_ROSTER: readonly RosterAgreement[] = [
     permitted: [SERVICE, ANALYTICS, TRACKING],
     prohibited: [PROFILING, SHARE_3P, NO_3P],
     obligations: [],
-    url: `${REGISTRY}SD-BASE-AT`,
+    url: `${REGISTRY}sd-base-at`,
   },
   {
     code: "SD-BASE-ATP",
@@ -120,7 +123,7 @@ export const MYTERMS_ROSTER: readonly RosterAgreement[] = [
     permitted: [SERVICE, ANALYTICS, TRACKING, PROFILING],
     prohibited: [SHARE_3P, NO_3P],
     obligations: [],
-    url: `${REGISTRY}SD-BASE-ATP`,
+    url: `${REGISTRY}sd-base-atp`,
   },
   {
     code: "SD-BASE-ATP-S3P",
@@ -129,7 +132,7 @@ export const MYTERMS_ROSTER: readonly RosterAgreement[] = [
     permitted: [SERVICE, ANALYTICS, TRACKING, PROFILING, SHARE_3P],
     prohibited: [NO_3P],
     obligations: [],
-    url: `${REGISTRY}SD-BASE-ATP-S3P`,
+    url: `${REGISTRY}sd-base-atp-s3p`,
   },
 ];
 
@@ -185,6 +188,13 @@ export interface CommunityTerms {
   /** Where the community publishes the agreements it accepts, for a person
    *  who wants to read them there. */
   agreementsUrl?: string;
+  /** The roster the community's agreements are entries of, when the
+   *  configuration pins it by uri, version and digest (`roster` as an object;
+   *  a bare URL pins nothing). With `agreementIris`, what a
+   *  `myterms/propose` proposal needs (`myterms-propose.ts`). */
+  roster?: RosterRef;
+  /** The roster IRI of each accepted code that names one (`iri`). */
+  agreementIris?: Record<string, string>;
 }
 
 export class MyTermsConfigurationError extends Error {
@@ -205,13 +215,17 @@ export function checkMyTermsConfiguration(json: unknown, endpoint: string): Comm
   if (!Array.isArray(agreements)) throw bad("no agreements");
   const accepts: string[] = [];
   const unknown: string[] = [];
+  const iris: Record<string, string> = {};
   for (const a of agreements) {
     const code = typeof a === "string" ? a : (a as { code?: unknown } | null)?.code;
     if (typeof code !== "string" || code.trim() === "") continue;
     if (rosterAgreement(code)) {
       if (!accepts.includes(code)) accepts.push(code);
+      const iri = typeof a === "string" ? undefined : (a as { iri?: unknown }).iri;
+      if (typeof iri === "string" && /^https:\/\//.test(iri) && iri.length <= 2048) iris[code] = iri;
     } else if (!unknown.includes(code)) unknown.push(code);
   }
+  const roster = rosterRefOf((json as { roster?: unknown }).roster);
   accepts.sort((a, b) => protection(a) - protection(b));
   const counter = (json as { counterOffer?: unknown }).counterOffer;
   const agreementsUrl = (json as { agreementsUrl?: unknown }).agreementsUrl;
@@ -221,6 +235,8 @@ export function checkMyTermsConfiguration(json: unknown, endpoint: string): Comm
     unknown,
     ...(typeof counter === "string" && accepts.includes(counter) ? { counterOffer: counter } : {}),
     ...(typeof agreementsUrl === "string" && /^https:\/\//.test(agreementsUrl) ? { agreementsUrl } : {}),
+    ...(roster ? { roster } : {}),
+    ...(Object.keys(iris).length > 0 ? { agreementIris: iris } : {}),
   };
 }
 
@@ -331,9 +347,11 @@ export function buildVca(applicantDid: string, communityDid: string, code: strin
   };
 }
 
-/** The `extensions` bag a join request carries the agreement in. */
-export function myTermsExtension(vca: Vca): Record<string, unknown> {
-  return { [MYTERMS_EXTENSION]: { version: "1", agreement: vca } };
+/** The `extensions` bag a join request carries the agreement in. `more` adds
+ *  members beside the agreement — the `myterms/propose` proposal, where the
+ *  community's configuration pins a roster (`proposalExtension`). */
+export function myTermsExtension(vca: Vca, more: Record<string, unknown> = {}): Record<string, unknown> {
+  return { [MYTERMS_EXTENSION]: { version: "1", agreement: vca, ...more } };
 }
 
 /** What the wallet keeps after a request under terms went out: both halves

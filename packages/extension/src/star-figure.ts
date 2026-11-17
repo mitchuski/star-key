@@ -19,16 +19,21 @@
 // encoding on the six axes) and a dashed edge to its complement, the witness.
 // The "places" layer seats glyphs at vertices: a City's doors on the lattice,
 // hoverable and clickable (a click on a place teleports instead of toggling spin).
+// The "earned" layer lights vertices a face of the evidence set, re-derived by star-evidence.ts;
+// the "claimed" layer rings vertices the bearer listed (`lit`), dimmer, so the two never read as one.
 
-export type LayerId = "field" | "sword" | "mage" | "routes" | "core" | "hold" | "invite" | "constellation" | "places";
+export type LayerId = "field" | "sword" | "mage" | "routes" | "core" | "hold" | "invite" | "constellation" | "places" | "earned" | "claimed";
 
 /** A place on the lattice: a glyph at a vertex that can be hovered and teleported to. */
 export interface Place { vertex: number; glyph: string; label?: string; href?: string; id?: string }
 export interface LayerState {
   level: number; // 0 hidden … 1 drawn
   next?: boolean; // drawn as a preview
-  /** constellation only: lattice vertices (0..63) joined in order — a walk up the six axes */
+  /** constellation: lattice vertices (0..63) joined in order — a walk up the six axes.
+   *  earned / claimed: the vertices to light or ring */
   vertices?: number[];
+  /** earned only: how many faces set each vertex; a heavier vertex glows larger */
+  weight?: Record<number, number>;
   /** constellation only: the complement vertex (63 − last), drawn as a dashed witness edge */
   witness?: number;
   /** places only: glyphs seated at vertices; hover and click report through opts.onPlaceHover / onPlaceClick */
@@ -124,7 +129,7 @@ export function createStarFigure(
   const HOME = { yaw: 1.2, pitch: 0.8 }; // same still as public/icon.svg (scripts/star-icon.mjs)
   let yaw = HOME.yaw, pitch = HOME.pitch, spinning = !reduce && opts.spinning !== false;
   let layers: Layers = {};
-  let shown: Record<LayerId, number> = { field: 0, sword: 0, mage: 0, routes: 0, core: 0, hold: 0, invite: 0, constellation: 0, places: 0 };
+  let shown: Record<LayerId, number> = { field: 0, sword: 0, mage: 0, routes: 0, core: 0, hold: 0, invite: 0, constellation: 0, places: 0, earned: 0, claimed: 0 };
   let hits: { x: number; y: number; r: number; place: Place }[] = [];
   let hovered: Place | null = null;
   let raf = 0, dragging = false, moved = 0, lx = 0, ly = 0, w = 0, h = 0, dpr = 1, t0 = performance.now();
@@ -235,6 +240,23 @@ export function createStarFigure(
         ctx!.strokeStyle = rgba(SWORD, 0.8 * lvl); ctx!.lineWidth = 1;
         ctx!.beginPath(); ctx!.arc(b.x, b.y, 4.5, 0, Math.PI * 2); ctx!.stroke();
       }
+    }
+    if (L("claimed") > 0.01) {
+      const lvl = L("claimed");
+      ctx!.setLineDash([2, 3]); ctx!.lineWidth = 1;
+      for (const v of (layers.claimed?.vertices ?? []).filter((x) => x >= 0 && x < 64)) {
+        const q = proj(LATTICE[v]!);
+        ctx!.strokeStyle = rgba(PALE, 0.5 * lvl * (0.55 + 0.45 * ((q.z + 1) / 2)));
+        ctx!.beginPath(); ctx!.arc(q.x, q.y, 5, 0, Math.PI * 2); ctx!.stroke();
+      }
+      ctx!.setLineDash([]);
+    }
+    if (L("earned") > 0.01) {
+      const lvl = L("earned"), wt = layers.earned?.weight ?? {};
+      (layers.earned?.vertices ?? []).filter((x) => x >= 0 && x < 64).map((v) => ({ v, q: proj(LATTICE[v]!) })).sort((a, b) => a.q.z - b.q.z).forEach(({ v, q }) => {
+        const depth = 0.55 + 0.45 * ((q.z + 1) / 2), r = (8 + 3 * Math.min(4, (wt[v] ?? 1) - 1)) * depth;
+        glow(q, mix(v / 63), r, 0.95 * lvl * depth);
+      });
     }
     // the two solids, back one first so they interpenetrate convincingly
     const order: [LayerId, V3[], readonly number[]][] = [["sword", SWORD_V, SWORD], ["mage", MAGE_V, MAGE]];

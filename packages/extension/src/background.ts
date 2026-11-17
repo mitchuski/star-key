@@ -348,12 +348,15 @@ import {
   type RuntimeSignInStepResponse,
   type OffscreenSignInStepRequest,
   RUNTIME_JOIN_COMMUNITY,
+  RUNTIME_SITE_TERMS,
+  type RuntimeSiteTermsRequest,
   type RuntimeJoinCommunityRequest,
   type RuntimeJoinCommunityResponse,
 } from "./bridge-protocol.js";
 import { pageFailure } from "./page-error.js";
 import { failureLogFields } from "./sign-in-failure.js";
 import { communityDidFromText } from "./community-did.js";
+import { siteTermsEndpoint } from "./site-terms.js";
 
 /** Consent-gated requests awaiting their one exempt replay. In-memory by
  *  design: a service-worker restart loses it, and losing it costs one extra
@@ -4076,6 +4079,44 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return false;
   }
 
+  if (msgType === RUNTIME_SITE_TERMS) {
+    // The 🤝 window's lookup; a page has no business asking where another
+    // site keeps its terms through the wallet.
+    if (!isExtensionPageSender(sender)) {
+      sendResponse({ ok: false, error: "asked only from the wallet's own window" });
+      return false;
+    }
+    const req = message as RuntimeSiteTermsRequest;
+    siteTermsEndpoint(
+      {
+        async active() {
+          const active = await readActiveConnection();
+          if (!active.ok) return { ok: false, error: active.error };
+          return {
+            ok: true,
+            vta: { vtaDid: active.conn.vtaDid, ...(active.conn.restBaseUrl ? { restBaseUrl: active.conn.restBaseUrl } : {}) },
+          };
+        },
+        async offscreen(vta, params) {
+          await ensureOffscreenDocument();
+          const reply = (await chrome.runtime.sendMessage({
+            target: OFFSCREEN_TARGET,
+            type: OFFSCREEN_DIRECTORY_PAGE,
+            vtaDid: vta.vtaDid,
+            ...(vta.restBaseUrl ? { restBaseUrl: vta.restBaseUrl } : {}),
+            params,
+          })) as OffscreenDirectoryPageResponse | undefined;
+          return reply ?? { ok: false, error: "the offscreen document did not answer" };
+        },
+      },
+      req.origin,
+      req.hostDid,
+    )
+      .then(sendResponse)
+      .catch((e: unknown) => sendResponse({ ok: false, error: e instanceof Error ? e.message : String(e) }));
+    return true; // async sendResponse
+  }
+
   if (msgType === RUNTIME_JOIN_COMMUNITY) {
     // Only the wallet's own surfaces (the popup, the scan window) start a
     // join; a page naming a community is a page asking to be joined.
@@ -4157,7 +4198,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     membershipPageGates
       .handle(req.origin, req.params)
       .then(sendResponse)
-      .catch((e: unknown) => sendResponse({ ok: false, error: e instanceof Error ? e.message : String(e) }));
+      .catch((e: unknown) => sendResponse(pageFailure(e)));
     return true; // async sendResponse
   }
 

@@ -158,6 +158,8 @@ import {
   rosterAgreement,
   buildVca,
   myTermsExtension,
+  proposalExtension,
+  proposalFor,
   documentDigest,
   type CommunityTerms,
   type TermsRecord,
@@ -371,6 +373,23 @@ function hostOf(origin: string): string {
   } catch {
     return origin;
   }
+}
+
+/** The `myterms/propose` proposal for the agreement a join goes out under,
+ *  as members of the MyTerms extensions entry; none where the community's
+ *  configuration pins no roster. */
+function proposalMembers(terms: { code: string; community: CommunityTerms } | undefined): Record<string, unknown> {
+  const proposal = terms ? proposalFor(terms.code, terms.community) : undefined;
+  return proposal ? proposalExtension(proposal) : {};
+}
+
+/** The origin of the community's `MyTerms` configuration, when its verified
+ *  document names one. A community may keep that document on another host
+ *  than its portal (the City: portal on `vtc.`, terms on `join.`), and the
+ *  wallet cannot read it there without being allowed to. */
+function termsOriginOf(doc: unknown): { termsOrigin?: string } {
+  const endpoint = myTermsEndpoint(doc);
+  return endpoint ? { termsOrigin: originOf(endpoint) } : {};
 }
 
 /** The origin of a URL (`https://host`), or the string itself when it is
@@ -789,7 +808,7 @@ export class SignInFlows {
       entries,
       join: { source },
     });
-    return { kind: "join-community", host, portalOrigin, trustTaskOrigin: originOf(selected.services.trustTaskEndpoint), source };
+    return { kind: "join-community", host, portalOrigin, trustTaskOrigin: originOf(selected.services.trustTaskEndpoint), ...termsOriginOf(resolved.doc), source };
   }
 
   // ── prepare ────────────────────────────────────────────────────────────────
@@ -898,7 +917,7 @@ export class SignInFlows {
           route: resolved.route,
           entries,
         });
-        return { kind: "join-community", host, portalOrigin, trustTaskOrigin: originOf(selected.services.trustTaskEndpoint) };
+        return { kind: "join-community", host, portalOrigin, trustTaskOrigin: originOf(selected.services.trustTaskEndpoint), ...termsOriginOf(resolved.doc) };
       }
       if (kind !== "did-hosting") {
         const contactLabel = contactDomainLabel(link.from, methods);
@@ -1250,7 +1269,10 @@ export class SignInFlows {
         criterion: plan.criterion,
         attributes: answers,
         registryConsent: req.registryConsent,
-        ...(vca ? { extensions: myTermsExtension(vca) } : {}),
+        // Where the community's configuration pins the roster, the same
+        // choice also rides as a `myterms/propose` proposal payload
+        // (`myterms-propose.ts`); the signed request around it is its envelope.
+        ...(vca ? { extensions: myTermsExtension(vca, proposalMembers(flow.terms)) } : {}),
       });
       flow.at = "join-sign";
       const signed = assertSignedAsSent(unsigned, await flow.vta.signTask(bound.entryId, unsigned), "authentication");

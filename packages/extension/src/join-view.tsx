@@ -17,8 +17,11 @@ import { c, t, button, card, mono } from "./theme.js";
 import { Mark } from "./ui.js";
 import {
   RUNTIME_JOIN_COMMUNITY,
+  RUNTIME_SITE_TERMS,
   type JoinSource,
   type RuntimeJoinCommunityResponse,
+  type RuntimeSiteTermsRequest,
+  type RuntimeSiteTermsResponse,
 } from "./bridge-protocol.js";
 import {
   communityDidFromText,
@@ -56,7 +59,39 @@ async function siteTermsOf(host: string): Promise<SiteTerms> {
       // not there, or not a configuration: try the next address
     }
   }
-  return { status: "none" };
+  return communityTermsOf(origin);
+}
+
+/** A community may keep its terms on another host than its portal. The page's
+ *  host says which community it is (`/health` → `vtc_did`); the background
+ *  believes that only when the DID's verified document names this origin as
+ *  its portal, and answers with the document's `MyTerms` service
+ *  (`site-terms.ts`). Reading that needs the terms host allowed as well. */
+async function communityTermsOf(origin: string): Promise<SiteTerms> {
+  let hostDid: unknown;
+  try {
+    const res = await fetch(`${origin}/health`, {
+      headers: { accept: "application/json" },
+      redirect: "error",
+      signal: AbortSignal.timeout(6_000),
+    });
+    if (!res.ok) return { status: "none" };
+    hostDid = ((await res.json()) as { vtc_did?: unknown } | null)?.vtc_did;
+  } catch {
+    return { status: "none" };
+  }
+  if (typeof hostDid !== "string") return { status: "none" };
+  const answer = (await chrome.runtime
+    .sendMessage({ type: RUNTIME_SITE_TERMS, origin, hostDid } satisfies RuntimeSiteTermsRequest)
+    .catch(() => undefined)) as RuntimeSiteTermsResponse | undefined;
+  if (!answer?.ok || !answer.termsEndpoint) return { status: "none" };
+  const termsOrigin = new URL(answer.termsEndpoint).origin;
+  if (!(await hasOriginPermission(termsOrigin).catch(() => false))) return { status: "unreachable", origin: termsOrigin };
+  try {
+    return { status: "takes", terms: await fetchCommunityTerms(answer.termsEndpoint, { timeoutMs: 6_000 }) };
+  } catch {
+    return { status: "none" };
+  }
 }
 
 /** How often a camera frame is decoded. */

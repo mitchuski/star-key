@@ -33,6 +33,7 @@ import type {
 } from "./bridge-protocol.js";
 import { portalRefusal, type ActiveVta } from "./directory-page.js";
 import type { CarriedHold } from "./star-hold-carried.js";
+import { PageRefusal, forwardedCode, pageFailure, type PageFailure } from "./page-error.js";
 
 export interface MembershipPageDeps {
   active(): Promise<{ ok: true; vta: ActiveVta } | { ok: false; error: string }>;
@@ -85,7 +86,8 @@ export function membershipView(
 /** How long a community's resolved portal is trusted before it is resolved again. */
 const PORTAL_CACHE_MS = 5 * 60 * 1000;
 
-class MembershipPageRefusal extends Error {}
+/** A refusal of this channel, always with its page code (`page-error.ts`). */
+class MembershipPageRefusal extends PageRefusal {}
 
 export class MembershipPageGates {
   private readonly portals = new Map<string, { portalOrigin: string; at: number }>();
@@ -94,7 +96,7 @@ export class MembershipPageGates {
 
   private async offscreen(vta: ActiveVta, op: OffscreenDirectoryPageOp): Promise<unknown> {
     const res = await this.deps.offscreen(vta, op);
-    if (!res.ok) throw new MembershipPageRefusal(res.error);
+    if (!res.ok) throw new MembershipPageRefusal(res.error, forwardedCode((res as { code?: unknown }).code));
     return res.result;
   }
 
@@ -111,19 +113,19 @@ export class MembershipPageGates {
   async handle(origin: string, raw: unknown): Promise<RuntimeMembershipPageResponse> {
     try {
       const malformed = membershipPageParamsRefusal(raw);
-      if (malformed) return { ok: false, error: malformed };
+      if (malformed) return { ok: false, error: malformed, code: "invalidCall" };
       return { ok: true, result: await this.status(origin, raw as MembershipPageOp) };
     } catch (e) {
-      return { ok: false, error: e instanceof Error ? e.message : String(e) };
+      return pageFailure(e);
     }
   }
 
   private async status(origin: string, p: MembershipPageOp): Promise<PageMembershipView> {
     const active = await this.deps.active();
-    if (!active.ok) throw new MembershipPageRefusal(active.error);
+    if (!active.ok) throw new MembershipPageRefusal(active.error, "notConnected");
     const vta = active.vta;
     const refusal = portalRefusal(origin, p.hostDid, await this.portalOrigin(vta, p.hostDid));
-    if (refusal) throw new MembershipPageRefusal(refusal);
+    if (refusal) throw new MembershipPageRefusal(refusal, "originNotPermitted");
     const members = (await this.offscreen(vta, { op: "members", hostDid: p.hostDid })) as string[];
     const agreements = await this.deps.agreements(vta.vtaDid).catch(() => [] as Agreement[]);
     const hold = this.deps.hold ? await this.deps.hold().catch(() => undefined) : undefined;

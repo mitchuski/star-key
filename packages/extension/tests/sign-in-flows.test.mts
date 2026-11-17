@@ -1669,7 +1669,40 @@ test("closing the join-by-DID window before continuing sends nothing", async () 
 // a submit naming an agreement that was not offered is out of order.
 
 const MYTERMS_EXT = "org.agentprivacy.myterms";
+
+test("MyTerms: a community that keeps its terms on another host names that origin, so the join window can ask for it", async () => {
+  const elsewhere = {
+    ...communityDoc,
+    service: [
+      ...communityDoc.service,
+      { id: `${VTC}#myterms`, type: "MyTerms", serviceEndpoint: "https://join.example.org/myterms/configuration.json" },
+    ],
+  };
+  const w = world({ known: UNKNOWN, doc: elsewhere });
+  const r = await step(w, { step: "prepare", link: LINK, origin: PORTAL });
+  assert.deepEqual(r, {
+    kind: "join-community",
+    host: "members.example.org",
+    portalOrigin: PORTAL,
+    trustTaskOrigin: PORTAL,
+    termsOrigin: "https://join.example.org",
+  });
+  assert.equal(w.sent.length, 0);
+});
 const submitted = (w: World) => (w.sent.find((s) => s.type === "join-submit")!.doc as { payload: Record<string, unknown> }).payload;
+
+test("MyTerms: where the configuration pins the roster, the choice also rides as a myterms/propose proposal", async () => {
+  const roster = { uri: "https://roster.example/p7012", version: "2025", digestMultibase: "zQmbWqxBEKC3P8tqsKc98xmWNzrzDtRLMiMPL8wBuTGsMnR" };
+  const iri = "https://roster.example/p7012#SD-BASE-AT";
+  const config = { ...TERMS_CONFIG, roster, agreements: [{ code: "SD-BASE" }, { code: "SD-BASE-AT", iri }] };
+  const w = world({ known: UNKNOWN, doc: termsDoc, terms: { config, preferred: "SD-BASE-AT" }, manifest: OPEN_MANIFEST, submit: { requestId: "jr-9", verdict: { effect: "allow", with: { role: "member" } } } });
+  await joinByDid(w);
+  await step(w, { step: "join-manifest" });
+  await step(w, { step: "join-submit", did: PERSONAS[0]!.did, attributes: [], registryConsent: false, terms: { code: "SD-BASE-AT" } });
+  const entry = (submitted(w).extensions as Record<string, Record<string, unknown>>)[MYTERMS_EXT]!;
+  assert.deepEqual(entry.proposal, { task: "myterms/propose/0.1", payload: { agreement: iri, roster } });
+  assert.equal((entry.agreement as { references: Array<{ code: string }> }).references[0]!.code, "SD-BASE-AT");
+});
 
 test("MyTerms: the person's agreement is offered when the community accepts it, and rides in the signed request", async () => {
   const w = world({ known: UNKNOWN, doc: termsDoc, terms: { config: TERMS_CONFIG, preferred: "SD-BASE-AT" }, manifest: OPEN_MANIFEST, submit: { requestId: "jr-9", verdict: { effect: "allow", with: { role: "member" } } } });
@@ -1699,7 +1732,7 @@ test("MyTerms: the person's agreement is offered when the community accepts it, 
   const vca = ext[MYTERMS_EXT]!.agreement;
   assert.equal(vca.agreementId, record.agreementId);
   assert.deepEqual(vca.ids, [PERSONAS[0]!.did, VTC]);
-  assert.deepEqual(vca.references, [{ code: "SD-BASE-AT", url: "https://customercommons.org/agreements/SD-BASE-AT" }]);
+  assert.deepEqual(vca.references, [{ code: "SD-BASE-AT", url: "https://agreements.info/r/sd-base-at" }]);
   assert.equal(w.signed.length, 1, "signed as the persona, once");
   assert.equal(w.termsRecords.length, 1);
   const kept = w.termsRecords[0]!;

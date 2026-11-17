@@ -12,6 +12,7 @@ export * from "./join.js";
 export * from "./directory-disclosure.js";
 export * from "./directory-card.js";
 export * from "./myterms.js";
+export * from "./myterms-propose.js";
 export * from "./agreements.js";
 export * from "./directory-present.js";
 export * from "./forge-account.js";

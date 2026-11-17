@@ -2475,6 +2475,23 @@ export interface RuntimeJoinCommunityRequest {
 
 export type RuntimeJoinCommunityResponse = { ok: true } | { ok: false; error: string };
 
+/** 🤝 window → background: where the community whose portal `origin` is keeps
+ *  its MyTerms configuration, by `hostDid`'s verified DID document
+ *  (`site-terms.ts`). Extension pages only. */
+export const RUNTIME_SITE_TERMS = "vta-wallet/site-terms" as const;
+
+export interface RuntimeSiteTermsRequest {
+  type: typeof RUNTIME_SITE_TERMS;
+  /** The page's origin, as the window read it from the tab. */
+  origin: string;
+  /** The DID the page's host says it is. */
+  hostDid: string;
+}
+
+export type RuntimeSiteTermsResponse =
+  | { ok: true; communityDid: string; termsEndpoint?: string }
+  | { ok: false; error: string };
+
 /** MyTerms at the join door (`@openvtc/pnm-core/vtc`'s `myterms.ts`): what
  *  the person would join under, for the `join-apply` screen. */
 export type SignInJoinTermsView =
@@ -3140,7 +3157,7 @@ export type PageMembershipView =
       hold?: { root: string; count: number; at: string };
     };
 
-export type RuntimeMembershipPageResponse = { ok: true; result: PageMembershipView } | { ok: false; error: string };
+export type RuntimeMembershipPageResponse = { ok: true; result: PageMembershipView } | { ok: false; error: string; code?: string };
 
 export const PAGE_FACING_RUNTIME_TYPES = [
   RUNTIME_LOGIN,
@@ -3390,6 +3407,10 @@ export type SignInStepResult =
        *  permission by default, and a cross-origin GET or POST from it is
        *  refused by CORS without one). */
       trustTaskOrigin: string;
+      /** The origin of the community's `MyTerms` configuration, when its
+       *  document names one: asked for with the other two, since it may be a
+       *  third host and the terms cannot be read without it. */
+      termsOrigin?: string;
       source?: JoinSource;
     }
   /** A join by DID: the DID names a verified community this wallet already
